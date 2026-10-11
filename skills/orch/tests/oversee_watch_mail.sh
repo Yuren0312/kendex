@@ -1539,9 +1539,23 @@ if [[ -f "$TRACKER_CASE_DIR/fail" ]]; then
   esac
 fi
 case "$1:$2" in
-  issues:get) echo '{"labels":["skills","feature"],"url":"https://linear.app/test/issue/KEN-7"}' ;;
-  issues:update) echo '{}' ;;
-  issues:list) echo '[{"id":"KEN-7"}]' ;;
+  users:list) cat "$TRACKER_CASE_DIR/user" ;;
+  issues:get) cat "$TRACKER_CASE_DIR/item" ;;
+  issues:update)
+    shift 3
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --description) jq --arg body "$2" '.description = $body' "$TRACKER_CASE_DIR/item" >"$TRACKER_CASE_DIR/next"; shift 2 ;;
+        --labels) jq --arg labels "$2" '.labels = ($labels | split(","))' "$TRACKER_CASE_DIR/item" >"$TRACKER_CASE_DIR/next"; shift 2 ;;
+        --assignee) jq -e --arg id "$2" --slurpfile user "$TRACKER_CASE_DIR/user" '.assignee = ($user[0][] | select(.id == $id) | .name)' "$TRACKER_CASE_DIR/item" >"$TRACKER_CASE_DIR/next"; shift 2 ;;
+        --clear-assignee) jq '.assignee = ""' "$TRACKER_CASE_DIR/item" >"$TRACKER_CASE_DIR/next"; shift ;;
+        --clear-labels) jq '.labels = []' "$TRACKER_CASE_DIR/item" >"$TRACKER_CASE_DIR/next"; shift ;;
+        *) exit 1 ;;
+      esac
+      mv -- "$TRACKER_CASE_DIR/next" "$TRACKER_CASE_DIR/item"
+    done
+    echo '{}' ;;
+  issues:list) jq '[.]' "$TRACKER_CASE_DIR/item" ;;
   comments:create) cp -- "$5" "$TRACKER_CASE_DIR/posted"; echo '{}' ;;
   comments:bulk-list) cat "$TRACKER_CASE_DIR/comments" ;;
   *) exit 1 ;;
@@ -1564,10 +1578,15 @@ tracker_answer_count() { # ASK
   jq -s --arg id "$1" '[.[] | select(.kind == "answer" and .re == $id and .by != "default")] | length' "$box"
 }
 tracker_case() { # ROW WATCH
-  local row="$1" watch="$2" extra=(--issue KEN-7) author=owner@example.com time=2026-10-02T00:00:00.001Z
+  local row="$1" watch="$2" action='Post the message. Its link closes this ask.' extra=(--issue KEN-7) author=owner@example.com time=2026-10-02T00:00:00.001Z
   new_case "tracker-$row"
   mail_reset overseer
   : >"$STUB_DIR/calls"
+  printf 'Engineering body.\n\nKeep these bytes.\n\n' >"$STUB_DIR/old-description"
+  printf '{"id":"12345678-1234-1234-1234-123456789abc","name":"Maya Owner","email":"owner@example.com"}\n' >"$STUB_DIR/owner"
+  # The shipped users list --max route returns all workspace users.
+  jq -n --slurpfile owner "$STUB_DIR/owner" '[{id:"87654321-4321-4321-4321-cba987654321",name:"Riley Other",email:"other@example.test"},$owner[0]]' >"$STUB_DIR/user"
+  jq -n --rawfile body "$STUB_DIR/old-description" '{id:"KEN-7",labels:["skills","feature"],description:$body,assignee:"",url:"https://linear.app/test/issue/KEN-7"}' >"$STUB_DIR/item"
   TRACKER_LABEL=owner-gated
   TRACKER_EMAIL=owner@example.com
   TRACKER_TEAM=KEN
@@ -1582,13 +1601,64 @@ tracker_case() { # ROW WATCH
     no-team) TRACKER_TEAM="" ;;
     other-author) author=other@example.test ;;
     old-comment) time=2026-09-30T00:00:00.000Z ;;
+    replacement) jq '.description = "**Previous, what you do:** Old action.\n\n" + .description' "$STUB_DIR/item" >"$STUB_DIR/next"; mv -- "$STUB_DIR/next" "$STUB_DIR/item" ;;
+    missing-action|empty-action|long-action)
+      local rc=0 invalid=() key=owner-action-missing
+      [[ "$row" != empty-action ]] || invalid=(--do '')
+      [[ "$row" != long-action ]] || { invalid=(--do 'First. Second. Third.'); key='owner-action-long sentences=3'; }
+      printf 'Approve?\n' >"$STUB_DIR/question"
+      tracker_mail ask --item overseer --to owner --file "$STUB_DIR/question" --options approve,hold --recommend approve --issue KEN-7 \
+        ${invalid[@]+"${invalid[@]}"} >"$STUB_DIR/invalid.out" 2>"$STUB_DIR/write.err" || rc=$?
+      ACTION_REFUSAL=false
+      if [[ "$rc" -ne 0 && ! -s "$STUB_DIR/calls" ]] && grep -Fq "lane-mail: $key" "$STUB_DIR/write.err"; then ACTION_REFUSAL=true; fi
+      TRACKER_FACTS=0,0
+      return ;;
   esac
+  [[ "$row" == no-item ]] || extra+=(--do "$action")
   printf 'Approve the action?\nMore detail.\n' >"$STUB_DIR/question"
   local id
   id="$(tracker_mail ask --item overseer --to owner --file "$STUB_DIR/question" \
     --options approve,hold --recommend approve ${extra[@]+"${extra[@]}"} 2>"$STUB_DIR/write.err")"
   id="${id#id=}"
   TRACKER_ASK="$id"
+  if [[ "$row" == close-earlier || "$row" == close-latest ]]; then
+    local later latest='Review the draft. Its approval closes this ask.' closing kept wanted
+    later="$(tracker_mail ask --item overseer --to owner --file "$STUB_DIR/question" \
+      --options approve,hold --recommend approve --issue KEN-7 --do "$latest" 2>"$STUB_DIR/write.err")"
+    later="${later#id=}"
+    tracker_mail ask --item overseer --to owner --file "$STUB_DIR/question" \
+      --options approve,hold --recommend approve --issue KEN-8 --do 'Approve the other item. Its answer closes it.' >/dev/null
+    printf 'assign\n' >"$STUB_DIR/fail"
+    tracker_mail ask --item overseer --to owner --file "$STUB_DIR/question" \
+      --options approve,hold --recommend approve --issue KEN-7 --do 'Answer in chat. The reply closes it.' >/dev/null 2>"$STUB_DIR/write.err"
+    rm -- "$STUB_DIR/fail"
+    closing="$id"; kept="$later"; wanted="$latest"
+    [[ "$row" != close-latest ]] || { closing="$later"; kept="$id"; wanted="$action"; }
+    tracker_mail resolve --item overseer --id "$closing" >/dev/null
+    assert_eq "$(tracker_mail pending --item overseer --to owner | jq -r 'select(.issue == "KEN-7" and .tracker_posted == true) | .id + "|" + (.tracker_posted | tostring)')" \
+      "$kept|true" "$row leaves the other tracker ask pending"
+    assert_eq "$(jq --rawfile body "$STUB_DIR/old-description" --slurpfile owner "$STUB_DIR/owner" --arg action "$wanted" \
+      '.description == ("**" + ($owner[0].name | split(" ")[0]) + ", what you do:** " + $action + "\n\n" + $body)
+      and .assignee == $owner[0].name and (.labels | index("owner-gated") != null)' "$STUB_DIR/item")" \
+      true "$row retains the remaining owner action and ownership"
+    printf '{}\n' >"$STUB_DIR/comments"
+    tracker_pass "$watch"
+    assert_eq "$(jq -s '[.[] | select(.[0] == "issues" and .[1] == "list")] | length' "$STUB_DIR/calls")" \
+      1 "$row keeps the remaining ask visible to the long pass"
+    tracker_mail resolve --item overseer --id "$kept" >/dev/null
+    assert_eq "$(tracker_mail pending --item overseer --to owner | jq -s 'any(.[]; .issue == "KEN-7" and .tracker_posted == true)')" \
+      false "$row closes the last tracker ask for the issue"
+    assert_eq "$(jq --rawfile body "$STUB_DIR/old-description" '.description == $body and .assignee == ""
+      and (.labels | index("owner-gated") == null)' "$STUB_DIR/item")" true "$row clears only after the last ask"
+    TRACKER_FACTS=0,0
+    return
+  fi
+  ACTION_CORRECT="$(jq --rawfile body "$STUB_DIR/old-description" --slurpfile owner "$STUB_DIR/owner" --arg action "$action" '
+    .description | test("^\\*\\*[^*]+, what you do:\\*\\* ")
+    and . == ("**" + ($owner[0].name | split(" ")[0]) + ", what you do:** " + $action + "\n\n" + $body)' "$STUB_DIR/item")"
+  if [[ "$row" == enabled || "$row" == replacement || "$row" == restored || "$row" == close ]]; then
+    assert_eq "$ACTION_CORRECT" true "$row opens with the resolved first name, action and unchanged body"
+  fi
   if [[ "$row" == due || "$row" == failed-* ]]; then
     jq -c '.deadline = "2000-01-01T00:00:00Z"' \
       "$CASE_REPO_ROOT/tmp/lane-mail/overseer/to-overseer.jsonl" >"$STUB_DIR/due-ask"
@@ -1598,7 +1668,7 @@ tracker_case() { # ROW WATCH
     assert_eq "$(jq -s '[.[] | select(.[1] == "update" or .[1] == "create")] | length' "$STUB_DIR/calls")" \
       3 'tracker ask makes the assignment, label and comment writes'
     assert_eq "$(jq -s -r '.[] | select(index("--assignee")) | .[4]' "$STUB_DIR/calls")" \
-      owner@example.com 'tracker ask assigns the configured person'
+      "$(jq -r '.id' "$STUB_DIR/owner")" 'tracker ask assigns the configured person'
     assert_eq "$(jq -s -r '.[] | select(index("--labels")) | .[4]' "$STUB_DIR/calls")" \
       feature,owner-gated,skills 'tracker ask preserves the existing labels'
     assert_contains "$(cat "$STUB_DIR/posted")" "ask=$id" 'tracker comment carries the machine-read ask marker'
@@ -1634,9 +1704,22 @@ tracker_case() { # ROW WATCH
       'the private confirmation never replays the old ask'
   fi
   local before after first second
+  if [[ "$row" == restored ]]; then
+    jq --rawfile body "$STUB_DIR/old-description" '.description = $body' "$STUB_DIR/item" >"$STUB_DIR/next"
+    mv -- "$STUB_DIR/next" "$STUB_DIR/item"
+  elif [[ "$row" == close ]]; then
+    printf 'Approved.\n' >"$STUB_DIR/ruling"
+    tracker_mail resolve --item overseer --id "$id" --text "$STUB_DIR/ruling" >/dev/null
+    assert_eq "$(jq --rawfile body "$STUB_DIR/old-description" '.description == $body' "$STUB_DIR/item")" true 'close leaves the old description byte-equal'
+  fi
   [[ "$row" != failed-read ]] || printf 'read\n' >"$STUB_DIR/fail"
   before="$(wc -l <"$STUB_DIR/calls" | tr -d ' ')"
   tracker_pass "$watch"
+  if [[ "$row" == restored ]]; then
+    assert_eq "$(jq --rawfile body "$STUB_DIR/old-description" --slurpfile owner "$STUB_DIR/owner" --arg action "$action" \
+      '.description == ("**" + ($owner[0].name | split(" ")[0]) + ", what you do:** " + $action + "\n\n" + $body)' \
+      "$STUB_DIR/item")" true 'long pass restores the resolved name, stored action and body'
+  fi
   if [[ "$watch" == "$REPO_ROOT/skills/orch/scripts/oversee-watch" && ( "$row" == enabled || "$row" == due ) ]]; then
     assert_contains "$TRACKER_OUT" "EVENT owner-ask-resolved $id " 'tracker answer event appears within one long pass'
   fi
@@ -1649,6 +1732,7 @@ tracker_case() { # ROW WATCH
     mv -- "$STUB_DIR/aged-answers" "$CASE_REPO_ROOT/tmp/lane-mail/overseer/to-lane.jsonl"
   fi
   tracker_pass "$watch"
+  [[ "$row" != restored ]] || assert_eq "$(jq -s '[.[] | select(index("--description") and (index("--labels") | not) and (index("--clear-assignee") | not))] | length' "$STUB_DIR/calls")" 1 'long pass restores the line once'
   second="$(tracker_answer_count "$id")"
   second=$((second - first))
   after="$(wc -l <"$STUB_DIR/calls" | tr -d ' ')"
@@ -1662,7 +1746,7 @@ tracker_case() { # ROW WATCH
     assert_eq "$(grep -c '^KEN-3624-unread ' "$STUB_DIR/tracker.err" || :)" 1 'a failed tracker read reports once'
   elif [[ "$row" == failed-* ]]; then
     assert_eq "$(tracker_mail pending --item overseer --to owner)" '' "$row keeps the chat deadline closure"
-    assert_eq "$(jq -s '[.[] | select(.[1] == "list" or .[1] == "bulk-list")] | length' "$STUB_DIR/calls")" \
+    assert_eq "$(jq -s '[.[] | select((.[0] == "issues" and .[1] == "list") or .[1] == "bulk-list")] | length' "$STUB_DIR/calls")" \
       0 "$row reads no tracker answer route"
     assert_eq "$(jq -s '[.[] | select(index("--clear-assignee"))] | length' "$STUB_DIR/calls")" \
       1 "$row still cleans up the bound item"
@@ -1674,6 +1758,14 @@ tracker_case() { # ROW WATCH
   fi
 }
 TRACKER_CASES='enabled|1,0
+missing-action|0,0
+empty-action|0,0
+long-action|0,0
+replacement|1,0
+restored|1,0
+close|1,0
+close-earlier|0,0
+close-latest|0,0
 fallback|1,0
 no-team|0,0
 other-author|0,0
@@ -1690,10 +1782,96 @@ large|1,0'
 TRACKER_ROWS=0
 while IFS='|' read -r row want; do
   tracker_case "$row" "$REPO_ROOT/skills/orch/scripts/oversee-watch"
+  case "$row" in missing-action|empty-action|long-action) assert_eq "$ACTION_REFUSAL" true "$row refuses before a tracker write" ;; esac
   assert_eq "$TRACKER_FACTS" "$want" "$row delivers only the person's new comment, once"
   TRACKER_ROWS=$((TRACKER_ROWS + 1))
 done <<<"$TRACKER_CASES"
 assert_eq "$TRACKER_ROWS" "$(awk 'END {print NR}' <<<"$TRACKER_CASES")" 'all tracker table rows completed'
+
+NORMAL_TRACKER_MAIL="$TRACKER_MAIL"
+CLOSE_SCRIPTS="$(mutant_scripts tracker-close/orch lib/mailbox-append.sh)"
+ln -s "$TMP_ROOT/owner-tracker/linear" "$TMP_ROOT/tracker-close/linear"
+mutate_file "$CLOSE_SCRIPTS/lib/mailbox-append.sh" 'if [[ "$remaining" != null ]]; then' 'if false; then'
+close_control_rc=0
+(
+  FAIL=0
+  TRACKER_MAIL="$CLOSE_SCRIPTS/lane-mail"
+  tracker_case close-earlier "$REPO_ROOT/skills/orch/scripts/oversee-watch"
+  [[ "$FAIL" -eq 0 ]]
+) >"$TMP_ROOT/tracker-close-control.out" 2>&1 || close_control_rc=$?
+assert_eq "$close_control_rc" 1 'control: clearing an earlier ask fails the remaining ask row'
+assert_contains "$(cat "$TMP_ROOT/tracker-close-control.out")" \
+  'FAIL  close-earlier retains the remaining owner action and ownership' \
+  'control: the remaining ask assertion detects premature cleanup'
+for rule in issue posted; do
+  CLOSE_SCRIPTS="$(mutant_scripts "tracker-close-$rule/orch" lib/mailbox-append.sh)"
+  ln -s "$TMP_ROOT/owner-tracker/linear" "$TMP_ROOT/tracker-close-$rule/linear"
+  if [[ "$rule" == issue ]]; then
+    mutate_file "$CLOSE_SCRIPTS/lib/mailbox-append.sh" '.tracker_posted == true and .issue == $issue' '.tracker_posted == true'
+  else
+    mutate_file "$CLOSE_SCRIPTS/lib/mailbox-append.sh" '.tracker_posted == true and .issue == $issue' '.issue == $issue'
+  fi
+  close_control_rc=0
+  (
+    FAIL=0
+    TRACKER_MAIL="$CLOSE_SCRIPTS/lane-mail"
+    tracker_case close-earlier "$REPO_ROOT/skills/orch/scripts/oversee-watch"
+    [[ "$FAIL" -eq 0 ]]
+  ) >"$TMP_ROOT/tracker-close-$rule-control.out" 2>&1 || close_control_rc=$?
+  assert_eq "$close_control_rc" 1 "control: dropping $rule selection fails the remaining ask row"
+  assert_contains "$(cat "$TMP_ROOT/tracker-close-$rule-control.out")" \
+    'FAIL  close-earlier retains the remaining owner action and ownership' \
+    "control: the remaining ask assertion detects missing $rule selection"
+done
+
+REPAIR_WATCH="$(mutant_scripts tracker-repair/orch oversee-watch)/oversee-watch"
+ln -s "$REPO_ROOT/skills/github" "$TMP_ROOT/tracker-repair/github"
+mutate_file "$REPAIR_WATCH" 'owner_action_line($item.assignee; $ask.do)' 'owner_action_line("Riley Other"; $ask.do)'
+repair_control_rc=0
+(
+  FAIL=0
+  tracker_case restored "$REPAIR_WATCH"
+  [[ "$FAIL" -eq 0 ]]
+) >"$TMP_ROOT/tracker-repair-control.out" 2>&1 || repair_control_rc=$?
+assert_eq "$repair_control_rc" 1 'control: another user name fails the restored row'
+assert_contains "$(cat "$TMP_ROOT/tracker-repair-control.out")" \
+  'FAIL  long pass restores the resolved name, stored action and body' \
+  'control: restoration equality detects the wrong owner name'
+
+OWNER_SCRIPTS="$(mutant_scripts tracker-owner/orch lib/mailbox-append.sh)"
+ln -s "$TMP_ROOT/owner-tracker/linear" "$TMP_ROOT/tracker-owner/linear"
+mutate_file "$OWNER_SCRIPTS/lib/mailbox-append.sh" 'select((.email | ascii_downcase) == ($email | ascii_downcase))' 'select(true)'
+owner_control_rc=0
+(
+  FAIL=0
+  TRACKER_MAIL="$OWNER_SCRIPTS/lane-mail"
+  tracker_case enabled "$REPO_ROOT/skills/orch/scripts/oversee-watch"
+  [[ "$FAIL" -eq 0 ]]
+) >"$TMP_ROOT/tracker-owner-control.out" 2>&1 || owner_control_rc=$?
+assert_eq "$owner_control_rc" 1 'control: removing email selection fails the enabled row'
+assert_contains "$(cat "$TMP_ROOT/tracker-owner-control.out")" \
+  'FAIL  enabled opens with the resolved first name, action and unchanged body' \
+  'control: the enabled owner-line assertion detects the missing email filter'
+
+ACTION_MAIL="$(mutant_scripts tracker-action/orch lib/mailbox-append.sh)/lane-mail"
+ln -s "$TMP_ROOT/owner-tracker/linear" "$TMP_ROOT/tracker-action/linear"
+mutate_file "${ACTION_MAIL%/*}/lib/mailbox-append.sh" '--labels "$labels" --description "$description"' '--labels "$labels"'
+TRACKER_MAIL="$ACTION_MAIL"
+tracker_case action-mutant "$REPO_ROOT/skills/orch/scripts/oversee-watch"
+assert_eq "$ACTION_CORRECT" false 'control: skipping the description write fails the first-row contract'
+for rule in missing long; do
+  ACTION_MAIL="$(mutant_scripts "tracker-action-$rule/orch" lane-mail)/lane-mail"
+  ln -s "$TMP_ROOT/owner-tracker/linear" "$TMP_ROOT/tracker-action-$rule/linear"
+  if [[ "$rule" == missing ]]; then
+    mutate_file "$ACTION_MAIL" 'jq -en --arg action "$OWNER_DO" '\''$action | test("\\S")'\'' >/dev/null || refuse owner-action-missing --do' ': # missing-action control'
+  else
+    mutate_file "$ACTION_MAIL" '[ "$OWNER_SENTENCES" -le 2 ]' 'true'
+  fi
+  TRACKER_MAIL="$ACTION_MAIL"
+  tracker_case "$rule-action" "$REPO_ROOT/skills/orch/scripts/oversee-watch"
+  assert_eq "$ACTION_REFUSAL" false "control: dropping $rule action refusal admits the invalid ask"
+done
+TRACKER_MAIL="$NORMAL_TRACKER_MAIL"
 
 # Without the delivery ID the same comment becomes a second answer.
 TRACKER_MUTANT="$(mutant_scripts tracker-replay/orch oversee-watch)/oversee-watch"
@@ -1736,6 +1914,100 @@ tracker_mail resolve --item overseer --id "$TRACKER_ASK" --text "$STUB_DIR/rulin
 TRACKER_MAIL="$NORMAL_TRACKER_MAIL"
 assert_not_contains "$(cat "$STUB_DIR/posted")" 'Approved action.' \
   'control: dropping the ruling fails the supplied-ruling assertion'
+
+# The macOS orch leg runs Bash 3.2. The Linear CLI owns its Bash 4 runtime
+# check; the stubbed tracker table above still runs on both shells.
+if bash -c 'source "$1"; linear_require_supported_bash' bash \
+  "$REPO_ROOT/skills/linear/scripts/lib/bash-version.sh" 2>/dev/null; then
+# Linear issues without a body leave only the action line. Exercise close
+# through the real CLI, because an argv stub cannot detect an omitted field.
+new_case mail_real_tracker_close
+REAL_TRACKER_ROOT="$CASE_REPO_ROOT/real-linear-close"
+mkdir -p "$REAL_TRACKER_ROOT/.agents/skills" "$REAL_TRACKER_ROOT/bin"
+git -C "$REAL_TRACKER_ROOT" init -q -b main
+git -C "$REAL_TRACKER_ROOT" config gc.auto 0
+git -C "$REAL_TRACKER_ROOT" config maintenance.auto false
+cp -R "$REPO_ROOT/skills/linear" "$REAL_TRACKER_ROOT/.agents/skills/linear"
+cat >"$REAL_TRACKER_ROOT/bin/curl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+config=$(cat)
+payload=$(sed -n 's/^data = //p' <<<"$config" | jq -r)
+query=$(jq -r '.query' <<<"$payload")
+printf '%s\n' "$payload" >>"$CLOSE_LOG"
+case "$query" in
+*"commentCreate(input:"*)
+  printf '%s' '{"data":{"commentCreate":{"success":true,"comment":{"id":"comment-id","body":"closed","issue":{"identifier":"PROJ-1"}}}}}'
+  ;;
+*"issueUpdate(id:"*)
+  jq --argjson input "$(jq -c '.variables.input' <<<"$payload")" '
+    if $input | has("description") then .description = $input.description else . end
+    | if $input | has("assigneeId") then .assignee = null else . end
+    | if $input | has("labelIds") then .labels.nodes = [] else . end' "$CLOSE_STATE" >"$CLOSE_STATE.next"
+  mv "$CLOSE_STATE.next" "$CLOSE_STATE"
+  jq -c '{data: {issueUpdate: {success: true, issue: .}}}' "$CLOSE_STATE"
+  ;;
+*"issue(id:"*)
+  jq -c '{data: {issue: .}}' "$CLOSE_STATE"
+  ;;
+*) exit 1 ;;
+esac
+printf '___HTTP_CODE___200'
+SH
+chmod +x "$REAL_TRACKER_ROOT/bin/curl"
+cat >"$REAL_TRACKER_ROOT/close-driver" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+source "$CLOSE_LIB"
+OWNER_TRACKER_LABEL=owner-gated
+ROOT="$CLOSE_ROOT"
+TO_LANE="$CLOSE_ROOT/mail.jsonl"
+owner_tracker_close "$CLOSE_CLI" '{"id":"ask-id","issue":"PROJ-1"}' close-id "$CLOSE_ROOT"
+SH
+printf '%s\n' '{"kind":"answer","re":"ask-id","text":"Approved."}' \
+  '{"id":"close-id","re":"ask-id","by":"explicit"}' >"$REAL_TRACKER_ROOT/mail.jsonl"
+real_tracker_close() { # BODY CLI
+  local body="$1" cli="$2"
+  jq -n --arg body "$body" '{id:"issue-uuid",identifier:"PROJ-1",title:"test",
+    description:("**Maya, what you do:** Post the message. Its link closes this ask.\n\n" + $body),
+    state:{name:"Todo",type:"unstarted"},assignee:{name:"Maya Owner"},
+    project:null,projectMilestone:null,cycle:null,parent:null,team:{name:"Fixture"},
+    labels:{nodes:[{name:"owner-gated"}],pageInfo:{hasNextPage:false,endCursor:null}},
+    relations:{nodes:[],pageInfo:{hasNextPage:false,endCursor:null}},
+    inverseRelations:{nodes:[],pageInfo:{hasNextPage:false,endCursor:null}},
+    children:{nodes:[],pageInfo:{hasNextPage:false,endCursor:null}},priority:3,estimate:null,
+    sortOrder:1,url:"https://linear.app/fixture/PROJ-1",createdAt:"2026-10-11T00:00:00Z",
+    updatedAt:"2026-10-11T00:00:00Z"}' >"$REAL_TRACKER_ROOT/issue.json"
+  : >"$REAL_TRACKER_ROOT/payloads.jsonl"
+  REAL_CLOSE_RC=0
+  (cd "$REAL_TRACKER_ROOT" && env -i HOME="$REAL_TRACKER_ROOT" PATH="$REAL_TRACKER_ROOT/bin:$PATH" \
+    LINEAR_API_KEY_OVERRIDE=fixture-token LINEAR_TEAM= KENDEX_ENV_FILE=absent.env \
+    CLOSE_ROOT="$REAL_TRACKER_ROOT" CLOSE_CLI="$cli" \
+    CLOSE_LIB="$REPO_ROOT/skills/orch/scripts/lib/mailbox-append.sh" \
+    CLOSE_STATE="$REAL_TRACKER_ROOT/issue.json" CLOSE_LOG="$REAL_TRACKER_ROOT/payloads.jsonl" \
+    bash "$REAL_TRACKER_ROOT/close-driver") >"$REAL_TRACKER_ROOT/close.out" 2>"$REAL_TRACKER_ROOT/close.err" || REAL_CLOSE_RC=$?
+}
+REAL_CLOSE_CLI="$REAL_TRACKER_ROOT/.agents/skills/linear/scripts/linear.sh"
+for body in '' $'Engineering body.\n\n'; do
+  real_tracker_close "$body" "$REAL_CLOSE_CLI"
+  assert_eq "$REAL_CLOSE_RC" 0 'owner close through the real CLI succeeds' "$REAL_TRACKER_ROOT/close.err"
+  assert_eq "$(jq -c '.description' "$REAL_TRACKER_ROOT/issue.json")" "$(jq -cn --arg body "$body" '$body')" \
+    'owner close through the real CLI leaves the underlying description byte-equal'
+  assert_eq "$(jq -r '.assignee == null and .labels.nodes == []' "$REAL_TRACKER_ROOT/issue.json")" true \
+    'owner close through the real CLI clears assignment and label'
+done
+# Reintroduce the nonempty-only producer in a private CLI copy. Close still
+# succeeds and clears ownership, but the empty-body assertion must detect it.
+cp -R "$REAL_TRACKER_ROOT/.agents/skills/linear" "$REAL_TRACKER_ROOT/mutant-linear"
+mutate_file "$REAL_TRACKER_ROOT/mutant-linear/scripts/commands/issues.sh" \
+  'if [[ "$description_set" == "true" || -n "$description" ]]; then' 'if [ -n "$description" ]; then'
+real_tracker_close '' "$REAL_TRACKER_ROOT/mutant-linear/scripts/linear.sh"
+assert_eq "$REAL_CLOSE_RC" 0 'control: nonempty-only description update still reports close success'
+assert_eq "$(jq -r '.description != "" and .assignee == null and .labels.nodes == []' "$REAL_TRACKER_ROOT/issue.json")" true \
+  'control: nonempty-only description update fails the empty-body close assertion'
+else
+  printf 'skip: real Linear close requires its supported Bash runtime\n'
+fi
 
 # The mailbox process ceilings use the same instrument as the reader suite.
 PROCESS_RC=0
