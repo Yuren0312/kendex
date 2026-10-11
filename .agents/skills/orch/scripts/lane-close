@@ -161,6 +161,8 @@ refuses as lane-live state=idle. A local lane's worktree is read on this disk;
 a hosted lane's .git through lane-host cat, as oversee-watch reads it before
 its own close of a merged hosted lane, and a read that fails refuses as
 worktree-read-failed.
+A Pi lane read unjudged also closes when its record carries the merge cycle
+and its worktree is gone. Every other unjudged lane refuses as lane-live.
 A limit banner below the lane's last turn is passed over only where
 `lanes pick --lane`, run under the record's host, so a hosted lane is read
 through the provider's copy, reads the account the record names as room, for
@@ -1310,18 +1312,25 @@ fi
 
 case "$state" in
   exited | windowless) ;;
-  idle)
-    tracker_rc=0
-    tracker_terminal || tracker_rc=$?
+  idle | unjudged)
+    tracker_rc=1
+    if [[ "$state" == idle ]]; then
+      tracker_rc=0
+      tracker_terminal || tracker_rc=$?
+    elif [[ "$harness" != pi ]]; then
+      message lane-live "item=$ITEM" "state=$state" "pane=$pane_id" >&2
+      exit 1
+    fi
     case "$tracker_rc" in
       0) ;;
       # The overseer's record of the merge, with the worktree the lane's
       # close-out removes gone, says the lane's work is done: an item held
-      # open for a box the overseer checks itself leaves the lane idle on
-      # nothing, a hosted one's sandbox billing until the box is checked.
-      1) { record_merged && worktree_gone; } || { message lane-live "item=$ITEM" "state=idle" "pane=$pane_id" >&2; exit 1; } ;;
+      # open for a box the overseer checks itself leaves no lane work,
+      # while a hosted one's sandbox bills until the box is checked.
+      1) { record_merged && worktree_gone; } || { message lane-live "item=$ITEM" "state=$state" "pane=$pane_id" >&2; exit 1; } ;;
       *) message tracker-read-failed "item=$ITEM" "tracker=$tracker" "source=$tracker_source" "cause=$TRACKER_CAUSE" >&2; exit 1 ;;
-    esac ;;
+    esac
+    state=idle ;;
   walled)
     message lane-live "item=$ITEM" "state=walled" "pane=$pane_id" "account=$WALL_ACCOUNT" ${WALL_RESETS:+"resets=$WALL_RESETS"} >&2
     exit 1 ;;

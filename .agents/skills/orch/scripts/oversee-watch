@@ -274,6 +274,7 @@ PW_STATE_DIR="${OVERSEE_WATCH_STATE_DIR:-$PROJECT_ROOT/tmp/oversee-watch}"
 #   lane-exited<TAB><lane><TAB><pane key>[|reported]
 #   terminal-close<TAB><item><TAB><terminal state>|<lane record JSON>
 #   lane-idle<TAB><lane><TAB><pane key>|<copilot note>|<screen cksum>[|reported]
+#   lane-idle<TAB><lane><TAB>pi-merged-gone[|reported]
 #   handoff<TAB><item><TAB><record checksum>
 #   lane-prepare<TAB><item><TAB><preparation start epoch>|<ready|failed|stuck>
 #   start-stalled<TAB><item><TAB><running_at epoch>|<passes since reported, or seen>|<branch heads>|<last observed progress epoch>
@@ -1210,12 +1211,19 @@ close_hosted_lane() { # ITEM [--if-terminal]
   esac
 }
 
-close_finished_hosted_lane() { # LANE ROW KEY; updates check_lanes' asking_state and close_failed
+finished_hosted_lane_eligible() { # LANE; sets hosted lane identity
   hosted_lane_item "$1"
   # A worktree still standing belongs to a lane inside merge close-out,
   # or one the overseer resumes. Only its removed worktree admits close.
   if [[ -n "$HOSTED_ROOT" && -n "$(lane_row_get merged "$asking_state" "$LANE_ITEM")" ]] \
      && grep -qxF -- "$LANE_ITEM" <<<"$HOSTED_GONE_ITEMS"; then
+    return 0
+  fi
+  return 1
+}
+
+close_finished_hosted_lane() { # LANE ROW KEY; updates check_lanes' asking_state and close_failed
+  if finished_hosted_lane_eligible "$1"; then
     # Commit before the irreversible close so a stopped pass cannot repeat it.
     lane_row_commit "$asking_state"
     if ! close_hosted_lane "$LANE_ITEM"; then
@@ -4141,6 +4149,23 @@ check_lanes() {
         capacity=1
       fi
     else
+      # Removed Pi rows cannot judge idle. Hold the merged-and-gone evidence
+      # for two long passes so close-out can send its final clone notice.
+      if [[ "${LANE_ROWS[$i]:-}" == none && "$(lane_obs_state "$states" "$i")" == unjudged ]] \
+         && finished_hosted_lane_eligible "$lane"; then
+        if ! prior="$(lane_row_get lane-idle "$asking_state" "$lane")"; then
+          die state-read-failed "" "lane=$lane" "row=lane-idle"
+        fi
+        [[ "$prior" != pi-merged-gone'|reported' ]] || continue
+        if [[ "$prior" == pi-merged-gone ]]; then
+          asking_state="$(lane_row_set lane-idle "$asking_state" "$lane" 'pi-merged-gone|reported')"
+          PASS_EVENT=1
+          close_finished_hosted_lane "$lane" lane-idle pi-merged-gone
+        else
+          asking_state="$(lane_row_set lane-idle "$asking_state" "$lane" pi-merged-gone)"
+        fi
+        continue
+      fi
       asking_state="$(lane_row_clear lane-idle "$asking_state" "$lane")"
       asking_state="$(lane_row_clear model-capacity "$asking_state" "$lane")"
       continue
