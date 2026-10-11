@@ -1477,9 +1477,9 @@ lane_copilot_allows_all() { # CMD [HARNESS]
   return 1
 }
 
-# The lane variable's value in the DEEPEST process under pane pid $1 that
-# carries it, empty when none does. Breadth first, so no carrier found later is
-# shallower than one found earlier.
+# CODEX_HOME from the deepest codex process under pane pid $1, even when unset.
+# Other lane variables retain the deepest nonempty value. Breadth first, so no
+# process found later is shallower than one found earlier.
 #
 # Deepest, not first: under `env VAR=<picked> claude` the env process carries
 # the picked value while a wrapper below it can already have replaced it, and a
@@ -1489,13 +1489,30 @@ lane_copilot_allows_all() { # CMD [HARNESS]
 # pgrep's 0 and 1 are its two answers and anything else is the probe breaking.
 # pgrep, not `ps --ppid`, which is procps-only and rejected by BSD ps.
 lane_observed_dir() { # PANE_PID NAME
-  local name="$2" frontier next pid kids value rc found=""
+  local name="$2" frontier next pid kids value rc found="" command name_re lib_dir
+  if [[ "$name" == CODEX_HOME ]]; then
+    # Standalone readers need the classifier without replacing caller globals.
+    name_re="$(
+      if ! declare -F lane_harness_process_re >/dev/null; then
+        lib_dir="$(dirname "${BASH_SOURCE[0]}")" || exit 2
+        # shellcheck source=lane-state.sh
+        source "$lib_dir/lane-state.sh" || exit 2
+      fi
+      lane_harness_process_re codex
+    )" || return 2
+  fi
   frontier="$(pgrep -P "$1" 2>/dev/null)" || { rc=$?; [[ "$rc" -eq 1 ]] || return 2; frontier=""; }
   while [[ -n "$frontier" ]]; do
     next=""
     for pid in $frontier; do
       kids="$(pgrep -P "$pid" 2>/dev/null)" || { rc=$?; [[ "$rc" -eq 1 ]] || return 2; kids=""; }
       [[ -z "$kids" ]] || next+="$kids"$'\n'
+      # Codex helpers can carry another home. Other variables name multiple
+      # commands, including Copilot's MainThread and Pi on CLAUDE_CONFIG_DIR.
+      if [[ "$name" == CODEX_HOME ]]; then
+        read -r command 2>/dev/null < "/proc/$pid/comm" || continue
+        [[ "$command" =~ $name_re ]] || continue
+      fi
       # A process that exits mid-walk takes its /proc entry with it; that is an
       # absent value, not a broken probe.
       # 2> BEFORE <: redirections apply left to right, so a suppression written
@@ -1503,7 +1520,7 @@ lane_observed_dir() { # PANE_PID NAME
       # stderr — a shell error in the launch output for the very case the
       # comment above calls an absent value.
       value="$(tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" | sed -n "s/^$name=//p" | tail -1)" || value=""
-      [[ -z "$value" ]] || found="$value"
+      if [[ "$name" == CODEX_HOME || -n "$value" ]]; then found="$value"; fi
     done
     frontier="$next"
   done

@@ -122,5 +122,98 @@ if lane_process_env_readable; then
     "control: a bound counted in pauses rather than seconds ends the reading early"
 fi
 
+echo "=== Codex ignores helpers and other account carriers retain their readings ==="
+if lane_process_env_readable; then
+  # The executables retain their command names while waiting. The child sends
+  # readiness through a pipe after exec, so the check reads the whole tree.
+  for command in codex node_repl codex-code-mode MainThread pi opencode; do
+    cp "$BASH" "$BIN/$command"
+  done
+  ACCOUNT_STUB='child_env=()
+[[ "$CHILD_HOME" == unset ]] || child_env+=("$ACCOUNT_NAME=$CHILD_HOME")
+env -i PATH="$PATH" "${child_env[@]}" "$BIN/$CHILD_COMMAND" -c '\''printf "ready\n" >&8; read -r -t 30 hold <&9 || true'\'' &
+child=$!
+trap '\''kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true'\'' EXIT
+wait "$child"'
+  account_row() { # LIB NAME PARENT_COMMAND CHILD_COMMAND CHILD_HOME [STATE_LIB]
+    (
+      source "$1"
+      # Production launchers load lane-state; direct readers do not. Both must
+      # retain the caller's state when they obtain the process classifier.
+      unset -f lane_harness_process_re
+      if [[ -n "${6:-}" ]]; then source "$6" || return 1; fi
+      WORKING_RE=account-fixture LANE_STOP_COUNT=account-fixture
+      mkfifo "$TMP_ROOT/ready" "$TMP_ROOT/hold"
+      exec 8<> "$TMP_ROOT/ready" 9<> "$TMP_ROOT/hold"
+      env -i PATH="$PATH" "$2=$TMP_ROOT/picked" ACCOUNT_NAME="$2" BIN="$BIN" CHILD_COMMAND="$4" CHILD_HOME="$5" \
+        "$BASH" -c '"$1" -c "$2" & child=$!; trap '\''kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true'\'' EXIT; wait "$child"' \
+        pane "$BIN/$3" "$ACCOUNT_STUB" &
+      pane_pid=$!
+      trap 'kill "$pane_pid" 2>/dev/null || true; wait "$pane_pid" 2>/dev/null || true; rm -- "$TMP_ROOT/ready" "$TMP_ROOT/hold"' EXIT
+      read -r -t 5 ready <&8
+      [[ "$ready" == ready ]]
+      lane_observed_dir "$pane_pid" "$2" >/dev/null || return 1
+      [[ "$WORKING_RE" == account-fixture && "$LANE_STOP_COUNT" == account-fixture ]] || return 1
+      if [[ -z "${6:-}" ]]; then
+        ! declare -F lane_harness_process_re >/dev/null || return 1
+      fi
+      tmux() { printf '%s\n' "$pane_pid"; }
+      PATH="$BIN:$PATH"
+      lane_account_check %1 "$2" "$TMP_ROOT/picked" prefix 1 || true
+      printf '%s' "$LANE_ACCOUNT_RESULT"
+    )
+  }
+  # name|parent command|child command|child home|result|label|optional state library
+  # Copilot's native binary uses MainThread. lane_env_prefix emits
+  # CLAUDE_CONFIG_DIR for Pi-on-Claude and Opencode as well as Claude.
+  for row in \
+    "CODEX_HOME|codex|node_repl|$TMP_ROOT/default|verified|a codex process on the picked home ignores a node_repl child on another home" \
+    "CODEX_HOME|codex|codex-code-mode|$TMP_ROOT/default|verified|a codex process on the picked home ignores a codex-code-mode child on another home" \
+    "CODEX_HOME|codex|codex|$TMP_ROOT/default|mismatch|a codex wrapper on the picked home cannot hide a deeper codex process on another home" \
+    'CODEX_HOME|codex|codex|unset|unobserved:no-lane-variable|a deeper codex process without CODEX_HOME cannot inherit the observed wrapper account' \
+    "COPILOT_HOME|MainThread|MainThread|$TMP_ROOT/picked|verified|Copilot MainThread on the picked home verifies" \
+    "COPILOT_HOME|MainThread|MainThread|$TMP_ROOT/default|mismatch|Copilot MainThread on another home mismatches" \
+    'COPILOT_HOME|MainThread|MainThread|unset|verified|an unset non-Codex child retains the deepest nonempty account' \
+    "CLAUDE_CONFIG_DIR|pi|pi|$TMP_ROOT/picked|verified|Pi-on-Claude on the picked home verifies" \
+    "CLAUDE_CONFIG_DIR|pi|pi|$TMP_ROOT/default|mismatch|Pi-on-Claude on another home mismatches" \
+    "CLAUDE_CONFIG_DIR|opencode|opencode|$TMP_ROOT/picked|verified|Opencode on the picked home verifies" \
+    "CLAUDE_CONFIG_DIR|opencode|opencode|$TMP_ROOT/default|mismatch|Opencode on another home mismatches" \
+    "CODEX_HOME|codex|node_repl|$TMP_ROOT/default|verified|the loaded shared classifier ignores the Codex helper without changing caller state|$SCRIPTS_DIR/lib/lane-state.sh"; do
+    IFS='|' read -r name parent_command child_command child_home expect label state_lib <<<"$row"
+    assert_eq "$(account_row "$LIB" "$name" "$parent_command" "$child_command" "$child_home" "$state_lib")" "$expect" "$label"
+  done
+  ACCOUNT_CONTROL="$(mutant_scripts helper-account lib/lane-launch.sh)" || exit 1
+  mutate_file "$ACCOUNT_CONTROL/lib/lane-launch.sh" '[[ "$command" =~ $name_re ]] || continue' ':'
+  assert_eq "$(account_row "$ACCOUNT_CONTROL/lib/lane-launch.sh" CODEX_HOME codex node_repl "$TMP_ROOT/default")" mismatch \
+    "control: reading every descendant lets node_repl replace the picked harness account"
+  ACCOUNT_CONTROL="$(mutant_scripts non-codex-account lib/lane-launch.sh)" || exit 1
+  mutate_file "$ACCOUNT_CONTROL/lib/lane-launch.sh" \
+    $'\n  if [[ "$name" == CODEX_HOME ]]; then\n' \
+    $'\n  if :; then\n'
+  mutate_file "$ACCOUNT_CONTROL/lib/lane-launch.sh" $'if [[ "$name" == CODEX_HOME ]]; then\n        read -r command' $'if :; then\n        read -r command'
+  assert_eq "$(account_row "$ACCOUNT_CONTROL/lib/lane-launch.sh" COPILOT_HOME MainThread MainThread "$TMP_ROOT/default")" unobserved:no-lane-variable \
+    "control: filtering non-Codex process names hides a replaced Copilot account"
+  ACCOUNT_CONTROL="$(mutant_scripts unset-codex-account lib/lane-launch.sh)" || exit 1
+  mutate_file "$ACCOUNT_CONTROL/lib/lane-launch.sh" '[[ "$name" == CODEX_HOME || -n "$value" ]]' '[[ -n "$value" ]]'
+  assert_eq "$(account_row "$ACCOUNT_CONTROL/lib/lane-launch.sh" CODEX_HOME codex codex unset)" verified \
+    "control: discarding an empty Codex reading falsely verifies the wrapper account"
+  ACCOUNT_CONTROL="$(mutant_scripts unset-non-codex-account lib/lane-launch.sh)" || exit 1
+  mutate_file "$ACCOUNT_CONTROL/lib/lane-launch.sh" 'if [[ "$name" == CODEX_HOME || -n "$value" ]]; then' 'if :; then'
+  assert_eq "$(account_row "$ACCOUNT_CONTROL/lib/lane-launch.sh" COPILOT_HOME MainThread MainThread unset)" unobserved:no-lane-variable \
+    "control: retaining an empty non-Codex reading hides the account still carried by its parent"
+  ACCOUNT_CONTROL="$(mutant_scripts classifier-account lib/lane-state.sh)" || exit 1
+  mutate_file "$ACCOUNT_CONTROL/lib/lane-state.sh" \
+    "    copilot) printf '%s\\n' '^(copilot|MainThread)\$' ;;" \
+    $'    codex) printf \'%s\\n\' \'^node_repl$\' ;;\n    copilot) printf \'%s\\n\' \'^(copilot|MainThread)$\' ;;'
+  for state_lib in "" "$ACCOUNT_CONTROL/lib/lane-state.sh"; do
+    assert_eq "$(account_row "$ACCOUNT_CONTROL/lib/lane-launch.sh" CODEX_HOME codex node_repl "$TMP_ROOT/default" "$state_lib")" mismatch \
+      "control: the account reader follows the shared classifier for ${state_lib:-standalone loading}"
+  done
+  ACCOUNT_CONTROL="$(mutant_scripts caller-state-account lib/lane-launch.sh)" || exit 1
+  mutate_file "$ACCOUNT_CONTROL/lib/lane-launch.sh" $'  printf \'%s\\n\' "$found"' $'  WORKING_RE=changed; printf \'%s\\n\' "$found"'
+  assert_eq "$(account_row "$ACCOUNT_CONTROL/lib/lane-launch.sh" CODEX_HOME codex node_repl "$TMP_ROOT/default" || printf 'caller-state-rejected=%s' "$?")" caller-state-rejected=1 \
+    "control: a direct account read that changes caller state fails its fixture"
+fi
+
 printf '\npass: %d   fail: %d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
