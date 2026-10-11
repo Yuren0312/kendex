@@ -1283,11 +1283,12 @@ lane_codex_trust_prepare() { # LANE_DIR LAUNCH_DIR
 # on another machine. It keeps its caller's form and has no local account read.
 lane_launch_form() { # CMD HARNESS LANE_DIR [TEMPLATE]
   local cmd="$1" harness="$2" dir="$3" template="${4:-}" name path
-  if [[ -z "$dir" ]] || [[ ! "$harness" =~ ^(claude|codex|copilot)$ ]]; then
+  if [[ ! "$harness" =~ ^(claude|codex|copilot)$ ]]; then
     printf 'unchecked\n'
     return
   fi
   if [[ -n "$template" ]]; then printf 'custom\n'; return; fi
+  if [[ -z "$dir" ]]; then printf 'unchecked\n'; return; fi
   name="$(basename -- "$dir")" || { printf 'prefix\n'; return; }
   name="${name#.}"
   if [[ "$name" != *"$harness"* || "$name" == "$harness" ]]; then printf 'prefix\n'; return; fi
@@ -1335,8 +1336,24 @@ lane_launch_compaction_env() { # CMD HARNESS VERIFIED
   printf 'ORCH_COMPACTION_OVERRIDES=%s' "$(lane_single_quote "$overrides")"
 }
 
-# The launch line for a command that must run on a chosen account, under the
-# form lane_launch_form picked for it.
+# Claude's critical-path prompts survive bypassPermissions. The provider's
+# https://code.claude.com/docs/en/permission-modes#critical-paths and
+# https://code.claude.com/docs/en/env-vars require these switches in the
+# launching environment, not a settings env block. The inline switch needs
+# v2.1.288. Subagents inherit them from the launched session.
+lane_launch_rm_prompt_env() { # CMD HARNESS
+  local rc=0
+  [[ "$2" == claude ]] || return 0
+  lane_copilot_allows_all "$1" "$2" || rc=$?
+  case "$rc" in
+    0) printf 'CLAUDE_CODE_DISABLE_INLINE_SHELL_RM_PROMPT=1 CLAUDE_CODE_DISABLE_SUBSTITUTION_RM_PROMPT=1' ;;
+    1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The complete command under the form lane_launch_form picked for it. Empty
+# account words keep the caller's account, or the provider's on a host.
 #
 # The prefix value is quoted by lane_single_quote, not wrapped in bare quotes:
 # lane dirs are paths, an unquoted space would split the env assignment inside
@@ -1348,7 +1365,7 @@ lane_launch_compaction_env() { # CMD HARNESS VERIFIED
 # this builder's to do.
 #
 # The lane is recorded in the launched command itself, so `ps` and the pane's
-# own first line show which account a stalled session belongs to — as the
+# own first line show which account a stalled session belongs to: the
 # launcher's own path, or as the env prefix where the machine has no launcher.
 # Not the window title: both launchers open their window with an explicit -n,
 # which turns tmux's automatic rename off, so the title keeps the name it was
@@ -1359,18 +1376,37 @@ lane_launch_compaction_env() { # CMD HARNESS VERIFIED
 # nothing else: the account variable here, and the words lane_copilot_env
 # below prints.
 lane_launch_line() { # CMD HARNESS LANE_VAR LANE_DIR FORM
-  local cmd="$1" harness="$2" var="$3" dir="$4" form="$5" compaction="" verified=true env_words
-  if [[ "$harness" == codex ]]; then
+  local cmd="$1" harness="$2" var="$3" dir="$4" form="$5" launch_env="" verified=true env_words
+  launch_env=$(lane_launch_rm_prompt_env "$cmd" "$harness") || return 1
+  if [[ "$harness" == codex && -n "$var" ]]; then
     [[ "$form" != unchecked && "$form" != custom ]] || verified=false
-    compaction=$(lane_launch_compaction_env "$cmd" "$harness" "$verified") || return 1
+    launch_env=$(lane_launch_compaction_env "$cmd" "$harness" "$verified") || return 1
   fi
   if [[ "$harness" != copilot ]]; then
     case "$form" in
-      launcher:*) printf '%s%s %s\n' "${compaction:+env $compaction }" "$(lane_single_quote "${form#launcher:}")" "${cmd#"$harness" }" ;;
-      *) printf 'env %s=%s %s%s\n' "$var" "$(lane_single_quote "$dir")" "${compaction:+$compaction }" "$cmd" ;;
+      custom)
+        [[ -z "$var" ]] || launch_env="$var=$(lane_single_quote "$dir")${launch_env:+ $launch_env}"
+        # The whole custom command runs in the same shell language. One
+        # quoted -c argument keeps operators, expansions and comments intact,
+        # and remains executable argv for overseer-run and other consumers.
+        if [[ -n "$launch_env" ]]; then
+          printf 'env %s %s -c %s\n' "$launch_env" "$(lane_single_quote "$BASH")" "$(lane_single_quote "$cmd")"
+        else
+          printf '%s\n' "$cmd"
+        fi
+        ;;
+      launcher:*) printf '%s%s %s\n' "${launch_env:+env $launch_env }" "$(lane_single_quote "${form#launcher:}")" "${cmd#"$harness" }" ;;
+      *)
+        if [[ -n "$var" ]]; then
+          printf 'env %s=%s %s%s\n' "$var" "$(lane_single_quote "$dir")" "${launch_env:+$launch_env }" "$cmd"
+        else
+          printf '%s%s\n' "${launch_env:+env $launch_env }" "$cmd"
+        fi
+        ;;
     esac
     return
   fi
+  if [[ -z "$var" ]]; then printf '%s\n' "$cmd"; return; fi
   env_words="$(lane_copilot_env "$cmd" "$(lane_single_quote "${LANES_HOME:-$HOME}/.agents/skills")")"
   case "$form" in
     launcher:*) printf '%s %s %s\n' "$env_words" "$(lane_single_quote "${form#launcher:}")" "${cmd#"$harness" }" ;;
@@ -1426,14 +1462,15 @@ lane_copilot_env() { # CMD SKILLS
   printf 'env -u COPILOT_GITHUB_TOKEN COPILOT_SKILLS_DIRS=%s %s\n' "$2" "$allow"
 }
 
-# Whether CMD carries one of the copilot row's transferable permission
-# spellings, the full allow-all ones, as a word the shell hands copilot. The
-# tools-only `--allow-all-tools` is not one: it leaves paths and URLs asking.
-lane_copilot_allows_all() { # CMD
-  local spellings i
-  spellings="$(launch_choice_transfer_permission_spellings copilot)"
-  launch_choice_shell_words "$1"
+# Whether CMD carries a transferable full-bypass permission word. Existing
+# Copilot callers omit HARNESS; tools-only --allow-all-tools is not full bypass.
+# Claude stops reading options at --. Return 2 when the command cannot be read.
+lane_copilot_allows_all() { # CMD [HARNESS]
+  local harness="${2:-copilot}" spellings i
+  spellings="$(launch_choice_transfer_permission_spellings "$harness")" || return 2
+  launch_choice_shell_words "$1" || return 2
   for ((i = 0; i < ${#LAUNCH_CHOICE_ARGV[@]}; i++)); do
+    [[ "$harness" != claude || "${LAUNCH_CHOICE_ARGV[i]}" != -- ]] || break
     launch_choice_permission_match "$spellings" "${LAUNCH_CHOICE_ARGV[i]}" "${LAUNCH_CHOICE_ARGV[i+1]:-}"
     (( LAUNCH_CHOICE_PERMISSION_SPAN == 0 )) || return 0
   done
