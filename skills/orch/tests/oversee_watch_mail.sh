@@ -1125,6 +1125,100 @@ WATCH_BIN="$TMP_ROOT/watch-ceiling" run_watch ORCH_WATCH_MAIL_INTERVAL=1 PATH="$
   >/dev/null 2>&1 || waived_rc=$?
 assert_eq "$waived_rc" "124" "control: with the clock waived the mail intervals are real and outlast a one-second ceiling"
 
+# A host read spends more than the mail interval on the injected clock.
+# This proves timer wiring and the persisted end time, not wall-clock latency.
+cat > "$TMP_ROOT/bin/mail-host-slow" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == read-many ]]; then
+  printf 'start %s\n' "$(date -u +%s)" >> "$STUB_DIR/mail-times"
+  if [[ "$(grep -c '^start ' "$STUB_DIR/mail-times")" -eq "${MAIL_NOTICE_AT:-2}" ]]; then
+    printf '{"id":"slow-host","kind":"notice","at":"t","text":"Read completed"}\n' > "$LANE_HOST_STUB_DIR/srv/lane/ken-70/tmp/lane-mail/KEN-70/to-overseer.jsonl"
+  fi
+  sleep 5
+  printf 'end %s\n' "$(date -u +%s)" >> "$STUB_DIR/mail-times"
+fi
+exec "$FIXTURE_HOST" "$@"
+EOF
+chmod +x "$TMP_ROOT/bin/mail-host-slow"
+cat > "$TMP_ROOT/mail-clock-env" <<'EOF'
+set -T
+trap 'if [[ "$BASH_COMMAND" == tick_wait && "${OWED_MAIL_TEST:-}" == 1 && -n "${LONG_PID:-}" ]]; then
+  until [[ -e "$LONG_DONE" ]]; do "$STUB_REAL_SLEEP" 0.1; done
+fi
+if [[ "$BASH_COMMAND" == *"WATCH_EPOCH + SECONDS - WATCH_SECONDS"* && -n "${STUB_CLOCK:-}" ]]; then
+  IFS= read -r _virtual_now <"$STUB_CLOCK" || [[ "$_virtual_now" =~ ^[0-9]+$ ]]
+  SECONDS=$((_virtual_now - WATCH_EPOCH + WATCH_SECONDS))
+fi' DEBUG
+EOF
+mail_idle_run() { # CASE [WATCH]
+  new_case "$1"
+  _virtual_clock_seed
+  mkdir -p "$STATE_DIR"
+  printf 'long-pass\tfleet\t%s\n' "$(cat "$STUB_CLOCK")" > "$STATE_DIR/owner_repo__none.mail"
+  mkdir -p "$STUB_DIR/remote/srv/lane/ken-70/tmp/lane-mail/KEN-70"
+  printf 'gitdir: /srv/clone/.git/worktrees/ken-70\n' > "$STUB_DIR/remote/srv/lane/ken-70/.git"
+  out="$(WATCH_BIN="${2:-}" run_watch ORCH_WATCH_MAIL_INTERVAL=2 \
+    PATH="$CLOCK_BIN:$TMP_ROOT/bin:$PATH" BASH_ENV="$TMP_ROOT/mail-clock-env" \
+    ORCH_LANE_HOST="$TMP_ROOT/bin/mail-host-slow" FIXTURE_HOST="$FIXTURE_HOST" \
+    LANE_HOST_STUB_LOG="$STUB_DIR/host.log" LANE_HOST_STUB_DIR="$STUB_DIR/remote" \
+    -- --interval 3600 --max-loops 2 --item KEN-70 --hosted KEN-70=/srv/lane/ken-70 2>"$STUB_DIR/idle.err")"
+  assert_contains "$out" 'EVENT lane-notice KEN-70 slow-host' 'the second host read completes and delivers its notice' "$STUB_DIR/idle.err"
+  MAIL_IDLE="$(awk '$1 == "end" && !ended { ended=$2; next } $1 == "start" && ended { print $2-ended; exit }' "$STUB_DIR/mail-times")"
+}
+mail_idle_run mail_cadence_slow_host
+assert_eq "$MAIL_IDLE" 2 'a slow host read is followed by a full idle interval' "$STUB_DIR/idle.err"
+assert_eq "$(awk '$1 == "mail-pass" { print $3 }' "$STATE_DIR/owner_repo__none.mail")" "$(cat "$STUB_CLOCK")" \
+  'the completed turn timestamp is persisted for the next run'
+IDLE_MUTANT="$(mutant_scripts idle-mutant/orch oversee-watch)/oversee-watch" || exit 1
+ln -s "$REPO_ROOT/skills/github" "$TMP_ROOT/idle-mutant/github"
+mutate_file "$IDLE_MUTANT" 'MAIL_DUE=$((WATCH_EPOCH + SECONDS - WATCH_SECONDS))' 'MAIL_DUE=$PASS_NOW'
+mail_idle_run mail_cadence_slow_host_control "$IDLE_MUTANT"
+assert_eq "$MAIL_IDLE" 0 'control: the base cadence starts the next read at once after an overrun' "$STUB_DIR/idle.err"
+
+# A completed long pass owes a final full read before the heartbeat. Hold the
+# first wait on its completion file so no ordinary mail deadline can cause
+# that read. The next run's long pass is not due, so its read keeps the idle
+# interval after the owed read. This proves timer wiring across runs.
+mail_owed_run() { # CASE [WATCH]
+  new_case "$1"
+  mail_reset KEN-70
+  _virtual_clock_seed
+  mkdir -p "$STUB_DIR/remote/srv/lane/ken-70/tmp/lane-mail/KEN-70"
+  printf 'gitdir: /srv/clone/.git/worktrees/ken-70\n' > "$STUB_DIR/remote/srv/lane/ken-70/.git"
+  # A parent deadline also bounds the completion-file barrier.
+  printf '#!/usr/bin/env bash\nexec "%s" 60 "%s" "$@"\n' \
+    "$(command -v timeout || command -v gtimeout)" "${2:-$REPO_ROOT/skills/orch/scripts/oversee-watch}" > "$TMP_ROOT/owed-ceiling"
+  chmod +x "$TMP_ROOT/owed-ceiling"
+  local run
+  for run in 1 2; do
+    out="$(WATCH_BIN="$TMP_ROOT/owed-ceiling" run_watch ORCH_WATCH_MAIL_INTERVAL=2 \
+      PATH="$CLOCK_BIN:$TMP_ROOT/bin:$PATH" BASH_ENV="$TMP_ROOT/mail-clock-env" \
+      ORCH_LANE_HOST="$TMP_ROOT/bin/mail-host-slow" FIXTURE_HOST="$FIXTURE_HOST" \
+      LANE_HOST_STUB_LOG="$STUB_DIR/host.log" LANE_HOST_STUB_DIR="$STUB_DIR/remote" \
+      MAIL_NOTICE_AT=3 OWED_MAIL_TEST=1 \
+      -- --interval 3600 --max-loops 1 --item KEN-70 --hosted KEN-70=/srv/lane/ken-70 2>"$STUB_DIR/owed.err")"
+    if [[ "$run" -eq 1 ]]; then
+      assert_contains "$out" 'EVENT heartbeat ' 'the quiet long pass ends on its heartbeat' "$STUB_DIR/owed.err"
+      assert_eq "$(grep -c '^end ' "$STUB_DIR/mail-times")" 2 'the heartbeat follows the owed full host read' "$STUB_DIR/owed.err"
+      OWED_STAMP="$(awk '$1 == "mail-pass" { print $3 }' "$STATE_DIR/owner_repo__none.mail")"
+      OWED_END="$(cat "$STUB_CLOCK")"
+    else
+      assert_contains "$out" 'EVENT lane-notice KEN-70 slow-host' 'the next run completes its host read' "$STUB_DIR/owed.err"
+    fi
+  done
+  OWED_IDLE="$(awk '$1 == "end" { ended=$2; n++; next } $1 == "start" && n == 2 { print $2-ended; exit }' "$STUB_DIR/mail-times")"
+}
+mail_owed_run mail_cadence_owed
+assert_eq "$OWED_STAMP" "$OWED_END" 'the owed full read persists its completed timestamp'
+assert_eq "$OWED_IDLE" 2 'the next run idles a full interval after the owed read'
+OWED_MUTANT="$(mutant_scripts owed-mutant/orch oversee-watch)/oversee-watch" || exit 1
+ln -s "$REPO_ROOT/skills/github" "$TMP_ROOT/owed-mutant/github"
+mutate_file "$OWED_MUTANT" 'if [[ $# -eq 0 ]]; then' 'if [[ $# -eq 0 && "$LONG_PASSES" -lt "$MAX_LOOPS" ]]; then'
+mail_owed_run mail_cadence_owed_control "$OWED_MUTANT"
+assert_eq "$((OWED_STAMP < OWED_END))|$OWED_IDLE" '1|0' \
+  'control: leaving the owed read unrecorded starts the next run with no idle interval'
+
 # --- the first long pass, after a read of every mailbox ---------------------
 # A run started a moment after the last full mail pass, as a note to the
 # overseer starts one, with its long pass due: that pass takes the removed

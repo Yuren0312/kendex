@@ -23,8 +23,8 @@ Blocks until the fleet needs the overseer, then prints every event it found
 as one block, each line prefixed with its kind, and exits once. Re-run after
 handling every line with the live fleet in scope.
 
-Two passes run on one clock. The mail pass starts every
-ORCH_WATCH_MAIL_INTERVAL seconds, reads every lane mailbox, the overseer
+Two passes run on one clock. After each full read, including the heartbeat's
+owed read, the mail pass idles for ORCH_WATCH_MAIL_INTERVAL seconds. It reads every lane mailbox, the overseer
 mailbox and the lane records one after another, and prints what it finds as
 it finds it: lane-question, lane-notice, directive-read, directive-unread,
 peer-note, owner-note, owner-ask-resolved and owner-ask-closed. Hosted mail
@@ -32,17 +32,17 @@ uses `lane-host read-many` once per provider per mail pass, as
 schemas/lane-host.md specifies. Before the overseer mailbox is read,
 `lane-mail resolve --default` closes due owner asks.
 Only an unanswered ask receives a recommendation answer. The interval is
-counted start to start and kept across runs in the state directory. Between
+counted end to start and kept across runs in the state directory. Between
 two mail passes, and through a --repeat sleep, the overseer mailbox's size is
 checked once a second, and once it moves that mailbox alone is read, so a
 note to the overseer is printed within about a second while the lane
 mailboxes keep the interval; a run's first turn reads it alone too when no
-mail pass is due. A run's first long pass follows a read of every mailbox in
-that run, due or not. ORCH_WATCH_MAIL_INTERVAL 0 checks nothing between turns. A read that waits
-on a lock or a slow host delays
-the mailboxes after it past that interval, as do the overseer pane below and,
-run in this loop, a run's one GitHub auth check before its first long pass
-and the heartbeat's open-PR listing. The long pass reads everything else
+mail pass is due. A run's first long pass requires a fresh read of every
+mailbox in that run, which can run before the interval ends.
+ORCH_WATCH_MAIL_INTERVAL 0 checks nothing between turns. A read that waits
+on a lock or a slow host delays the mailboxes after it. The overseer pane
+below, a run's one GitHub auth check before its first long pass and the
+heartbeat's open-PR listing can also delay the next turn. The long pass reads everything else
 every --interval seconds, counted start to start and kept across runs in the
 state directory, so a run ending on mail news brings the next one no nearer. A long pass runs apart from the mail pass: one that overruns its
 interval holds up no mail pass, the next one starts only once it has ended,
@@ -1083,17 +1083,19 @@ Environment:
                               security-alert, bot-fix and
                               security-alerts-unread rows; the mail pass's
                               file beside the first one holds
-                              each lane mailbox's read position and when the
-                              last mail and long passes started, plus claims/ and
+                              each lane mailbox's read position, when the last
+                              full mail pass completed and when the last long
+                              pass started, plus claims/ and
                               usage/, both shared across the repositories
                               that point here
-  ORCH_WATCH_MAIL_INTERVAL    seconds from the start of one mail pass to the
-                              next, a whole number, default 20, and the most
+  ORCH_WATCH_MAIL_INTERVAL    idle seconds after a full mail read, a whole
+                              number, default 20, and the most
                               --repeat waits between two runs after one that
                               did not exit 2: a lane read failure first
                               reported, a hosted lane close that fails, or a
                               global failure. The mail pass paragraph above
-                              names when a note lands later. 0 reads the mail
+                              names the first-long-pass exception and delays.
+                              0 reads the mail
                               on every turn of the loop and waits out a long
                               pass in flight rather than polling it
   ORCH_DIRECTIVE_UNREAD_SECS  age in seconds past which a directive the lane
