@@ -688,8 +688,8 @@ PREPARE_ROWS=""
 PARKED_ROWS_FILTER='
   (.lanes // [])[] | select(type == "object" and .status == "parked")
   | if ((.item? | type) != "string" or (.item | length) == 0) then error("lane-field field=item value=\(.item | tojson)")
-    elif ((.parked.pr? | type) != "number" or (.parked.repo? | type) != "string") then error("lane-field field=parked value=\(.parked | tojson)")
-    else "\(.item)\u001f\(.parked.repo | ascii_downcase)#\(.parked.pr)\u001f\(.launched_at | if . == null then "" else (fromdateiso8601 | tostring) end)" end'
+    elif (((.parked.until_pr // .parked.pr) | type) != "number" or (.parked.repo? | type) != "string") then error("lane-field field=parked value=\(.parked | tojson)")
+    else "\(.item)\u001f\(.parked.repo | ascii_downcase)#\(.parked.until_pr // .parked.pr)\u001f\(.launched_at | if . == null then "" else (fromdateiso8601 | tostring) end)" end'
 PARKED_ITEMS=()
 PARKED_KEYS=()
 
@@ -1521,16 +1521,60 @@ merged_item_read() { # ITEM REPO PR [SINCE_EPOCH] [SINCE_UTC]
 
 check_merged() {
   [[ -n "$ITEM_BRANCHES" ]] || return 0
-  local errf="$WORK_DIR/merged.err" item branch repo pr hit hits prior keys fresh key line state="${PW_SEEN[0]}"
+  local errf="$WORK_DIR/merged.err" item branch repo pr hit hits prior keys fresh key line until view dependency_state dependency_record own_pr own_repo state="${PW_SEEN[0]}"
   for item in "${MERGED_ITEMS[@]}"; do
     branch="$(printf '%s' "$item" | tr '[:upper:]' '[:lower:]')"
     PARKED_KEY=""
     item_parked "$item" || true
+    until="$(jq -r --arg item "$item" '(.lanes // [])[] | select(.item == $item and .status == "parked") | .parked.until_pr // empty' <<<"${FLEET_STATE:-"{}"}")" \
+      || die state-invalid "" "path=$STATE_FILE" "field=parked"
+    if [[ -n "$until" ]]; then
+      repo="${PARKED_KEY%#*}"
+      view="$(gh pr view "$until" --repo "$repo" --json state 2>"$errf")" \
+        || die pr-list-failed "$(cat "$errf")" "repo=$repo" "pr=$until"
+      dependency_state="$(jq -er '.state | select(. == "OPEN" or . == "MERGED" or . == "CLOSED")' <<<"$view" 2>"$errf")" \
+        || die pr-list-invalid "$(cat "$errf")" "repo=$repo" "pr=$until"
+      key="$PARKED_KEY $dependency_state"
+      prior="$(lane_row_get parked-until "$state" "$item")" \
+        || die state-read-failed "" "item=$item" "row=parked-until"
+      if [[ "$key" != "$prior" ]]; then
+        case "$dependency_state" in
+          MERGED) parked_merged_line "$item" "$PARKED_KEY"; PASS_EVENT=1 ;;
+          CLOSED) echo "EVENT parked-closed $item pr=$until repo=$repo"; PASS_EVENT=1 ;;
+        esac
+      fi
+      state="$(lane_row_set parked-until "$state" "$item" "$key")"
+      # The dependency is not this item's merge and earns no item cycle.
+    fi
+    # Its own delivery still needs a merged row before terminal close can
+    # remove the lane. Recovery keeps that identity in pending_pr as well.
+    dependency_record="$(jq -c --arg item "$item" '(.lanes // [])[] | select(.item == $item) | (.parked // .pending_pr) | select(.until_pr != null)' <<<"${FLEET_STATE:-"{}"}")" \
+      || die state-invalid "" "path=$STATE_FILE" "field=parked"
+    own_pr="" own_repo=""
+    if [[ -n "$dependency_record" ]]; then
+      own_pr="$(jq -r '.pr // empty' <<<"$dependency_record")" \
+        || die state-invalid "" "path=$STATE_FILE" "field=parked"
+      own_repo="$(jq -r '.repo | ascii_downcase' <<<"$dependency_record")" \
+        || die state-invalid "" "path=$STATE_FILE" "field=parked"
+    fi
     hits=""
     for repo in "${REPOS[@]}"; do
       pr=null
       [[ "${PARKED_KEY%#*}" != "$repo" ]] || pr="${PARKED_KEY##*#}"
-      merged_item_read "$item" "$repo" "$pr" "$SINCE_EPOCH" "$SINCE"
+      if [[ -n "$dependency_record" ]]; then
+        [[ "$repo" == "$own_repo" && -n "$own_pr" ]] || continue
+        pr="$own_pr"
+        # A second branch need not carry a searchable item reference. Read
+        # the retained own number, never the dependency, through gh's PR API.
+        view="$(gh pr view "$pr" --repo "$repo" --json number,headRefName,headRepositoryOwner,mergedAt,mergeCommit,title,body 2>"$errf")" \
+          || die pr-list-failed "$(cat "$errf")" "repo=$repo" "pr=$pr"
+        if ! MERGED_ITEM_ROWS="$(jq -c --arg item "$item" --arg owner "${repo%%/*}" --argjson pr "$pr" --argjson since "$SINCE_EPOCH" \
+          "$LANE_MERGED_JQ"' [.] | lane_merged($item; $owner; $pr; $since)' <<<"$view" 2>"$errf")"; then
+          die pr-list-invalid "$(cat "$errf")" "repo=$repo" "pr=$pr"
+        fi
+      else
+        merged_item_read "$item" "$repo" "$pr" "$SINCE_EPOCH" "$SINCE"
+      fi
       if ! hit="$(jq -r --arg item "$item" --arg repo "$repo" '.[] | "\(.number) \($item | ascii_downcase) \($repo)"' <<<"$MERGED_ITEM_ROWS" 2>"$errf")"; then
         die pr-list-invalid "$(cat "$errf")" "repo=$repo" "branch=$branch"
       fi
@@ -1552,6 +1596,9 @@ check_merged() {
       PASS_EVENT=1
     done <<<"$hits"
     state="$(lane_row_set merged "$state" "$item" "$keys")"
+    # An own merge cannot clear a dependency wait. Its events and heartbeat
+    # replay remain owned by parked-until, independently of this merged row.
+    [[ -z "$dependency_record" ]] || continue
     item_parked "$item" && [[ -n "$fresh" ]] || continue
     # A parked item's fresh merges that are not its own are named, so a park
     # left standing over a merge has a line saying which merge it was not.
@@ -1562,6 +1609,7 @@ check_merged() {
     parked_merged_line "$item" "$PARKED_KEY"
   done
   state="$(lane_row_prune merged "$state" "${MERGED_ITEMS[@]}")"
+  state="$(lane_row_prune parked-until "$state" ${PARKED_ITEMS[@]+"${PARKED_ITEMS[@]}"})"
   lane_row_commit "$state"
 }
 
@@ -1589,8 +1637,13 @@ parked_merged_line() { # ITEM KEY
 # first hand, still has the merge named at the next heartbeat. Errexit is off
 # under the caller's `||`, so the row read returns its own failure.
 parked_merged_owed() { # STATE
-  local i row
+  local i row dependency
   for i in ${PARKED_ITEMS[@]+"${!PARKED_ITEMS[@]}"}; do
+    dependency="$(lane_row_get parked-until "$1" "${PARKED_ITEMS[$i]}")" || return 1
+    if [[ "$dependency" == "${PARKED_KEYS[$i]} MERGED" ]]; then
+      parked_merged_line "${PARKED_ITEMS[$i]}" "${PARKED_KEYS[$i]}"
+      continue
+    fi
     row="$(lane_row_get merged "$1" "${PARKED_ITEMS[$i]}")" || return 1
     [[ " $row " == *" ${PARKED_KEYS[$i]} "* ]] || continue
     parked_merged_line "${PARKED_ITEMS[$i]}" "${PARKED_KEYS[$i]}"
