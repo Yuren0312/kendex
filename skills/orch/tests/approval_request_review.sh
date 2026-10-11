@@ -25,24 +25,30 @@ cat > "$TMP_ROOT/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 case "$1 $2" in
-  'auth status'|'api user') exit 0 ;;
+  'auth status'|'api user') exit "${AUTH_EXIT:-0}" ;;
   'repo view') echo consumer/repo ;;
   'pr view')
     printf '%s\n' "$PWD|$*" >> "$QUERY_LOG"
-    if [[ "$*" == *'--json state,isDraft,headRefOid'* ]]; then
+    if [[ "$*" == *'--json state,isDraft'* ]]; then
       [[ "${HEAD_READ_FAIL:-false}" != true ]] || exit 1
       [[ "${HEAD_READ_FAIL_AFTER_READY:-false}" != true || ! -s "$TRANSITION_LOG" ]] || exit 1
       draft=false
       [[ ! -f "$DRAFT_FILE" ]] || draft="$(cat "$DRAFT_FILE")"
       head=current-head
       [[ ! -f "$HEAD_FILE" ]] || head="$(cat "$HEAD_FILE")"
-      jq -cn --argjson draft "$draft" --arg head "$head" '{state:"OPEN",isDraft:$draft,headRefOid:$head}'
+      view="$(jq -cn --argjson draft "$draft" --arg head "$head" --arg state "${PR_STATE:-OPEN}" '{state:$state,isDraft:$draft,headRefOid:$head}')"
+      if [[ "$*" == *'--jq'* ]]; then
+        jq -r "${!#}" <<<"$view"
+      else
+        printf '%s\n' "$view"
+      fi
     else
       echo '{"baseRefName":"feature/base","reviewDecision":"REVIEW_REQUIRED"}'
     fi
     ;;
   'pr ready')
     printf 'ready\n' >> "$TRANSITION_LOG"
+    [[ "${CLOUD_DIRTY_BASE:-false}" != true ]] || touch "$PWD/cloud-cleanup-blocker"
     [[ "${READY_EXIT:-0}" == 0 ]] || exit "$READY_EXIT"
     printf 'false\n' > "$DRAFT_FILE"
     [[ "${MOVE_READY_HEAD:-false}" != true ]] || printf 'new-head\n' > "$HEAD_FILE"
@@ -78,6 +84,7 @@ esac
 EOF
 chmod +x "$BASE/.agents/skills/orch/scripts/approval-wait" "$TMP_ROOT/bin/gh"
 RUN="$REPO_ROOT/skills/orch/scripts/approval-wait"
+STATE="$REPO_ROOT/skills/orch/scripts/workflow-state"
 OUT="$TMP_ROOT/out"
 ERR="$TMP_ROOT/err"
 REQUEST_LOG="$TMP_ROOT/requests"
@@ -106,7 +113,7 @@ run_action() { # SCRIPT REQUEST_EXIT ARGS...
   : > "$EXECUTION_LOG"
   : > "$TRANSITION_LOG"
   RC=0
-  (cd -- "$TMP_ROOT/catalog" && env -i GIT_CEILING_DIRECTORIES="$GIT_CEILING_DIRECTORIES" PATH="$TMP_ROOT/bin:$PATH" HOME="$TMP_ROOT/home" \
+  (cd -- "${ACTION_CWD:-$TMP_ROOT/catalog}" && env -i GIT_CEILING_DIRECTORIES="$GIT_CEILING_DIRECTORIES" PATH="$TMP_ROOT/bin:$PATH" HOME="$TMP_ROOT/home" \
     GH_TOKEN=github_pat_fixture GH_REPO=catalog/repo GITHUB_REPOSITORY=catalog/repo \
     REVIEW_GATE_MODE=enforce PR_REVIEW_GATE=review REVIEW_GATE_SETTINGS_FILE=/dev/null \
     QUERY_LOG="$QUERY_LOG" EXECUTION_LOG="$EXECUTION_LOG" REQUEST_LOG="$REQUEST_LOG" \
@@ -171,10 +178,12 @@ ready_doc_args() { # DOC
   line="$(sed 's/^.*approval-wait \[PR_NUMBER\] //' <<<"$line")"
   for field in $line; do
     [[ "$field" != '[REVIEW_BASE_CHECKOUT]' ]] || field="$BASE"
+    [[ "$field" != '[ISSUE_ID]' ]] || field=KEN-3231
     READY_ARGS+=("$field")
   done
 }
 READY_ARGS=()
+"$STATE" --state-dir "$TMP_ROOT/state" init KEN-3231 --worktree "$TMP_ROOT/catalog" >/dev/null
 ready_doc_args "$REPO_ROOT/skills/orch/workflows/submit-pr.md" || exit 1
 for row in \
   'draft held|true|no|0|false|false|0|fallback cause=draft|0|none' \
@@ -197,7 +206,7 @@ RUN_ENV=()
 # Removing the producer's ready flag makes the same publication command fail
 # to produce the ready request. This control exercises the script, not prose.
 cp "$REPO_ROOT/skills/orch/workflows/submit-pr.md" "$TMP_ROOT/submit-mutant.md"
-mutate_file "$TMP_ROOT/submit-mutant.md" '--request-review --mark-ready --base-checkout' '--request-review --base-checkout'
+mutate_file "$TMP_ROOT/submit-mutant.md" '--request-review --mark-ready --item' '--request-review --item'
 ready_doc_args "$TMP_ROOT/submit-mutant.md" || exit 1
 printf 'true\n' > "$DRAFT_FILE"
 printf 'current-head\n' > "$HEAD_FILE"
@@ -215,8 +224,6 @@ code="${code//\[ISSUE_ID\]/KEN-3231}"
 code="${code//\[HEAD_SHA\]/current-head}"
 code="${code//\[REVIEW_BASE_CHECKOUT\]/\"\$REVIEW_BASE_FIXTURE\"}"
 printf 'set -euo pipefail\n%s\n' "$code" > "$PUBLICATION_SCRIPT"
-STATE="$REPO_ROOT/skills/orch/scripts/workflow-state"
-"$STATE" --state-dir "$TMP_ROOT/state" init KEN-3231 --worktree "$TMP_ROOT/catalog" >/dev/null
 "$STATE" --state-dir "$TMP_ROOT/state" set KEN-3231 pr_order push-first-returned >/dev/null
 printf 'true\n' > "$DRAFT_FILE"
 printf 'current-head\n' > "$HEAD_FILE"
@@ -245,6 +252,188 @@ CHECK_ACTIVE='[{"check_runs":[{"name":"copilot-pull-request-reviewer","status":"
 TIMELINE_PENDING='[[{"event":"review_requested","id":8,"created_at":"2026-10-10T07:04:13Z","requested_reviewer":{"login":"copilot-pull-request-reviewer[bot]"}}]]'
 HEAD_REVIEW='[{"user":{"login":"copilot-pull-request-reviewer[bot]"},"commit_id":"current-head","state":"APPROVED","body":"Reviewed."}]'
 ERROR_REVIEW='[{"user":{"login":"copilot-pull-request-reviewer[bot]"},"commit_id":"current-head","state":"COMMENTED","body":"Copilot encountered an error and was unable to review this pull request."}]'
+# Execute the completion commands delivered to the cloud session. Its base
+# checkout carries enforcing policy while the item tree tries to turn it off.
+CLOUD_ORIGIN="$TMP_ROOT/cloud-origin"
+ACTION_CWD="$TMP_ROOT/cloud"
+git init -q "$CLOUD_ORIGIN"
+git -C "$CLOUD_ORIGIN" config gc.auto 0
+git -C "$CLOUD_ORIGIN" config maintenance.auto false
+git -C "$CLOUD_ORIGIN" config user.email test@example.com
+git -C "$CLOUD_ORIGIN" config user.name test
+git -C "$CLOUD_ORIGIN" checkout -q -b main
+cp -R "$BASE/.agents" "$CLOUD_ORIGIN/.agents"
+write_settings "$CLOUD_ORIGIN/kendex.settings.toml" '"enforce"' ''
+git -C "$CLOUD_ORIGIN" add .
+git -C "$CLOUD_ORIGIN" commit -qm base
+git clone -q "$CLOUD_ORIGIN" "$ACTION_CWD"
+git -C "$ACTION_CWD" config gc.auto 0
+git -C "$ACTION_CWD" config maintenance.auto false
+git -C "$ACTION_CWD" checkout -q -b item
+write_settings "$ACTION_CWD/kendex.settings.toml" '"off"' ''
+mkdir -p "$ACTION_CWD/tmp"
+cloud_script() { # LIB [ERREXIT]
+  local words block
+  words="$(env -i PATH="$PATH" "$BASH" -uc 'source "$1"; printf "%s" "$LAUNCH_SESSION_TEXT"' _ "$1")"
+  block="$(awk '/^\($/ || /^git fetch origin \[BASE\]$/ {take=1} take {print} take && (/^\)$/ || /^git worktree remove tmp\/review-base$/) {exit}' <<<"$words")"
+  block="${block//.agents\/skills\/orch\/scripts\/approval-wait/$RUN}"
+  block="${block//\[PR_NUMBER\]/42}"
+  block="${block//\[BASE\]/main}"
+  printf 'set -uo pipefail\n%s\n%s\n' "${2:+set -e}" "${block:-:}" > "$TMP_ROOT/cloud-complete.sh"
+}
+for row in \
+  'cloud marks ready|strict|true|0|0|false|0|1|ready,request head=current-head draft=false|0' \
+  'person already marked ready|strict|false|0|0|false|0|1|request head=current-head draft=false|0' \
+  'authentication failure with errexit|strict|true|1|0|false|3|0||0' \
+  'authentication failure without errexit||true|1|0|false|3|0||0' \
+  'ready failure with errexit|strict|true|0|8|false|2|0|ready|0' \
+  'ready failure without errexit||true|0|8|false|2|0|ready|0' \
+  'cleanup failure with errexit|strict|true|0|0|true|128|1|ready,request head=current-head draft=false|128' \
+  'cleanup failure without errexit||true|0|0|true|128|1|ready,request head=current-head draft=false|128' \
+  'request and cleanup failure with errexit|strict|true|0|8|true|2|0|ready|128' \
+  'request and cleanup failure without errexit||true|0|8|true|2|0|ready|128'; do
+  IFS='|' read -r label errexit draft auth_exit ready_exit dirty want_rc requests transitions cleanup_exit <<<"$row"
+  cloud_script "$REPO_ROOT/skills/orch/scripts/lib/lane-launch.sh" "$errexit"
+  printf '%s\n' "$draft" > "$DRAFT_FILE"
+  printf 'current-head\n' > "$HEAD_FILE"
+  RUN_ENV=("AUTH_EXIT=$auth_exit" "READY_EXIT=$ready_exit" "CLOUD_DIRTY_BASE=$dirty")
+  run_action "$TMP_ROOT/cloud-complete.sh" 0
+  assert_eq "$RC|$REQUESTS|$(paste -sd, "$TRANSITION_LOG")|$(cat "$EXECUTION_LOG")" "$want_rc|$requests|$transitions|" "$label preserves the request result" "$ERR"
+  if [[ "$cleanup_exit" == 0 ]]; then
+    assert_not_contains "$(git -C "$ACTION_CWD" worktree list --porcelain)" 'tmp/review-base' "$label removes its temporary base checkout"
+  else
+    assert_contains "$(cat "$ERR")" "cloud-completion: base-cleanup-failed exit=$cleanup_exit" "$label reports cleanup failure separately"
+    assert_contains "$(git -C "$ACTION_CWD" worktree list --porcelain)" 'tmp/review-base' "$label retains the checkout Git refused to remove"
+  fi
+  [[ ! -d "$ACTION_CWD/tmp/review-base" ]] || git -C "$ACTION_CWD" worktree remove --force tmp/review-base
+done
+RUN_ENV=()
+# The emitted commands own cleanup and preserve its two independent results.
+# Each control changes a disposable source copy and runs the real request owner.
+for row in \
+  'cloud-request-cleanup|cloud_request_status=$?|exit "$?" # cloud_request_status=$?|strict|1|false|3|yes|no' \
+  'cloud-request-result|exit "$cloud_request_status"|exit "$cloud_cleanup_status"||1|false|0|no|no' \
+  'cloud-cleanup-report|  printf "%s\n" "cloud-completion: base-cleanup-failed exit=$cloud_cleanup_status" >&2|  : # printf "%s\n" "cloud-completion: base-cleanup-failed exit=$cloud_cleanup_status" >&2|strict|0|true|128|yes|no'; do
+  IFS='|' read -r label old new errexit auth_exit dirty want_rc registered diagnostic <<<"$row"
+  scripts="$(mutant_scripts "$label" lib/lane-launch.sh)" || exit 1
+  mutate_file "$scripts/lib/lane-launch.sh" "$old" "$new"
+  cloud_script "$scripts/lib/lane-launch.sh" "$errexit"
+  printf 'true\n' > "$DRAFT_FILE"
+  printf 'current-head\n' > "$HEAD_FILE"
+  RUN_ENV=("AUTH_EXIT=$auth_exit" "CLOUD_DIRTY_BASE=$dirty")
+  run_action "$TMP_ROOT/cloud-complete.sh" 0
+  actual_registered=no
+  [[ ! -d "$ACTION_CWD/tmp/review-base" ]] || actual_registered=yes
+  actual_diagnostic=no
+  [[ "$(cat "$ERR")" != *'cloud-completion: base-cleanup-failed'* ]] || actual_diagnostic=yes
+  assert_eq "$RC|$actual_registered|$actual_diagnostic" "$want_rc|$registered|$diagnostic" "$label control breaks its failure handling" "$ERR"
+  [[ "$actual_registered" == no ]] || git -C "$ACTION_CWD" worktree remove --force tmp/review-base
+done
+RUN_ENV=()
+for row in \
+  'cloud-ready|--request-review --mark-ready|--request-review|true' \
+  'cloud-policy|--base-checkout tmp/review-base|--base-checkout .|false'; do
+  IFS='|' read -r label old new draft <<<"$row"
+  scripts="$(mutant_scripts "$label" lib/lane-launch.sh)" || exit 1
+  mutate_file "$scripts/lib/lane-launch.sh" "$old" "$new"
+  cloud_script "$scripts/lib/lane-launch.sh"
+  printf 'true\n' > "$DRAFT_FILE"
+  run_action "$TMP_ROOT/cloud-complete.sh" 0
+  assert_eq "$RC|$REQUESTS|$(cat "$DRAFT_FILE")" "0|0|$draft" "$label control breaks the completion request" "$ERR"
+done
+unset ACTION_CWD
+rm -- "$DRAFT_FILE" "$HEAD_FILE"
+# A cloud session outside orch can leave a ready PR with only the skipped
+# request run from its draft opening. Execute the landing workflow's commands.
+landing_script() { # DOC [REQUEST SCRIPTS]
+  local block scripts="${2:-$REPO_ROOT/skills/orch/scripts}"
+  block="$(awk '
+    /^[[:space:]]*```bash/ {inside=1; block=""; next}
+    /^[[:space:]]*```/ && inside {
+      if (index(block, "MERGE_PR_OPEN_READY=")) {printf "%s", block; exit}
+      inside=0
+    }
+    inside && /github.sh pr-merge \[PR_NUMBER\] --check/ {exit}
+    inside {block=block $0 ORS}
+  ' "$1")"
+  block="${block//.agents\/skills\/orch\/scripts\//$scripts/}"
+  block="${block//\[PR_NUMBER\]/42}"
+  block="${block//\[STATE_KEY\]/KEN-landing}"
+  block="${block//\[REVIEW_BASE_CHECKOUT\]/\"\$REVIEW_BASE_FIXTURE\"}"
+  printf 'set -euo pipefail\n%s\n' "${block:-:}" > "$TMP_ROOT/landing.sh"
+}
+SKIPPED_REQUEST='[{"check_runs":[{"id":9,"name":"Request Copilot review","status":"completed","conclusion":"skipped","started_at":"2026-10-11T07:25:19Z"}]}]'
+"$STATE" --state-dir "$TMP_ROOT/state" init KEN-landing --worktree "$TMP_ROOT/catalog" >/dev/null
+landing_script "$REPO_ROOT/skills/orch/workflows/merge-pr.md"
+for row in \
+  "ready cloud PR with skipped opening run|OPEN|false|$SKIPPED_REQUEST|[]|false|0|1" \
+  "ready cloud PR with active Copilot work|OPEN|false|$CHECK_ACTIVE|[]|false|0|0" \
+  "ready cloud PR with a Copilot review|OPEN|false|$SKIPPED_REQUEST|$HEAD_REVIEW|false|0|0" \
+  "ready cloud PR with a human approval|OPEN|false|$SKIPPED_REQUEST|${HEAD_REVIEW/copilot-pull-request-reviewer\[bot\]/colleague}|false|0|1" \
+  "draft cloud PR|OPEN|true|$SKIPPED_REQUEST|[]|false|0|0" \
+  "closed cloud PR|CLOSED|false|$SKIPPED_REQUEST|[]|false|0|0" \
+  "merged cloud PR|MERGED|false|$SKIPPED_REQUEST|[]|false|0|0" \
+  "unreadable cloud PR|OPEN|false|$SKIPPED_REQUEST|[]|true|1|0"; do
+  IFS='|' read -r label state draft checks reviews unread want_rc requests <<<"$row"
+  printf '%s\n' "$draft" > "$DRAFT_FILE"
+  printf 'current-head\n' > "$HEAD_FILE"
+  RUN_ENV=("PR_STATE=$state" "CHECKS_JSON=$checks" "REVIEWS_JSON=$reviews" "HEAD_READ_FAIL=$unread")
+  run_action "$TMP_ROOT/landing.sh" 0
+  assert_eq "$RC|$REQUESTS" "$want_rc|$requests" "$label requests before landing waits" "$ERR"
+done
+RUN_ENV=()
+# The error wait writes this record before requesting and retains it after
+# retry or fallback. A landing restart must not restart that finished route.
+for row in \
+  'current-head|requested|0' \
+  'current-head|fallback|0' \
+  'earlier-head|requested|1' \
+  'earlier-head|fallback|1'; do
+  IFS='|' read -r saved_head outcome requests <<<"$row"
+  "$STATE" --state-dir "$TMP_ROOT/state" update KEN-landing --arg head "$saved_head" --arg outcome "$outcome" \
+    '.pr_approval.copilot_error_retries = {($head): {review_id: "10", outcome: $outcome}}' >/dev/null
+  saved="$("$STATE" --state-dir "$TMP_ROOT/state" get KEN-landing '.pr_approval.copilot_error_retries')"
+  RUN_ENV=("CHECKS_JSON=$SKIPPED_REQUEST" "REVIEWS_JSON=$ERROR_REVIEW ${HEAD_REVIEW/copilot-pull-request-reviewer\[bot\]/colleague}")
+  for pass_number in first repeated; do
+    run_action "$TMP_ROOT/landing.sh" 0
+    assert_eq "$RC|$REQUESTS" "0|$requests" "$pass_number landing preserves $outcome at $saved_head" "$ERR"
+    assert_eq "$("$STATE" --state-dir "$TMP_ROOT/state" get KEN-landing '.pr_approval.copilot_error_retries')" "$saved" \
+      "$pass_number landing preserves its saved error outcome" "$ERR"
+  done
+done
+"$STATE" --state-dir "$TMP_ROOT/state" update KEN-landing 'del(.pr_approval.copilot_error_retries)' >/dev/null
+RUN_ENV=()
+run_action "$RUN" 0 --request-review --item KEN-missing-state --base-checkout "$BASE"
+assert_eq "$RC|$REQUESTS|$(cat "$OUT")" '2|0|' 'a request cannot ignore unreadable item state' "$ERR"
+scripts="$(mutant_scripts request-error-outcome approval-wait)" || exit 1
+# shellcheck disable=SC2016
+mutate_file "$scripts/approval-wait" '    if [[ -n "$ITEM" ]] && ! $retry_claimed; then' \
+  '    if false && [[ -n "$ITEM" ]] && ! $retry_claimed; then'
+landing_script "$REPO_ROOT/skills/orch/workflows/merge-pr.md" "$scripts"
+for outcome in requested fallback; do
+  "$STATE" --state-dir "$TMP_ROOT/state" update KEN-landing --arg outcome "$outcome" \
+    '.pr_approval.copilot_error_retries = {"current-head": {review_id: "10", outcome: $outcome}}' >/dev/null
+  RUN_ENV=("CHECKS_JSON=$SKIPPED_REQUEST" "REVIEWS_JSON=$ERROR_REVIEW")
+  run_action "$TMP_ROOT/landing.sh" 0
+  assert_eq "$RC|$REQUESTS" '0|1' "control: ignoring $outcome repeats the finished error request" "$ERR"
+done
+"$STATE" --state-dir "$TMP_ROOT/state" update KEN-landing 'del(.pr_approval.copilot_error_retries)' >/dev/null
+RUN_ENV=()
+scripts="$(mutant_scripts request-error-state-read approval-wait)" || exit 1
+# shellcheck disable=SC2016
+mutate_file "$scripts/approval-wait" 'get "$ITEM" '\''.pr_approval.copilot_error_retries // {}'\'')' \
+  'get "$ITEM" '\''.pr_approval.copilot_error_retries // {}'\'' || printf '\''{}\n'\'')'
+run_action "$scripts/approval-wait" 0 --request-review --item KEN-missing-state --base-checkout "$BASE"
+assert_eq "$RC|$REQUESTS" '0|1' 'control: substituting empty state requests without reading its item' "$ERR"
+cp "$REPO_ROOT/skills/orch/workflows/merge-pr.md" "$TMP_ROOT/landing-mutant.md"
+mutate_file "$TMP_ROOT/landing-mutant.md" 'if [[ "$MERGE_PR_OPEN_READY" == true ]]; then' 'if false && [[ "$MERGE_PR_OPEN_READY" == true ]]; then'
+landing_script "$TMP_ROOT/landing-mutant.md"
+printf 'false\n' > "$DRAFT_FILE"
+RUN_ENV=("CHECKS_JSON=$SKIPPED_REQUEST")
+run_action "$TMP_ROOT/landing.sh" 0
+assert_eq "$RC|$REQUESTS" '0|0' 'control: bypassing the landing request breaks the skipped opening row' "$ERR"
+RUN_ENV=()
+rm -- "$DRAFT_FILE" "$HEAD_FILE"
 # GitHub dismisses the previous review when another Copilot request starts.
 DISMISSED_THEN_ERROR="${HEAD_REVIEW/APPROVED/DISMISSED}"$'\n'"$ERROR_REVIEW"
 scripts="$(mutant_scripts request-head-work approval-wait)" || exit 1
@@ -351,9 +540,9 @@ for row in \
   'stdout-isolation~"enforce"~~~0~gh pr edit "$PR_NUM" --repo "$REPO" --add-reviewer @copilot >&2~gh pr edit "$PR_NUM" --repo "$REPO" --add-reviewer @copilot~0~approval~1' \
   'copilot-off~"enforce"~off~~0~    elif [[ "$COPILOT_REQUESTS" == off ]]; then~    elif false; then~0~fallback cause=off~0' \
   'refused-request~"enforce"~~~8~--add-reviewer @copilot >&2 || request_rc=$?~--add-reviewer @copilot >&2 || exit $?~0~fallback cause=refused exit=8~1' \
-  'caller-setting~"enforce"~~off~0~COPILOT_REQUESTS="$("$SCRIPT_DIR/orch-env" PR_COPILOT_REQUESTS on)" || exit 2~COPILOT_REQUESTS="$(cd -- "$BASE_CHECKOUT" && "$SCRIPT_DIR/orch-env" PR_COPILOT_REQUESTS on)" || exit 2~0~approval~1' \
-  'copilot-setting-invalid~"enforce"~junk~~0~*) approval_message copilot-requests-invalid >&2; exit 2 ;;~*) ;;~2~~0' \
-  'copilot-setting-unreadable~"enforce"~\"off~~0~PR_COPILOT_REQUESTS on)" || exit 2~PR_COPILOT_REQUESTS on)" || COPILOT_REQUESTS=on~2~~0' \
+  'caller-setting~"enforce"~~off~0~COPILOT_REQUESTS="$("$SCRIPT_DIR/orch-env" PR_COPILOT_REQUESTS on)" || return 2~COPILOT_REQUESTS="$(cd -- "$BASE_CHECKOUT" && "$SCRIPT_DIR/orch-env" PR_COPILOT_REQUESTS on)" || return 2~0~approval~1' \
+  'copilot-setting-invalid~"enforce"~junk~~0~*) approval_message copilot-requests-invalid >&2; return 2 ;;~*) ;;~2~~0' \
+  'copilot-setting-unreadable~"enforce"~\"off~~0~PR_COPILOT_REQUESTS on)" || return 2~PR_COPILOT_REQUESTS on)" || COPILOT_REQUESTS=on~2~~0' \
   'copilot-setting-at-resolution~"enforce"~junk~~0~if $REQUEST_REVIEW || [[ -n "$ITEM" ]]; then~if true; then~0~approval~0~--resolve-mode'; do
   IFS='~' read -r label setting caller_copilot base_copilot request_exit old new want_rc want_out want_requests action <<< "$row"
   write_settings "$BASE/kendex.settings.toml" "$setting" "$base_copilot"
