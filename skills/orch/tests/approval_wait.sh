@@ -200,6 +200,10 @@ case "${1:-}" in
       if [[ "${STUB_DUPLICATE_ERRORS:-0}" == 1 ]]; then
         rows="$(jq -c '[.[0] + {id:1}] + .' <<<"$rows")"
       fi
+      # GitHub dismisses the older success before the later error review.
+      if [[ "${STUB_DISMISSED_SUCCESS:-0}" == 1 ]]; then
+        rows="$(jq -c '[.[0] + {id:1,state:"DISMISSED",body:"Reviewed."}] + .' <<<"$rows")"
+      fi
       if [[ "${STUB_REVIEW_PAGES:-0}" == 1 ]]; then
         echo '[]'
         [[ " $* " == *' --paginate '* ]] || exit 0
@@ -741,12 +745,13 @@ echo "=== Copilot error answers retry once through the request owner ==="
 # consumes one retry; unchanged IDs are not new answers. A later ID is terminal.
 table "$APPROVAL" \
   'the error retries once and an approval ends the continued wait||STUB_APPROVAL_MODE=copilot_error_approved|rc=0 status=approved requests=1 approval_polls=3 request_argv=pr+edit+1+--repo+owner/repo+--add-reviewer+@copilot' \
+  'a dismissed success does not consume the later error retry||STUB_APPROVAL_MODE=copilot_error_approved,STUB_DISMISSED_SUCCESS=1,STUB_ERROR_ID=2|rc=0 status=approved requests=1 approval_polls=3' \
   'a new error after unchanged polls ends early||STUB_APPROVAL_MODE=copilot_error_twice|rc=1 status=copilot-error requests=1 approval_polls=3 head_sha=headsha1 copilot_fallback_cause=error elapsed_seconds=2' \
   'duplicate errors in the initial snapshot still permit one retry||STUB_APPROVAL_MODE=copilot_error_twice,STUB_DUPLICATE_ERRORS=1|rc=1 status=copilot-error requests=1 approval_polls=3' \
   'the same error keeps waiting to the original deadline||STUB_APPROVAL_MODE=copilot_error|rc=1 status=timeout requests=1 approval_polls=4 elapsed_seconds=3' \
   'an earlier-head error consumes no request||STUB_APPROVAL_MODE=copilot_error,STUB_ERROR_HEAD=oldsha|rc=1 status=timeout requests=0' \
   'the sentence from another reviewer consumes no request||STUB_APPROVAL_MODE=human_error|rc=1 status=timeout requests=0' \
-  'a completed Copilot comment consumes no request||STUB_APPROVAL_MODE=copilot_comment|rc=1 status=timeout requests=0' \
+  'a completed Copilot comment consumes no request||STUB_APPROVAL_MODE=copilot_comment|rc=1 status=timeout requests=0 stderr_line=' \
   'review identities on a later page are read||STUB_APPROVAL_MODE=copilot_error_twice,STUB_REVIEW_PAGES=1|rc=1 status=copilot-error requests=1' \
   'a spent request allowance returns the existing refusal cause||STUB_APPROVAL_MODE=copilot_error,STUB_REQUEST_EXIT=8|rc=1 status=copilot-error requests=1 copilot_fallback_cause=refused+exit=8' \
   'unreadable review identities refuse without a request||STUB_APPROVAL_MODE=copilot_error,STUB_REVIEW_READ=fail|rc=1 status=error requests=0' \
@@ -1031,10 +1036,15 @@ control copilot-current-head '        and .commit_id == $head and (.state == "CO
 control copilot-reviewer '    | [.[] | select(.user.login == $reviewer' \
   '    | [.[] | select(true' \
   "$APPROVAL" 'STUB_APPROVAL_MODE=copilot_error,STUB_REST_REVIEWER=human' 'rc=1 status=timeout requests=0'
+# The request owner can suppress a misclassified comment's request. Its
+# structured diagnostic still exposes that the retry reached that owner.
 # shellcheck disable=SC2016
 control copilot-error-body '    | if .state == "COMMENTED" and ((.body // "") | contains($sentence))' \
   '    | if .state == "COMMENTED"' \
-  "$APPROVAL" 'STUB_APPROVAL_MODE=copilot_comment' 'rc=1 status=timeout requests=0'
+  "$APPROVAL" 'STUB_APPROVAL_MODE=copilot_comment' 'rc=1 status=timeout requests=0 stderr_line='
+assert_eq "$(observe 'rc=1 status=timeout requests=0 stderr_line=')" \
+  'rc=1 status=timeout requests=0 stderr_line=approval-wait:+existing-review+head=headsha1' \
+  'copilot-error-body: the mutated classification reaches the request owner' "$RUN/stderr"
 # shellcheck disable=SC2016
 control copilot-distinct-answer '        && [ "$(jq -r '\''.review_id'\'' <<<"$copilot_retry")" != "$copilot_error_id" ]; then' \
   '        && [ "$(jq -r '\''.review_id'\'' <<<"$copilot_retry")" = "$copilot_error_id" ]; then' \
