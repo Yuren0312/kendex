@@ -2,6 +2,7 @@
 // project settings writer, the two spawn mocks and the bridge event shapes.
 // Nothing here plants a defect; a case that needs one builds it inline.
 import assert from "node:assert/strict";
+import { onTestFinished } from "bun:test";
 import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -36,6 +37,16 @@ export function withModelFixtureCapture(capture: NonNullable<Parameters<typeof i
 }
 
 export function tempRuntime(): string {
+	const dir = allocateTempRuntime();
+	onTestFinished(() => {
+		rmSync(dir, { force: true, recursive: true });
+		tempRuntimeDirs.delete(dir);
+	});
+	return dir;
+}
+
+/** Standalone benchmarks release these allocations through cleanupTempRuntimes. */
+export function allocateTempRuntime(): string {
 	const dir = mkdtempSync(join(tmpdir(), "pi-agents-lanes-"));
 	tempRuntimeDirs.add(dir);
 	return dir;
