@@ -1200,6 +1200,9 @@ ci_rows() {
     [[ -z "${2:-}" || "$label" == "$2" ]] || continue
     proj="$proj_ci"
     [[ "$named" == yes ]] || proj="$proj_ci_unset"
+    # Each row starts on a worktree with no earlier run: a pass of the same
+    # command over the same tree would answer it.
+    rm -rf -- "${proj:?}"/tmp/dev-validate-*
     ci_world "$world"
     RUN_PATH="$GH_STUB_BIN:$PATH" STUB_QUEUE="$queue" STUB_ANSWER="$answer" STUB_DOCS="$docs" STUB_MEASURED="$measured" \
       run_script "$1" --worktree "$proj" --poll 1 --validate-mode ci --base HEAD
@@ -1266,7 +1269,7 @@ assert_eq "$RC $(sed -n 1p <<<"$OUT" | cut -d' ' -f1) $(verdict_of "$OUT")" \
   "0 state=started state=done guard-exit=0 validate=pass" \
   "an attached ci run prints its started line, then its done line" "$ERR"
 cp -p -- "$CI_SCRIPT" "$CI_SCRIPT.mutant"
-mutate_file "$CI_SCRIPT.mutant" '[[ "$attached" == true && "$validate_mode" != ci && "$bound_ended" == false ]]' '[[ "$attached" == true ]]'
+mutate_file "$CI_SCRIPT.mutant" '[[ "$attached" == true && "$validate_mode" != ci && "$bound_ended" == false && "$passed_before" == false ]]' '[[ "$attached" == true ]]'
 ci_run "$CI_SCRIPT.mutant" --attached
 assert_eq "$(sed -n 1p <<<"$OUT" | cut -d' ' -f1)" "state=done" \
   "control: an attached ci run that skips its started line opens on the done line" "$ERR"
@@ -2249,8 +2252,7 @@ assert_eq "$([[ "$live_read_got" != "$(live_read_want live-child)" ]] && echo tu
 # before it commits, so its tree is the edit's, never HEAD's. A failing run
 # after it makes the worktree red, and a ci run after it, which ran nothing,
 # leaves the pass standing. restack_skip.sh holds what reads the answer. Run
-# directories are named for the second they start, so a row waits a second
-# between two runs whose order it reads.
+# start seconds below are injected where a row must prove run order.
 proj_last="$(make_mode_proj proj-last "")"
 run_script "$RUN" --last-pass --worktree "$proj_last"
 assert_eq "$OUT rc=$RC" "last-pass=none rc=1" "a worktree with no run has no last pass" "$ERR"
@@ -2263,15 +2265,16 @@ LAST_PASS_WANT="run-dir=$last_pass_dir head=$(git -C "$proj_last" rev-parse HEAD
 run_script "$RUN" --last-pass --worktree "$proj_last"
 assert_eq "$OUT rc=$RC" "$LAST_PASS_WANT" \
   "--last-pass names the passing run, its HEAD and the tree of the uncommitted edit it validated" "$ERR"
-sleep 1
 sed -i.bak 's/^DEV_VALIDATE_CMD = .*/DEV_VALIDATE_CMD = "false"/' "$proj_last/kendex.settings.toml"
 run_script "$RUN" --worktree "$proj_last" --poll 1
 last_red_dir="$(run_dir_of "$OUT")"
+mutate_file "$last_pass_dir/start" "start=$(start_of "$last_pass_dir")" 'start=2000000000'
+mutate_file "$last_red_dir/start" "start=$(start_of "$last_red_dir")" 'start=2000000001'
 assert_eq "$(verdict_of "$OUT")" "state=done guard-exit=1 validate=FAILING" "the later run in that worktree fails" "$ERR"
 LAST_RED_WANT="last-pass=red run-dir=$last_red_dir rc=1"
 run_script "$RUN" --last-pass --worktree "$proj_last"
 assert_eq "$OUT rc=$RC" "$LAST_RED_WANT" "a failing run after the pass names that run as red" "$ERR"
-mutant mutant-last-pass-red $'      red="$run_dir"\n      continue' '      continue'
+mutant mutant-last-pass-red '    if [[ "$verdict" != pass ]]; then' $'    if [[ "$verdict" != pass ]]; then\n      continue'
 run_script "$MUTANT" --last-pass --worktree "$proj_last"
 assert_eq "$OUT rc=$RC" "$LAST_PASS_WANT" "control: a read that passes over a red run names the pass before it"
 proj_last_head="$(make_mode_proj proj-last-head "")"
@@ -2663,6 +2666,184 @@ run_script "$CI_SCRIPT" --record --run-dir "$bound_rec_dir"
 assert_eq "$(sed -E 's/ head=[^ ]* start=[0-9]+ / /; s/started-at=[^ ]+ ended-at=[^ ]+$/T/' <<<"$OUT")" \
   "validate-mode=full selection=unreported verdict=no-verdict seconds=0 T" \
   "a run an earlier run's bound ended records no verdict and no wall time" "$ERR"
+
+# --- A pass over the same tree answers a later run of the same command -------
+# Each row's project counts the range command's starts in tmp/ran, which the
+# tree ignores, and fails it while tmp/fail exists. A fix round's lanes pass
+# once on the tree, the round then asks for its range receipt, and the row's
+# step between the two either leaves the tree alone or changes what the
+# second start judges. A ci request falls back to range here: the project
+# names no context.
+pass_proj() { # NAME
+  local dir
+  dir="$(make_mode_proj "$1" 'printf x >> tmp/ran; test ! -e tmp/fail && echo validate: lanes=a,b selection=subset')"
+  printf 'DEV_VALIDATE_FINDING_PREFIX = "echo: "\n' >> "$dir/kendex.settings.toml"
+  printf 'tmp/\n' > "$dir/.gitignore"
+  git -C "$dir" add -A
+  git -C "$dir" -c user.name=t -c user.email=t@example.com commit -q -m ignore
+  git -C "$dir" update-ref refs/remotes/origin/main HEAD
+  mkdir -p "$dir/tmp"
+  printf '%s\n' "$dir"
+}
+pass_start() { # SCRIPT WORKTREE PATHS ARG...
+  local script="$1" proj="$2" paths="$3"
+  shift 3
+  RUN_PATH="$GH_STUB_BIN:$PATH" STUB_ANSWER=change_class=micro STUB_DOCS=false STUB_MEASURED=true STUB_PATHS="$paths" \
+    run_script "$script" --worktree "$proj" --poll 1 "$@"
+}
+# pass_row SCRIPT STEP PATHS REQUEST — the starts of the range command, the
+# second start's verdict, the run its pass-run= line names and its --record
+# fields, after a range pass over docs/a.md and the row's STEP:
+#   none     nothing between the two starts
+#   edit     an untracked file changes the tree
+#   failed-* a --fresh failure has another selection or ambiguous order
+#   unfinished a stopped run has no exit file or live child
+#   timeout  a qualifying older timeout coexists with the pass
+# The count of projects made lives in a file: pass_rows runs in a subshell.
+pass_row() {
+  local script="$1" step="$2" paths="$3" request="$4" proj n first dir failed old pass_run seconds="" last=""
+  n=$(( $(cat "$TMP_ROOT/pass-n" 2>/dev/null || echo 0) + 1 ))
+  printf '%s\n' "$n" > "$TMP_ROOT/pass-n"
+  proj="$(pass_proj "proj-pass-$n")"
+  pass_start "$script" "$proj" docs/a.md --validate-mode range --base HEAD
+  first="$(run_dir_of "$OUT")"
+  case "$step" in
+    none) ;;
+    edit) printf 'draft\n' > "$proj/docs-b.md" ;;
+    failed|failed-*|unfinished)
+      : > "$proj/tmp/fail"
+      if [[ "$step" == failed-base ]]; then
+        pass_start "$script" "$proj" docs/a.md --validate-mode range --base HEAD^ --fresh
+      else
+        pass_start "$script" "$proj" docs/a.md --validate-mode range --base HEAD --fresh
+      fi
+      failed="$(run_dir_of "$OUT")"
+      rm -f -- "$proj/tmp/fail"
+      case "$step" in
+        failed-class) mutate_file "$failed/start" 'class=micro' 'class=standard' ;;
+        failed-docs) mutate_file "$failed/start" 'docs-only=false' 'docs-only=true' ;;
+        failed-prefix) mutate_file "$failed/start" 'finding-prefix=echo: ' 'finding-prefix=guard: ' ;;
+        unfinished) rm -f -- "$failed/exit" "$failed/pid" ;;
+        failed-tied|failed-reused-pid|failed-older|failed-unknown)
+          mutate_file "$first/start" "start=$(start_of "$first")" 'start=2000000000'
+          case "$step" in
+            failed-older) mutate_file "$failed/start" "start=$(start_of "$failed")" 'start=1999999999' ;;
+            failed-unknown) mutate_file "$failed/start" "start=$(start_of "$failed")" 'start=' ;;
+            *) mutate_file "$failed/start" "start=$(start_of "$failed")" 'start=2000000000' ;;
+          esac
+          old="$proj/tmp/dev-validate-20330518T033320Z-9999"
+          mv -- "$first" "$old"
+          first="$old"
+          old="$proj/tmp/dev-validate-20330518T033320Z-10000"
+          [[ "$step" != failed-reused-pid ]] || old="$proj/tmp/dev-validate-20330518T033320Z-9998"
+          mv -- "$failed" "$old"
+          failed="$old"
+          run_script "$script" --last-pass --worktree "$proj"
+          if [[ "$RC" == 1 && "$OUT" == "last-pass=red run-dir=$failed" ]]; then
+            last=' last=red'
+          elif [[ "$RC" == 0 && "$OUT" == "run-dir=$first "* ]]; then
+            last=' last=first'
+          else
+            last=" last=unexpected:$RC:$OUT"
+          fi
+          ;;
+      esac
+      ;;
+    timeout)
+      plant_run "$proj" 20000101T000000Z-1 range docs/a.md 20
+      old="$proj/tmp/dev-validate-20000101T000000Z-1"
+      cp -- "$first/cmd" "$old/cmd"
+      printf 'start=1\n' >> "$old/start"
+      ;;
+  esac
+  pass_start "$script" "$proj" "$paths" --validate-mode "$request" --base HEAD
+  dir="$(run_dir_of "$OUT")"
+  pass_run="$(start_line "$dir" pass-run 2>/dev/null)" || pass_run=""
+  printf '%s|%s|%s|' "$(cat "$proj/tmp/ran")" "$(verdict_of "$OUT")" \
+    "$([[ "$pass_run" == "$first" ]] && echo first || echo none)"
+  run_script "$script" --record --run-dir "$dir"
+  # Reuse records zero work. An executed command can cross a clock second.
+  [[ -z "$pass_run" ]] || seconds=" $(record_field seconds "$OUT")"
+  printf '%s %s %s%s%s\n' "$(record_field validate-mode "$OUT")" "$(record_field lanes "$OUT")" \
+    "$(record_field verdict "$OUT")" "$seconds" "$last"
+}
+# label|step|paths the second start reads|its mode|want
+PASS_ROWS=(
+  "a fix round whose lanes passed on a tree asks for a range receipt on it and starts no second command|none|docs/a.md|range|x|$OK|first|range a,b pass 0"
+  "a ci request that falls back to range after the round's pass on the tree starts no second command|none|docs/a.md|ci|x|$OK|first|range a,b pass 0"
+  "a changed tree after the pass still runs the range command|edit|docs/a.md|range|xx|$OK|none|range a,b pass"
+  "a later failed run over the tree voids the pass and the range command runs|failed|docs/a.md|range|xxx|$OK|none|range a,b pass"
+  "a failure from another base voids the pass|failed-base|docs/a.md|range|xxx|$OK|none|range a,b pass"
+  "a failure handed another class voids the pass|failed-class|docs/a.md|range|xxx|$OK|none|range a,b pass"
+  "a failure handed another docs verdict voids the pass|failed-docs|docs/a.md|range|xxx|$OK|none|range a,b pass"
+  "a failure with another finding prefix voids the pass|failed-prefix|docs/a.md|range|xxx|$OK|none|range a,b pass"
+  "a later unfinished run voids the pass|unfinished|docs/a.md|range|xxx|$OK|none|range a,b pass"
+  "a same-second failure across PID widths cannot reuse a pass|failed-tied|docs/a.md|range|xxx|$OK|none|range a,b pass last=red"
+  "a same-second failure after PID reuse cannot reuse a pass|failed-reused-pid|docs/a.md|range|xxx|$OK|none|range a,b pass last=red"
+  "a known older failure does not void the newer pass|failed-older|docs/a.md|range|xx|$OK|first|range a,b pass 0 last=first"
+  "a failure without a start second cannot reuse a pass|failed-unknown|docs/a.md|range|xxx|$OK|none|range a,b pass last=red"
+  "a later pass wins over qualifying timeout evidence and keeps its lanes|timeout|docs/a.md|range|x|$OK|first|range a,b pass 0"
+  "a pass that read fewer paths than this run reads still runs the range command|none|docs/a.md,docs/b.md|range|xx|$OK|none|range a,b pass"
+)
+pass_rows() { # SCRIPT [LABEL]
+  local row label step paths request
+  for row in "${PASS_ROWS[@]}"; do
+    IFS='|' read -r label step paths request _ <<<"$row"
+    [[ -z "${2:-}" || "$label" == "$2" ]] || continue
+    printf '%s\t%s\n' "$label" "$(pass_row "$1" "$step" "$paths" "$request")"
+  done
+}
+PASS_GOT="$(pass_rows "$CI_SCRIPT")"
+for row in "${PASS_ROWS[@]}"; do
+  IFS='|' read -r label _ _ _ want <<<"$row"
+  assert_eq "$(awk -F'\t' -v want="$label" '$1 == want { print $2 }' <<<"$PASS_GOT")" "$want" "$label"
+done
+# pass_control LABEL ANCHOR REPLACEMENT ROW — ROW under a copy with one rule
+# removed must answer otherwise than it does with the rule.
+pass_control() {
+  local want got
+  cp -p -- "$CI_SCRIPT" "$CI_SCRIPT.mutant"
+  mutate_file "$CI_SCRIPT.mutant" "$2" "$3"
+  want="$(awk -F'\t' -v want="$4" '$1 == want { print $2 }' <<<"$PASS_GOT")"
+  got="$(pass_rows "$CI_SCRIPT.mutant" "$4" | cut -f2)"
+  assert_eq "$([[ "$got" != "$want" ]] && echo turned || echo "held:$got")" "turned" "control: with $1, '$4' turns"
+}
+# shellcheck disable=SC2016 # the script's own text, not expansions
+{
+pass_control 'no pass evidence, the runner before KEN-3828' 'PASS_RUN_DIR="$dir" pass_start=$(( 10#$started ))' ':' \
+  'a fix round whose lanes passed on a tree asks for a range receipt on it and starts no second command'
+pass_control 'no tree rule' $'    if [[ -n "$9" && "$(start_field "$start_file" tree)" == "$9" ]]; then\n      if [[ "$line" =~ ^guard-exit=0' \
+  $'    if true; then\n      if [[ "$line" =~ ^guard-exit=0' \
+  'a changed tree after the pass still runs the range command'
+pass_control 'no later-run rule' '(( red_start >= pass_start ))' 'false' \
+  'a later failed run over the tree voids the pass and the range command runs'
+pass_control 'no path rule' 'if (( rc == 1 )); then' 'if true; then' \
+  'a pass that read fewer paths than this run reads still runs the range command'
+pass_control 'unreadable exit skipped' 'line="$(cat "$dir/exit" 2>/dev/null)" || line=""' 'line="$(cat "$dir/exit" 2>/dev/null)" || continue' \
+  'a later unfinished run voids the pass'
+pass_control 'timeout evidence before pass evidence' 'if [[ -n "$PASS_RUN_DIR" ]]; then' 'if [[ -n "$PASS_RUN_DIR" && -z "$BOUND_RUN_DIR" ]]; then' \
+  'a later pass wins over qualifying timeout evidence and keeps its lanes'
+pass_control 'same-second failure ignored' '(( red_start >= pass_start ))' '(( red_start > pass_start ))' \
+  'a same-second failure across PID widths cannot reuse a pass'
+pass_control 'unknown chronology ignored' 'if [[ "$order_unknown" == true ]] || (( red_start >= pass_start )); then' 'if (( red_start >= pass_start )); then' \
+  'a failure without a start second cannot reuse a pass'
+pass_control 'last-pass tie accepted' '(( red_start >= found_start ))' '(( red_start > found_start ))' \
+  'a same-second failure after PID reuse cannot reuse a pass'
+pass_control 'last-pass start order ignored' '(( red_start >= found_start ))' 'true' \
+  'a known older failure does not void the newer pass'
+pass_control 'base filter before invalidation' '    line="$(cat "$dir/exit" 2>/dev/null)" || line=""' \
+  $'    [[ "$(start_field "$start_file" validate-base)" == "$7" ]] || continue\n    line="$(cat "$dir/exit" 2>/dev/null)" || line=""' \
+  'a failure from another base voids the pass'
+pass_control 'class filter before invalidation' '    line="$(cat "$dir/exit" 2>/dev/null)" || line=""' \
+  $'    [[ "$(start_field "$start_file" class)" == "$5" ]] || continue\n    line="$(cat "$dir/exit" 2>/dev/null)" || line=""' \
+  'a failure handed another class voids the pass'
+pass_control 'docs filter before invalidation' '    line="$(cat "$dir/exit" 2>/dev/null)" || line=""' \
+  $'    [[ "$(start_field "$start_file" docs-only)" == "$6" ]] || continue\n    line="$(cat "$dir/exit" 2>/dev/null)" || line=""' \
+  'a failure handed another docs verdict voids the pass'
+pass_control 'prefix filter before invalidation' '    line="$(cat "$dir/exit" 2>/dev/null)" || line=""' \
+  $'    [[ "$(start_field "$start_file" finding-prefix)" == "$8" ]] || continue\n    line="$(cat "$dir/exit" 2>/dev/null)" || line=""' \
+  'a failure with another finding prefix voids the pass'
+}
 
 # --- A no-verdict run with no finding leaves the last pass standing ----------
 # A run the bound ended after the pass, planted under a name that sorts after
