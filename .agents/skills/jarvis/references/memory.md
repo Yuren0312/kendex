@@ -9,6 +9,9 @@
 
 ## Notes
 
+- Put each note under its own `###` heading naming one subject.
+- When you create or update a note, add or update its reading route in the user's standing instructions. Name the note's file and subject heading. Require the step that acts on that subject to read only that section.
+
 | Field | Content |
 |---|---|
 | Source | The user statement or original record that supports the note. |
