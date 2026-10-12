@@ -1662,7 +1662,18 @@ case "$1:$2" in
       mv -- "$TRACKER_CASE_DIR/next" "$TRACKER_CASE_DIR/item"
     done
     echo '{}' ;;
-  issues:list) jq '[.]' "$TRACKER_CASE_DIR/item" ;;
+  issues:list)
+    shift 2
+    label=''
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --label) label="$2"; shift 2 ;;
+        --assignee) shift 2 ;;
+        --max|--format=safe) shift ;;
+        *) exit 1 ;;
+      esac
+    done
+    jq --arg label "$label" '[select(.labels | index($label) != null)]' "$TRACKER_CASE_DIR/item" ;;
   comments:create) cp -- "$5" "$TRACKER_CASE_DIR/posted"; echo '{}' ;;
   comments:bulk-list) cat "$TRACKER_CASE_DIR/comments" ;;
   *) exit 1 ;;
@@ -1706,6 +1717,10 @@ tracker_case() { # ROW WATCH
     failed-comment) printf 'comment\n' >"$STUB_DIR/fail" ;;
     fallback) TRACKER_EMAIL="" ;;
     no-team) TRACKER_TEAM="" ;;
+    close-earlier-different|close-latest-different|close-earlier-mixed*|close-latest-mixed*) TRACKER_TEAM="" ;;
+    send-unreadable)
+      printf '[env]\nORCH_OWNER_ASK_LABEL = [broken]\n' >"$CASE_REPO_ROOT/kendex.settings.toml"
+      extra+=(--wait 0) ;;
     other-author) author=other@example.test ;;
     old-comment) time=2026-09-30T00:00:00.000Z ;;
     replacement) jq '.description = "**Previous, what you do:** Old action.\n\n" + .description' "$STUB_DIR/item" >"$STUB_DIR/next"; mv -- "$STUB_DIR/next" "$STUB_DIR/item" ;;
@@ -1728,42 +1743,173 @@ tracker_case() { # ROW WATCH
     --options approve,hold --recommend approve ${extra[@]+"${extra[@]}"} 2>"$STUB_DIR/write.err")"
   id="${id#id=}"
   TRACKER_ASK="$id"
-  if [[ "$row" == close-earlier || "$row" == close-latest ]]; then
+  case "$row" in
+    disabled|send-unreadable)
+      local cause=settings-unset pending
+      [[ "$row" != send-unreadable ]] || cause=settings-unreadable
+      assert_contains "$(cat "$STUB_DIR/write.err")" "lane-mail: tracker-unwritten issue=KEN-7 cause=$cause" "$row identifies the settings failure"
+      pending="$(tracker_mail pending --item overseer --to owner)"
+      assert_eq "$(jq --arg id "$id" '.id == $id and .text == "Approve the action?\nMore detail." and .options == ["approve","hold"] and .recommend == "approve" and has("deadline")' <<<"$pending")" true "$row delivers the chat ask"
+      assert_eq "$(wc -l <"$STUB_DIR/calls" | tr -d ' ')" 0 "$row makes no tracker call"
+      rm -f -- "$CASE_REPO_ROOT/kendex.settings.toml"
+      TRACKER_FACTS=0,0
+      return ;;
+    close-unset|close-changed|close-legacy-unset|close-legacy-unreadable|close-unreadable|close-watch-unset|close-watch-unreadable)
+      local cause=settings-unset legacy=false
+      assert_eq "$(tracker_mail pending --item overseer --to owner | jq -r '.tracker_posted == true and .tracker_label == "owner-gated"')" true "$row retains the posted label"
+      case "$row" in close-legacy-*|close-watch-*) legacy=true ;; esac
+      if [[ "$legacy" == true ]]; then
+        jq -c 'del(.tracker_label)' "$CASE_REPO_ROOT/tmp/lane-mail/overseer/to-overseer.jsonl" >"$STUB_DIR/legacy"
+        mv -- "$STUB_DIR/legacy" "$CASE_REPO_ROOT/tmp/lane-mail/overseer/to-overseer.jsonl"
+      fi
+      TRACKER_LABEL=""; TRACKER_EMAIL=""
+      [[ "$row" != close-changed ]] || TRACKER_LABEL=different-label
+      case "$row" in
+        close-watch-unreadable)
+          # The private env producer fails only in the mailbox reader. The
+          # watch loads its settings, then reports the close's failed read.
+          printf 'if [[ $0 == */mailbox/scripts/lane-mail ]]; then return 1; fi\n' >"$CASE_REPO_ROOT/.env.local"
+          cause=settings-unreadable ;;
+        *unreadable)
+          printf '[env]\nORCH_OWNER_ASK_LABEL = [broken]\n' >"$CASE_REPO_ROOT/kendex.settings.toml"
+          cause=settings-unreadable ;;
+      esac
+      case "$row" in
+        close-watch-*)
+          jq -c 'if .kind == "ask" then .deadline = "2000-01-01T00:00:00Z" else . end' \
+            "$CASE_REPO_ROOT/tmp/lane-mail/overseer/to-overseer.jsonl" >"$STUB_DIR/due"
+          mv -- "$STUB_DIR/due" "$CASE_REPO_ROOT/tmp/lane-mail/overseer/to-overseer.jsonl"
+          tracker_pass "$watch"
+          cp -- "$STUB_DIR/tracker.err" "$STUB_DIR/write.err"
+          assert_contains "$TRACKER_OUT" "EVENT owner-ask-closed $id by=default" "$row reports the close event" ;;
+        *) tracker_mail resolve --item overseer --id "$id" --default >"$STUB_DIR/closed.out" 2>"$STUB_DIR/write.err" ;;
+      esac
+      assert_eq "$(tracker_mail pending --item overseer --to owner)" '' "$row closes the chat ask"
+      if [[ "$legacy" == true ]]; then
+        assert_contains "$(cat "$STUB_DIR/write.err")" "lane-mail: tracker-unwritten issue=KEN-7 cause=$cause" "$row identifies the settings failure"
+        assert_eq "$(jq -s '[.[] | select(index("--clear-assignee"))] | length' "$STUB_DIR/calls")" 0 "$row leaves tracker ownership when cleanup cannot resolve"
+      else
+        assert_eq "$(jq --rawfile body "$STUB_DIR/old-description" '.description == $body and .assignee == "" and (.labels | index("owner-gated") == null) and .labels == ["feature","skills"]' "$STUB_DIR/item")" true "$row clears the recorded tracker ownership"
+        assert_contains "$(cat "$STUB_DIR/posted")" "ask=$id closed (default):" "$row posts the machine-read close marker"
+      fi
+      rm -f -- "$CASE_REPO_ROOT/kendex.settings.toml" "$CASE_REPO_ROOT/.env.local"
+      TRACKER_FACTS=0,0
+      return ;;
+  esac
+  if [[ "$row" == close-earlier* || "$row" == close-latest* ]]; then
     local later latest='Review the draft. Its approval closes this ask.' closing kept wanted
+    local first_label="$TRACKER_LABEL" second_label="$TRACKER_LABEL" wanted_label middle='' pending_ids wanted_labels legacy_id='' historic='' final_labels
+    case "$row" in *-different|*-mixed*) second_label=owner-later ;; esac
+    case "$row" in *-same) second_label="$first_label" ;; esac
+    TRACKER_LABEL="$second_label"
     later="$(tracker_mail ask --item overseer --to owner --file "$STUB_DIR/question" \
       --options approve,hold --recommend approve --issue KEN-7 --do "$latest" 2>"$STUB_DIR/write.err")"
     later="${later#id=}"
+    if [[ "$row" == close-earlier-shared-label ]]; then
+      middle="$later"
+      second_label=owner-later
+      TRACKER_LABEL="$second_label"
+      latest='Approve the release. Its confirmation closes this ask.'
+      later="$(tracker_mail ask --item overseer --to owner --file "$STUB_DIR/question" \
+        --options approve,hold --recommend approve --issue KEN-7 --do "$latest" 2>"$STUB_DIR/write.err")"
+      later="${later#id=}"
+    fi
     tracker_mail ask --item overseer --to owner --file "$STUB_DIR/question" \
       --options approve,hold --recommend approve --issue KEN-8 --do 'Approve the other item. Its answer closes it.' >/dev/null
     printf 'assign\n' >"$STUB_DIR/fail"
     tracker_mail ask --item overseer --to owner --file "$STUB_DIR/question" \
       --options approve,hold --recommend approve --issue KEN-7 --do 'Answer in chat. The reply closes it.' >/dev/null 2>"$STUB_DIR/write.err"
     rm -- "$STUB_DIR/fail"
-    closing="$id"; kept="$later"; wanted="$latest"
-    [[ "$row" != close-latest ]] || { closing="$later"; kept="$id"; wanted="$action"; }
-    tracker_mail resolve --item overseer --id "$closing" >/dev/null
-    assert_eq "$(tracker_mail pending --item overseer --to owner | jq -r 'select(.issue == "KEN-7" and .tracker_posted == true) | .id + "|" + (.tracker_posted | tostring)')" \
-      "$kept|true" "$row leaves the other tracker ask pending"
-    assert_eq "$(jq --rawfile body "$STUB_DIR/old-description" --slurpfile owner "$STUB_DIR/owner" --arg action "$wanted" \
+    case "$row" in
+      *-mixed*)
+        # The previous lane-mail writer omitted tracker_label. Only its
+        # first ask loses that field, so old and current records coexist.
+        legacy_id="$id"
+        case "$row" in *-new-first*) legacy_id="$later" ;; esac
+        jq -c --arg id "$legacy_id" 'if .kind == "tracker-posted" and .re == $id
+          then del(.tracker_label) else . end' "$CASE_REPO_ROOT/tmp/lane-mail/overseer/to-overseer.jsonl" >"$STUB_DIR/legacy"
+        mv -- "$STUB_DIR/legacy" "$CASE_REPO_ROOT/tmp/lane-mail/overseer/to-overseer.jsonl"
+        TRACKER_LABEL="$first_label"
+        case "$row" in
+          *-changed|*-new-first|*-new-first-unset|*-new-first-unreadable|*-new-first-same) TRACKER_LABEL="$second_label" ;;
+        esac
+        if [[ "$legacy_id" == "$id" && "$TRACKER_LABEL" != "$first_label" ]]; then historic="$first_label"; fi
+        if [[ "$legacy_id" == "$later" && "$TRACKER_LABEL" != "$second_label" ]]; then historic="$second_label"; fi ;;
+      *-legacy)
+        jq -c 'del(.tracker_label)' "$CASE_REPO_ROOT/tmp/lane-mail/overseer/to-overseer.jsonl" >"$STUB_DIR/legacy"
+        mv -- "$STUB_DIR/legacy" "$CASE_REPO_ROOT/tmp/lane-mail/overseer/to-overseer.jsonl" ;;
+    esac
+    closing="$id"; kept="$later"; wanted="$latest"; wanted_label="$second_label"
+    [[ "$row" != close-latest* ]] || { closing="$later"; kept="$id"; wanted="$action"; wanted_label="$first_label"; }
+    [[ "$kept" != "$legacy_id" ]] || wanted_label="$TRACKER_LABEL"
+    pending_ids="$(jq -cn --arg kept "$kept" --arg middle "$middle" '[$kept,$middle] | map(select(. != "")) | sort')"
+    wanted_labels="$(jq -cn --arg label "$wanted_label" --arg middle "$middle" --arg first "$first_label" --arg historic "$historic" \
+      '["feature","skills",$label] + (if $middle != "" then [$first] else [] end)
+      + (if $historic != "" then [$historic] else [] end) | unique')"
+    final_labels="$(jq -cn --arg historic "$historic" '["feature","skills"] + (if $historic != "" then [$historic] else [] end) | unique')"
+    local settings_cause=''
+    case "$row" in
+      *-mixed*-unset) TRACKER_LABEL=''; settings_cause=settings-unset ;;
+      *-mixed*-unreadable)
+        printf '[env]\nORCH_OWNER_ASK_LABEL = [broken]\n' >"$CASE_REPO_ROOT/kendex.settings.toml"
+        settings_cause=settings-unreadable ;;
+    esac
+    cp -- "$STUB_DIR/item" "$STUB_DIR/before-close"
+    tracker_mail resolve --item overseer --id "$closing" >/dev/null 2>"$STUB_DIR/close.err"
+    assert_eq "$(tracker_mail pending --item overseer --to owner | jq -cs '[.[] | select(.issue == "KEN-7" and .tracker_posted == true) | .id] | sort')" \
+      "$pending_ids" "$row leaves the other tracker ask pending"
+    if [[ -n "$settings_cause" ]]; then
+      assert_contains "$(cat "$STUB_DIR/close.err")" "lane-mail: tracker-unwritten issue=KEN-7 cause=$settings_cause" \
+        "$row reports unavailable legacy settings"
+      assert_eq "$(jq --slurpfile before "$STUB_DIR/before-close" '. == $before[0]' "$STUB_DIR/item")" true \
+        "$row keeps tracker ownership when a legacy label cannot resolve"
+      tracker_mail resolve --item overseer --id "$kept" >/dev/null 2>"$STUB_DIR/close-last.err"
+      if [[ "$kept" == "$legacy_id" ]]; then
+        assert_contains "$(cat "$STUB_DIR/close-last.err")" "lane-mail: tracker-unwritten issue=KEN-7 cause=$settings_cause" \
+          "$row reports unavailable settings on the last legacy close"
+        assert_eq "$(jq --slurpfile before "$STUB_DIR/before-close" '. == $before[0]' "$STUB_DIR/item")" true \
+          "$row never guesses the missing legacy label"
+      else
+        local legacy_label="$first_label"
+        [[ "$legacy_id" != "$later" ]] || legacy_label="$second_label"
+        assert_eq "$(jq --rawfile body "$STUB_DIR/old-description" --arg legacy "$legacy_label" \
+          '.description == $body and .assignee == "" and .labels == (["feature","skills",$legacy] | sort)' "$STUB_DIR/item")" true \
+          "$row still cleans the last recorded ask from its own evidence"
+      fi
+      assert_eq "$(tracker_mail pending --item overseer --to owner | jq -s 'any(.[]; .issue == "KEN-7" and .tracker_posted == true)')" \
+        false "$row closes both mixed mailbox asks"
+      rm -f -- "$CASE_REPO_ROOT/kendex.settings.toml"
+      TRACKER_FACTS=0,0
+      return
+    fi
+    assert_eq "$(jq --rawfile body "$STUB_DIR/old-description" --slurpfile owner "$STUB_DIR/owner" --arg action "$wanted" --argjson labels "$wanted_labels" \
       '.description == ("**" + ($owner[0].name | split(" ")[0]) + ", what you do:** " + $action + "\n\n" + $body)
-      and .assignee == $owner[0].name and (.labels | index("owner-gated") != null)' "$STUB_DIR/item")" \
+      and .assignee == $owner[0].name and .labels == $labels' "$STUB_DIR/item")" \
       true "$row retains the remaining owner action and ownership"
-    printf '{}\n' >"$STUB_DIR/comments"
+    jq -n --arg ask "$kept" '{"KEN-7":[
+      {id:"ask-comment",body:("ask=" + $ask),user_email:"agent@example.test",created_at:"2026-10-01T00:00:00Z"},
+      {id:"owner-comment",body:"approve",user_email:"owner@example.com",created_at:"2026-10-02T00:00:00Z"}]}' >"$STUB_DIR/comments"
     tracker_pass "$watch"
-    assert_eq "$(jq -s '[.[] | select(.[0] == "issues" and .[1] == "list")] | length' "$STUB_DIR/calls")" \
-      1 "$row keeps the remaining ask visible to the long pass"
+    assert_eq "$(tracker_answer_count "$kept")" 1 "$row delivers the remaining owner reply"
+    assert_eq "$(jq -sc '[.[] | select(.[0] == "comments" and .[1] == "bulk-list") | .[2:-1]]' "$STUB_DIR/calls")" \
+      '[["KEN-7"]]' "$row reads each matching item once"
+    if [[ -n "$middle" ]]; then
+      tracker_mail resolve --item overseer --id "$middle" >/dev/null
+      assert_eq "$(jq --arg label "$second_label" '.labels == (["feature","skills",$label] | sort)
+        and .assignee != ""' "$STUB_DIR/item")" true "$row removes a label after its last ask closes"
+    fi
     tracker_mail resolve --item overseer --id "$kept" >/dev/null
     assert_eq "$(tracker_mail pending --item overseer --to owner | jq -s 'any(.[]; .issue == "KEN-7" and .tracker_posted == true)')" \
       false "$row closes the last tracker ask for the issue"
-    assert_eq "$(jq --rawfile body "$STUB_DIR/old-description" '.description == $body and .assignee == ""
-      and (.labels | index("owner-gated") == null)' "$STUB_DIR/item")" true "$row clears only after the last ask"
+    assert_eq "$(jq --rawfile body "$STUB_DIR/old-description" --argjson labels "$final_labels" '.description == $body and .assignee == ""
+      and .labels == $labels' "$STUB_DIR/item")" true "$row clears only after the last ask"
     TRACKER_FACTS=0,0
     return
   fi
   ACTION_CORRECT="$(jq --rawfile body "$STUB_DIR/old-description" --slurpfile owner "$STUB_DIR/owner" --arg action "$action" '
     .description | test("^\\*\\*[^*]+, what you do:\\*\\* ")
     and . == ("**" + ($owner[0].name | split(" ")[0]) + ", what you do:** " + $action + "\n\n" + $body)' "$STUB_DIR/item")"
-  if [[ "$row" == enabled || "$row" == replacement || "$row" == restored || "$row" == close ]]; then
+  if [[ "$row" == enabled || "$row" == no-team || "$row" == replacement || "$row" == restored || "$row" == close ]]; then
     assert_eq "$ACTION_CORRECT" true "$row opens with the resolved first name, action and unchanged body"
   fi
   if [[ "$row" == due || "$row" == failed-* ]]; then
@@ -1771,7 +1917,7 @@ tracker_case() { # ROW WATCH
       "$CASE_REPO_ROOT/tmp/lane-mail/overseer/to-overseer.jsonl" >"$STUB_DIR/due-ask"
     mv -- "$STUB_DIR/due-ask" "$CASE_REPO_ROOT/tmp/lane-mail/overseer/to-overseer.jsonl"
   fi
-  if [[ "$row" == enabled || "$row" == fallback ]]; then
+  if [[ "$row" == enabled || "$row" == no-team || "$row" == fallback ]]; then
     assert_eq "$(jq -s '[.[] | select(.[1] == "update" or .[1] == "create")] | length' "$STUB_DIR/calls")" \
       3 'tracker ask makes the assignment, label and comment writes'
     assert_eq "$(jq -s -r '.[] | select(index("--assignee")) | .[4]' "$STUB_DIR/calls")" \
@@ -1810,7 +1956,7 @@ tracker_case() { # ROW WATCH
     assert_eq "$(tracker_mail drain --item overseer --after 1)" "count=2 first=$id" \
       'the private confirmation never replays the old ask'
   fi
-  local before after first second
+  local before first second
   if [[ "$row" == restored ]]; then
     jq --rawfile body "$STUB_DIR/old-description" '.description = $body' "$STUB_DIR/item" >"$STUB_DIR/next"
     mv -- "$STUB_DIR/next" "$STUB_DIR/item"
@@ -1842,7 +1988,6 @@ tracker_case() { # ROW WATCH
   [[ "$row" != restored ]] || assert_eq "$(jq -s '[.[] | select(index("--description") and (index("--labels") | not) and (index("--clear-assignee") | not))] | length' "$STUB_DIR/calls")" 1 'long pass restores the line once'
   second="$(tracker_answer_count "$id")"
   second=$((second - first))
-  after="$(wc -l <"$STUB_DIR/calls" | tr -d ' ')"
   TRACKER_FACTS="$first,$second"
   if [[ "$row" == due ]]; then
     assert_eq "$(jq -s '[.[] | select(.delivery_id == "linear:owner-comment")] | length' \
@@ -1860,8 +2005,6 @@ tracker_case() { # ROW WATCH
   fi
   if [[ "$row" == no-item ]]; then
     assert_eq "$before" 0 'no item makes no tracker write'
-  elif [[ "$row" == disabled || "$row" == no-team ]]; then
-    assert_eq "$before,$after" 0,0 "$row makes no tracker writes or reads"
   fi
 }
 TRACKER_CASES='enabled|1,0
@@ -1873,8 +2016,41 @@ restored|1,0
 close|1,0
 close-earlier|0,0
 close-latest|0,0
+close-earlier-different|0,0
+close-latest-different|0,0
+close-earlier-shared-label|0,0
+close-earlier-legacy|0,0
+close-latest-legacy|0,0
+close-earlier-mixed|0,0
+close-latest-mixed|0,0
+close-earlier-mixed-unset|0,0
+close-latest-mixed-unset|0,0
+close-earlier-mixed-unreadable|0,0
+close-latest-mixed-unreadable|0,0
+close-earlier-mixed-changed|0,0
+close-latest-mixed-changed|0,0
+close-earlier-mixed-new-first|0,0
+close-latest-mixed-new-first|0,0
+close-earlier-mixed-new-first-restored|0,0
+close-latest-mixed-new-first-restored|0,0
+close-earlier-mixed-same|0,0
+close-latest-mixed-same|0,0
+close-earlier-mixed-new-first-same|0,0
+close-latest-mixed-new-first-same|0,0
+close-earlier-mixed-new-first-unset|0,0
+close-latest-mixed-new-first-unset|0,0
+close-earlier-mixed-new-first-unreadable|0,0
+close-latest-mixed-new-first-unreadable|0,0
 fallback|1,0
-no-team|0,0
+no-team|1,0
+send-unreadable|0,0
+close-unset|0,0
+close-changed|0,0
+close-unreadable|0,0
+close-legacy-unset|0,0
+close-legacy-unreadable|0,0
+close-watch-unset|0,0
+close-watch-unreadable|0,0
 other-author|0,0
 old-comment|0,0
 no-item|0,0
@@ -1896,9 +2072,41 @@ done <<<"$TRACKER_CASES"
 assert_eq "$TRACKER_ROWS" "$(awk 'END {print NR}' <<<"$TRACKER_CASES")" 'all tracker table rows completed'
 
 NORMAL_TRACKER_MAIL="$TRACKER_MAIL"
+SETTINGS_CONTROLS='team|no-team|no-team opens with the resolved first name, action and unchanged body
+fallback|close-unset|close-unset clears the recorded tracker ownership
+diagnostic|disabled|disabled identifies the settings failure
+diagnostic|close-legacy-unset|close-legacy-unset identifies the settings failure
+read-cause|send-unreadable|send-unreadable identifies the settings failure
+read-cause|close-watch-unreadable|close-watch-unreadable identifies the settings failure'
+while IFS='|' read -r rule row failure; do
+  SETTINGS_SCRIPTS="$(mutant_scripts "tracker-settings-$rule-$row/orch" lib/mailbox-append.sh)"
+  ln -s "$TMP_ROOT/owner-tracker/linear" "$TMP_ROOT/tracker-settings-$rule-$row/linear"
+  case "$rule" in
+    team) mutate_file "$SETTINGS_SCRIPTS/lib/mailbox-append.sh" \
+      '[[ -z "$OWNER_TRACKER_LABEL" || -z "$OWNER_TRACKER_EMAIL" ]] || configured=1' \
+      '[[ -z "$OWNER_TRACKER_LABEL" || -z "$OWNER_TRACKER_EMAIL" || -z "${LINEAR_TEAM:-}" ]] || configured=1' ;;
+    fallback) mutate_file "$SETTINGS_SCRIPTS/lib/mailbox-append.sh" \
+      'if [[ -n "$recorded_label" ]]; then' 'if false && [[ -n "$recorded_label" ]]; then' ;;
+    diagnostic) mutate_file "$SETTINGS_SCRIPTS/lib/mailbox-append.sh" \
+      "printf 'lane-mail: tracker-unwritten issue=%s cause=%s\\n'" \
+      ": 'lane-mail: tracker-unwritten issue=%s cause=%s\\n'" ;;
+    read-cause) mutate_file "$SETTINGS_SCRIPTS/lib/mailbox-append.sh" \
+      'OWNER_TRACKER_SETTINGS_CAUSE=settings-unreadable' 'OWNER_TRACKER_SETTINGS_CAUSE=settings-unset' ;;
+  esac
+  settings_control_rc=0
+  (
+    FAIL=0
+    TRACKER_MAIL="$SETTINGS_SCRIPTS/lane-mail"
+    tracker_case "$row" "$REPO_ROOT/skills/orch/scripts/oversee-watch"
+    [[ "$FAIL" -eq 0 ]]
+  ) >"$TMP_ROOT/tracker-settings-$rule-$row.out" 2>&1 || settings_control_rc=$?
+  assert_eq "$settings_control_rc" 1 "control: $rule makes $row fail"
+  assert_contains "$(cat "$TMP_ROOT/tracker-settings-$rule-$row.out")" "FAIL  $failure" \
+    "control: $rule reaches the settings contract assertion"
+done <<<"$SETTINGS_CONTROLS"
 CLOSE_SCRIPTS="$(mutant_scripts tracker-close/orch lib/mailbox-append.sh)"
 ln -s "$TMP_ROOT/owner-tracker/linear" "$TMP_ROOT/tracker-close/linear"
-mutate_file "$CLOSE_SCRIPTS/lib/mailbox-append.sh" 'if [[ "$remaining" != null ]]; then' 'if false; then'
+mutate_file "$CLOSE_SCRIPTS/lib/mailbox-append.sh" "if [[ \"\$remaining\" != '[]' ]]; then" 'if false; then'
 close_control_rc=0
 (
   FAIL=0
@@ -1910,6 +2118,77 @@ assert_eq "$close_control_rc" 1 'control: clearing an earlier ask fails the rema
 assert_contains "$(cat "$TMP_ROOT/tracker-close-control.out")" \
   'FAIL  close-earlier retains the remaining owner action and ownership' \
   'control: the remaining ask assertion detects premature cleanup'
+LABEL_SCRIPTS="$(mutant_scripts tracker-close-labels/orch lib/mailbox-append.sh)"
+ln -s "$TMP_ROOT/owner-tracker/linear" "$TMP_ROOT/tracker-close-labels/linear"
+mutate_file "$LABEL_SCRIPTS/lib/mailbox-append.sh" \
+  '($remaining | owner_tracker_open_labels($configured))' \
+  '($remaining | if length > 0 then [$label] else [] end)'
+for row in close-earlier-different close-latest-different; do
+  label_control_rc=0
+  (
+    FAIL=0
+    TRACKER_MAIL="$LABEL_SCRIPTS/lane-mail"
+    tracker_case "$row" "$REPO_ROOT/skills/orch/scripts/oversee-watch"
+    [[ "$FAIL" -eq 0 ]]
+  ) >"$TMP_ROOT/tracker-close-labels-$row.out" 2>&1 || label_control_rc=$?
+  assert_eq "$label_control_rc" 1 "control: the issue-wide label assumption fails $row"
+  assert_contains "$(cat "$TMP_ROOT/tracker-close-labels-$row.out")" \
+    "FAIL  $row retains the remaining owner action and ownership" \
+    "control: $row rejects a label with no remaining owner ask"
+  assert_contains "$(cat "$TMP_ROOT/tracker-close-labels-$row.out")" \
+    "FAIL  $row clears only after the last ask" \
+    "control: $row detects the label left after every ask closes"
+done
+MIXED_LABEL_SCRIPTS="$(mutant_scripts tracker-mixed-label/orch lib/mailbox-append.sh)"
+ln -s "$TMP_ROOT/owner-tracker/linear" "$TMP_ROOT/tracker-mixed-label/linear"
+mutate_file "$MIXED_LABEL_SCRIPTS/lib/mailbox-append.sh" \
+  '($remaining | owner_tracker_open_labels($configured))' \
+  '($remaining | owner_tracker_open_labels($label))'
+while IFS='|' read -r row failure; do
+  mixed_label_rc=0
+  (
+    FAIL=0
+    TRACKER_MAIL="$MIXED_LABEL_SCRIPTS/lane-mail"
+    tracker_case "$row" "$REPO_ROOT/skills/orch/scripts/oversee-watch"
+    [[ "$FAIL" -eq 0 ]]
+  ) >"$TMP_ROOT/tracker-mixed-label-$row.out" 2>&1 || mixed_label_rc=$?
+  assert_eq "$mixed_label_rc" 1 "control: the closing label cannot identify the legacy label in $row"
+  assert_contains "$(cat "$TMP_ROOT/tracker-mixed-label-$row.out")" "FAIL  $row $failure" \
+    "control: $row rejects reuse of another record label"
+done <<'ROWS'
+close-latest-mixed|clears only after the last ask
+close-latest-mixed-unset|reports unavailable legacy settings
+close-latest-mixed-unreadable|reports unavailable legacy settings
+ROWS
+SHARED_LABEL_SCRIPTS="$(mutant_scripts tracker-shared-label/orch lib/mailbox-append.sh)"
+ln -s "$TMP_ROOT/owner-tracker/linear" "$TMP_ROOT/tracker-shared-label/linear"
+mutate_file "$SHARED_LABEL_SCRIPTS/lib/mailbox-append.sh" \
+  '($remaining | owner_tracker_open_labels($configured))' \
+  '($remaining | if length > 0 then [last] else [] end | owner_tracker_open_labels($configured))'
+shared_label_rc=0
+(
+  FAIL=0
+  TRACKER_MAIL="$SHARED_LABEL_SCRIPTS/lane-mail"
+  tracker_case close-earlier-shared-label "$REPO_ROOT/skills/orch/scripts/oversee-watch"
+  [[ "$FAIL" -eq 0 ]]
+) >"$TMP_ROOT/tracker-shared-label.out" 2>&1 || shared_label_rc=$?
+assert_eq "$shared_label_rc" 1 'control: selecting only the latest label loses an earlier remaining label'
+assert_contains "$(cat "$TMP_ROOT/tracker-shared-label.out")" \
+  'FAIL  close-earlier-shared-label retains the remaining owner action and ownership' \
+  'control: all remaining asks contribute their labels'
+LABEL_WATCH="$(mutant_scripts tracker-watch-labels/orch oversee-watch)/oversee-watch"
+ln -s "$TMP_ROOT/owner-tracker/linear" "$TMP_ROOT/tracker-watch-labels/linear"
+mutate_file "$LABEL_WATCH" 'owner_tracker_open_labels($label)[]' '$label'
+label_watch_rc=0
+(
+  FAIL=0
+  tracker_case close-latest-different "$LABEL_WATCH"
+  [[ "$FAIL" -eq 0 ]]
+) >"$TMP_ROOT/tracker-watch-labels.out" 2>&1 || label_watch_rc=$?
+assert_eq "$label_watch_rc" 1 'control: configured-label discovery loses the remaining owner reply'
+assert_contains "$(cat "$TMP_ROOT/tracker-watch-labels.out")" \
+  'FAIL  close-latest-different delivers the remaining owner reply' \
+  'control: the reply assertion detects discovery with the wrong label'
 for rule in issue posted; do
   CLOSE_SCRIPTS="$(mutant_scripts "tracker-close-$rule/orch" lib/mailbox-append.sh)"
   ln -s "$TMP_ROOT/owner-tracker/linear" "$TMP_ROOT/tracker-close-$rule/linear"
