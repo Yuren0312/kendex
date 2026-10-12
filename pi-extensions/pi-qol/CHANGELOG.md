@@ -2,6 +2,10 @@
 
 ## Consumer-impacting changes
 
+### Unreleased
+
+- Add an optional gateway privacy setting for main-agent and QOL model requests through OpenRouter and Vercel AI Gateway. It requires zero data retention and no prompt training while keeping other routing options. Native Pi compaction and branch summaries still require gateway account privacy policies.
+
 ### 2.4.0
 
 - `workingIndicator.mode` defaults to `static`, a dot with no animation timer, instead of `animated`; set `animated` to restore Pi's spinner. In a scripted 100-second streaming session, `static` drew 58% fewer frames and used a third less CPU.
