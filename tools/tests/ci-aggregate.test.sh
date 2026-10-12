@@ -398,12 +398,12 @@ legs() { # WORKFLOW SELECTION [RESULT] [EVENT] [KEY] — what a matrix key expan
 
 # The selected portability job on pull requests and merge groups.
 MACOS_QUEUE_JOB=skill-suites-macos-queue
-EVERY_GATED="bot-instructions cargo-check-windows cargo-lint cargo-linux cargo-macos cargo-tests-windows markdown preflight $MACOS_QUEUE_JOB skill-suites-shard ui-tests"
+EVERY_GATED="bot-instructions cargo-check-windows cargo-lint cargo-linux cargo-macos cargo-tests-windows catalog markdown preflight $MACOS_QUEUE_JOB skill-suites-shard smoke ui-tests"
 # A pull request runs every gated lane.
-EVERY_PR_LANE="bot-instructions cargo-check-windows cargo-lint cargo-linux cargo-macos cargo-tests-windows markdown preflight $MACOS_QUEUE_JOB skill-suites-shard ui-tests"
+EVERY_PR_LANE="bot-instructions cargo-check-windows cargo-lint cargo-linux cargo-macos cargo-tests-windows catalog markdown preflight $MACOS_QUEUE_JOB skill-suites-shard smoke ui-tests"
 # What a merge group runs of it: every lane, without the two pull-request diff
 # checks.
-EVERY_GROUP_LANE="bot-instructions cargo-check-windows cargo-lint cargo-linux cargo-macos cargo-tests-windows $MACOS_QUEUE_JOB skill-suites-shard ui-tests"
+EVERY_GROUP_LANE="bot-instructions cargo-check-windows cargo-lint cargo-linux cargo-macos cargo-tests-windows catalog $MACOS_QUEUE_JOB skill-suites-shard smoke ui-tests"
 check "the gated set is read out of the workflow" "$EVERY_GATED" \
   "$(gated_jobs "$WORKFLOW" | tr '\n' ' ' | sed 's/ $//')"
 
@@ -426,17 +426,17 @@ pull_request|$VERIFY_ROW|bot-instructions markdown preflight
 merge_group|$VERIFY_ROW|bot-instructions
 pull_request|$ALL_ON|$EVERY_PR_LANE
 merge_group|$ALL_ON|$EVERY_GROUP_LANE
-pull_request|$one_skill|bot-instructions cargo-linux markdown preflight skill-suites-shard
-merge_group|$one_skill|bot-instructions cargo-linux skill-suites-shard
+pull_request|$one_skill|bot-instructions cargo-linux catalog markdown preflight skill-suites-shard smoke
+merge_group|$one_skill|bot-instructions cargo-linux catalog skill-suites-shard smoke
 pull_request|$CODE_ROW|bot-instructions cargo-linux cargo-macos cargo-tests-windows markdown preflight
 merge_group|$CODE_ROW|bot-instructions cargo-linux cargo-macos cargo-tests-windows
-pull_request|$ORCH_CODE_ROW|bot-instructions cargo-linux cargo-macos cargo-tests-windows markdown preflight $MACOS_QUEUE_JOB skill-suites-shard
-merge_group|$ORCH_CODE_ROW|bot-instructions cargo-linux cargo-macos cargo-tests-windows $MACOS_QUEUE_JOB skill-suites-shard
-pull_request|$standard_code|bot-instructions cargo-check-windows cargo-lint cargo-linux cargo-macos cargo-tests-windows markdown preflight $MACOS_QUEUE_JOB skill-suites-shard
-merge_group|$standard_code|bot-instructions cargo-check-windows cargo-lint cargo-linux cargo-macos cargo-tests-windows $MACOS_QUEUE_JOB skill-suites-shard
-merge_group|$ORCH_PROOF_ROW|bot-instructions cargo-linux cargo-macos cargo-tests-windows $MACOS_QUEUE_JOB skill-suites-shard
-merge_group|$SOURCE_PROOF_ROW|bot-instructions cargo-linux cargo-macos cargo-tests-windows $MACOS_QUEUE_JOB skill-suites-shard
-merge_group|$PATCH_PROOF_ROW|bot-instructions cargo-linux cargo-tests-windows skill-suites-shard
+pull_request|$ORCH_CODE_ROW|bot-instructions cargo-linux cargo-macos cargo-tests-windows catalog markdown preflight $MACOS_QUEUE_JOB skill-suites-shard smoke
+merge_group|$ORCH_CODE_ROW|bot-instructions cargo-linux cargo-macos cargo-tests-windows catalog $MACOS_QUEUE_JOB skill-suites-shard smoke
+pull_request|$standard_code|bot-instructions cargo-check-windows cargo-lint cargo-linux cargo-macos cargo-tests-windows catalog markdown preflight $MACOS_QUEUE_JOB skill-suites-shard smoke
+merge_group|$standard_code|bot-instructions cargo-check-windows cargo-lint cargo-linux cargo-macos cargo-tests-windows catalog $MACOS_QUEUE_JOB skill-suites-shard smoke
+merge_group|$ORCH_PROOF_ROW|bot-instructions cargo-linux cargo-macos cargo-tests-windows catalog $MACOS_QUEUE_JOB skill-suites-shard smoke
+merge_group|$SOURCE_PROOF_ROW|bot-instructions cargo-linux cargo-macos cargo-tests-windows catalog $MACOS_QUEUE_JOB skill-suites-shard smoke
+merge_group|$PATCH_PROOF_ROW|bot-instructions cargo-linux cargo-tests-windows catalog skill-suites-shard smoke
 ROWS
 [ "$job_rows" -ge 14 ] || { echo "the job table read $job_rows rows" >&2; exit 1; }
 
@@ -1070,6 +1070,69 @@ aggregate() { # AGGREGATE_SCRIPT LANE... — the exit status, and the refusal ke
   printf '%s' "$status"
   sed -n 's/^ci-aggregate: cause=/ /p' "$TMP/aggregate-err" | head -1
 }
+
+# Evaluate each job's real aggregate expression. A README-only diff permits
+# the skips, while catalog content, compiled renderer inputs and a dead
+# classifier cannot produce a passing CI context over skipped jobs.
+saved_results="$RESULTS"
+for job in catalog smoke; do
+  case "$job" in catalog) variable=CATALOG ;; smoke) variable=SMOKE ;; esac
+  # Main's checkout is a real producer even when classification has no
+  # usable output. The same jobs must check external releases there.
+  while IFS='|' read -r result sel; do
+    case " $(running "$WORKFLOW" "$sel" "$result" push) " in
+      *" $job "*) ok "$job runs on main with classifier $result and no selected inputs" ;;
+      *) bad "$job skips main with classifier $result and no selected inputs" ;;
+    esac
+  done <<ROWS
+success|$ALL_OFF
+skipped|$ALL_OFF
+failure|$ALL_OFF
+ROWS
+  expr="$(aggregate_lanes "$WORKFLOW" "$CI_JOB" | awk -F '\t' -v j="$job" '$2 == j { print $3 }')"
+  [ -n "$expr" ] || { bad "missing aggregate expression for $job"; continue; }
+  while IFS='|' read -r event result path expected_lane expected_status; do
+    sel="$(SELECT_EVENT="$event" selection trivial true "$path")"
+    value="$(gh_eval value "$(context_json "$event" "$result" "$sel" "$TMP/published-map")" "$expr" | jq -r 'if . == null then "" else . end')"
+    RESULTS="$(jq -cn --arg job "$job" --arg result "$result" '{changes: {result: $result}} + {($job): {result: "skipped"}}')"
+    check "$job CI selection on $event $result $path" "$expected_lane" "$value"
+    check "$job CI skip on $event $result $path" "$expected_status" \
+      "$(aggregate "$AGGREGATE" --lane "$value:$job")"
+  done <<ROWS
+pull_request|success|README.md|false|0
+merge_group|success|README.md|false|0
+pull_request|success|skills/orch/SKILL.md|true|1
+merge_group|success|skills/orch/SKILL.md|true|1
+pull_request|success|crates/core/src/render/agent.rs|true|1
+merge_group|success|crates/core/src/render/agent.rs|true|1
+pull_request|failure|README.md||1
+merge_group|failure|README.md||1
+ROWS
+  plant "$WORKFLOW" "$variable: \${{ $expr }}" "$variable: \${{ $expr && false }}" \
+    "$TMP/wf-$job-false.yml" "$CI_JOB"
+  false_expr="$(aggregate_lanes "$TMP/wf-$job-false.yml" "$CI_JOB" | awk -F '\t' -v j="$job" '$2 == j { print $3 }')"
+  value="$(gh_eval value "$(context_json pull_request success "$ORCH_CODE_ROW" "$TMP/published-map")" "$false_expr")"
+  RESULTS="$(jq -cn --arg job "$job" '{changes: {result: "success"}} + {($job): {result: "skipped"}}')"
+  check "must-fail: $job aggregate inverse authorizes an unselected skip" "0" \
+    "$(aggregate "$AGGREGATE" --lane "$value:$job")"
+  condition="!cancelled() && (github.event_name == 'push' || needs.changes.result != 'success' || needs.changes.outputs.$job == 'true')"
+  plant "$WORKFLOW" "$condition" "!cancelled()" "$TMP/wf-$job-unconditional.yml" "$job"
+  case " $(running "$TMP/wf-$job-unconditional.yml" "$VERIFY_ROW" success pull_request) " in
+    *" $job "*) ok "must-fail: $job job inverse runs on README" ;;
+    *) bad "must-fail: $job unconditional inverse" ;;
+  esac
+  plant "$WORKFLOW" "$condition" "github.event_name == 'push' || needs.changes.result != 'success' || needs.changes.outputs.$job == 'true'" "$TMP/wf-$job-no-status.yml" "$job"
+  case " $(running "$TMP/wf-$job-no-status.yml" "$ALL_OFF" failure merge_group) " in
+    *" $job "*) bad "must-fail: $job status inverse still runs" ;;
+    *) ok "must-fail: $job status inverse loses the dead-classifier job" ;;
+  esac
+  plant "$WORKFLOW" "$condition" "!cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.$job == 'true')" "$TMP/wf-$job-no-main.yml" "$job"
+  case " $(running "$TMP/wf-$job-no-main.yml" "$ALL_OFF" success push) " in
+    *" $job "*) bad "must-fail: $job main inverse still runs" ;;
+    *) ok "must-fail: $job main inverse loses the main-push job" ;;
+  esac
+done
+RESULTS="$saved_results"
 
 # CI combines the shard and runner selections. Keep both output names in
 # the control: name coverage
