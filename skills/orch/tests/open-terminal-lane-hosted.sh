@@ -374,6 +374,84 @@ run_ot "ORCH_LANE_ALIASES=eclaude=work;flags=--model pi-claude/opus --thinking h
 assert_eq "$(observe "hostseat=none") called=$([[ "$(host_call)" == nolog ]] && echo no || echo yes)" "hostseat=none called=yes" \
   "control: without the refusal a hosted Pi launch on a pi-claude model goes on to the provider"
 OPEN_TERMINAL="$PI_OT_SHIPPED"
+echo "=== a hosted Anthropic Pi launch spends the selected account grant ==="
+API_ROWS="$TMP_ROOT/hosted-api-credit.tsv"
+api_hosted_rows() { # REMAINING [STATUS [DETAIL]]
+  if [[ "${2:-ok}" == unreachable ]]; then
+    printf 'account=%s\tharness=pi\tstatus=unreachable\tdetail=%s\n' "$H/.eclaude" "$3" > "$API_ROWS"
+  else
+    printf 'account=%s\tharness=pi\tstatus=%s\tcredit-limit=200.00\tcredit-spent=0.00\tcredit-remaining=%s\tcredit-expires=2099-10-06T00:00:00Z\n' \
+      "$H/.eclaude" "${2:-ok}" "$1" > "$API_ROWS"
+  fi
+}
+API_FLAGS='flags=--model anthropic/claude-opus-5-5 --thinking high'
+API_ENV="$HARNESS_UP;LANE_HOST_STUB_ACCOUNTS=$API_ROWS;ORCH_LANE_CLOUD_CREDIT_FLOOR=5;$API_FLAGS"
+api_launch_result() { # no host create is accepted on a refused credit
+  printf 'rc=%s creates=%s launched=%s cause=%s' "$RC" \
+    "$(grep -c '^create ' "$RUN/host.log" 2>/dev/null || true)" "$(typed "clear; ssh 'lane.example'")" \
+    "$(awk '$2 == "lane-credit-refused" {for(i=3;i<=NF;i++) if($i ~ /^cause=/ || $i ~ /^retry-at=/) printf "%s,", $i}' <<<"$OUT")"
+}
+api_launch_room() {
+  run_ot "$API_ENV" --host "$HOST_STUB" --harness pi --lane auto --repo o/r KEN-3747
+  assert_eq "rc=$RC account=$(awk '/^create / { for(i=1;i<=NF;i++) if($i == "--account") print $(i+1) }' "$RUN/host.log") launched=$(typed "clear; ssh 'lane.example'") pool=$(awk -F'\t' '{print $9}' "$RUN"/state/claims/*.claim 2>/dev/null)" \
+    "rc=0 account=$H/.eclaude launched=1 pool=api-credit" 'the API-credit pick passes its Claude home and spending pool to create and the claim'
+}
+api_hosted_rows 150
+api_launch_room
+for lane in auto "$H/.eclaude"; do
+  api_hosted_rows 5
+  run_ot "$API_ENV" --host "$HOST_STUB" --harness pi --lane "$lane" --repo o/r KEN-3747
+  assert_eq "$(api_launch_result)" 'rc=1 creates=0 launched= cause=cause=api-credit,retry-at=none,' 'credit at the floor creates no hosted lane'
+done
+api_hosted_rows 150 expired
+run_ot "$API_ENV" --host "$HOST_STUB" --harness pi --lane auto --repo o/r KEN-3747
+assert_eq "$(api_launch_result)" 'rc=1 creates=0 launched= cause=cause=api-credit,retry-at=none,' 'a provider-expired grant creates no lane'
+for detail in api-credit-tokens-unreadable api-credit-tokens-undated api-credit-model-unpriced api-credit-reading-unavailable; do
+  api_hosted_rows '' unreachable "$detail"
+  run_ot "$API_ENV" --host "$HOST_STUB" --harness pi --lane "$H/.eclaude" --repo o/r KEN-3747
+  assert_eq "rc=$RC calls=$(host_call) detail=$(awk '$2 == "lane-provider-unmeasured" {for(i=3;i<=NF;i++) if($i ~ /^detail=/) print $i}' <<<"$OUT")" \
+    "rc=1 calls=accounts detail=detail=$detail" 'an unread provider API row names its detail and creates nothing'
+done
+api_hosted_rows 150
+for lane in auto "$H/.eclaude"; do
+  for failure in busy timeout; do
+    failure_env=LANE_HOST_STUB_ACCOUNTS_STATUS=69
+    [[ "$failure" != timeout ]] || failure_env='LANE_HOST_STUB_ACCOUNTS_DELAY=2;ORCH_LANE_HOST_ACCOUNTS_TIMEOUT_S=1;OT_SLEEP_INSTANT='
+    run_ot "$API_ENV;$failure_env" --host "$HOST_STUB" --harness pi --lane "$lane" --repo o/r KEN-3747
+    failure_key=lane-resolution-failed
+    [[ "$lane" == auto ]] || failure_key=lane-judge-failed
+    assert_eq "rc=$RC creates=$(grep -c '^create ' "$RUN/host.log" || true) failed=$(awk -v key="$failure_key" '$2 == key {n++} END {print n+0}' <<<"$OUT") repair=$(awk '$2 == "lane-provider-unmeasured" {n++} END {print n+0}' <<<"$OUT")" \
+      'rc=1 creates=0 failed=1 repair=0' 'failed API accounts returns a command failure and opens no lane'
+  done
+done
+api_hosted_rows 150
+API_OT_SHIPPED="$OPEN_TERMINAL"
+OPEN_TERMINAL="$(mutant_scripts ctl-api-unmeasured/orch lib/lane-launch.sh)/open-terminal" || exit 1
+orch_fixture_shared_libs "$TMP_ROOT/ctl-api-unmeasured/orch"
+mutate_file "${OPEN_TERMINAL%/*}/lib/lane-launch.sh" 'github-copilot/* | anthropic/*)' 'github-copilot/*)'
+API_SAVED_FAIL="$FAIL"; FAIL=0
+api_launch_room > "$TMP_ROOT/api-unmeasured-control.out"
+API_CONTROL="$FAIL"; FAIL="$API_SAVED_FAIL"; OPEN_TERMINAL="$API_OT_SHIPPED"
+assert_eq "$API_CONTROL" 1 'control: the prior unmeasured Anthropic mapping fails the unchanged hosted launch row'
+OPEN_TERMINAL="$(mutant_scripts ctl-api-claim-pool/orch lib/lane-claims.sh)/open-terminal" || exit 1
+orch_fixture_shared_libs "$TMP_ROOT/ctl-api-claim-pool/orch"
+mutate_file "${OPEN_TERMINAL%/*}/lib/lane-claims.sh" \
+  'lane_claim_put "$1" claim "$2" "$3" "$4" "$5" "${6:-}" "${7:-}" "${8:-plan}"' \
+  'lane_claim_put "$1" claim "$2" "$3" "$4" "$5" "${6:-}" "${7:-}" "plan"'
+API_SAVED_FAIL="$FAIL"; FAIL=0
+api_launch_room > "$TMP_ROOT/api-claim-pool-control.out"
+API_CONTROL="$FAIL"; FAIL="$API_SAVED_FAIL"; OPEN_TERMINAL="$API_OT_SHIPPED"
+assert_eq "$API_CONTROL" 1 'control: dropping the picked pool makes the unchanged hosted claim assertion fail'
+# The refusal cause must reach the launcher even when the chooser works.
+OPEN_TERMINAL="$(mutant_scripts ctl-api-refusal/orch open-terminal)/open-terminal" || exit 1
+orch_fixture_shared_libs "$TMP_ROOT/ctl-api-refusal/orch"
+mutate_file "$OPEN_TERMINAL" '3) ot_message lane-credit-refused cause=api-credit retry-at=none' \
+  '3) ot_message lane-credit-refused cause=cloud-credit retry-at=none'
+api_hosted_rows 5
+run_ot "$API_ENV" --host "$HOST_STUB" --harness pi --lane auto --repo o/r KEN-3747
+assert_eq "$(api_launch_result)" 'rc=1 creates=0 launched= cause=cause=cloud-credit,retry-at=none,' 'control: the wrong pool cause reaches the launcher refusal'
+OPEN_TERMINAL="$API_OT_SHIPPED"
+
 # A hosted Pi relaunch on a Copilot model whose pool neither the provider's
 # harness=pi row nor the override reads is refused as unmeasured, with the fix
 # naming the provider's accounts read, and open-terminal does not ask whether
@@ -439,6 +517,58 @@ COPILOT_REMOTE="exec bash -lc 'cd /srv/lane && export KENDEX_LANE_ORIGIN=${Q}/sr
 assert_eq "$(observe "rc=0 launched=1") create=$(host_call | tr ';' '\n' | grep -c '^create,--item,KEN-1935,--repo,o/r,--harness,copilot,--account,1copilot$') remote=$(typed "$COPILOT_REMOTE") local=$(typed COPILOT_HOME=)" \
   "rc=0 launched=1 create=1 remote=1 local=0" \
   "a hosted copilot launch creates with --harness copilot and runs copilot under the launch policy, the provider setting COPILOT_HOME"
+# The provider can hold a Copilot login while its usage query returns 403.
+# The admitted relaunch must still charge the monthly pool once readings return.
+COPILOT_CLAIM_ROWS="$TMP_ROOT/copilot-claim-rows.tsv"
+copilot_claim_case() { # READING ROUTE [HOST_POOL]
+  local reading="$1" route="$2" account="$H/.1copilot" pick_rc=0 picked launch_rc pool capabilities
+  local route_args=()
+  capabilities="$(printf 'kind=ssh\tlaunch=ssh\tchannel=mailbox\tfiles=verb\tstatus=verb\tstop=verb\trelaunch=resume\tpark=none\taccounts=none\tpool=%s\tland=lane' "${3:-plan}")"
+  [[ "$route" != relaunch ]] || route_args=(--relaunch)
+  case "$reading" in
+    room) printf 'account=%s\tharness=copilot\tmonthly-pct=40\n' "$account" > "$COPILOT_CLAIM_ROWS" ;;
+    refused) printf 'account=%s\tharness=copilot\tstatus=refused\tdetail=http-403-permission_error\n' "$account" > "$COPILOT_CLAIM_ROWS" ;;
+    absent)
+      account="$TMP_ROOT/named-copilot"
+      mkdir -p "$account"
+      printf '{"copilot_tokens":"fixture-token"}\n' > "$account/config.json"
+      : > "$COPILOT_CLAIM_ROWS"
+      ;;
+  esac
+  run_ot "cwd=$NOSETTINGS;LANE_HOST_STUB_CAPABILITIES=$capabilities;LANE_HOST_STUB_ACCOUNTS=$COPILOT_CLAIM_ROWS;$COPILOT_HOSTED" \
+    --host "$HOST_STUB" --harness copilot --lane "$account" --repo o/r ${route_args[@]+"${route_args[@]}"} KEN-3747
+  launch_rc="$RC"
+  pool="$(awk -F'\t' '{print $9}' "$RUN"/state/claims/*.claim 2>/dev/null)"
+  printf 'account=%s\tharness=copilot\tmonthly-pct=94\n' "$account" > "$COPILOT_CLAIM_ROWS"
+  picked="$(cd "$NOSETTINGS" && env GIT_CEILING_DIRECTORIES="$TMP_ROOT" LANES_HOME="$H" \
+    ORCH_LANE_HOST="$HOST_STUB" LANE_HOST_STUB_ACCOUNTS="$COPILOT_CLAIM_ROWS" \
+    LANE_HOST_STUB_CAPABILITIES="$capabilities" \
+    LANE_HOST_STUB_LOG="$RUN/host.log" OVERSEE_WATCH_STATE_DIR="$RUN/state" \
+    OT_TMUX_SERVER_PID="$$" OT_TMUX_PANES="$RUN/panes" OT_TMUX_LOG="$RUN/tmux.log" \
+    PATH="$OT_STUB_BIN:$PATH" "$SCRIPTS_DIR/lanes" pick --lane "$account" --harness copilot --model claude-opus-5 --projected --json --no-cache)" || pick_rc=$?
+  assert_eq "launch=$launch_rc pool=$pool pick=$pick_rc charged=$(jq -c '[.claims, .pool, (.projected_headroom_pct < 6)]' <<<"$picked")" \
+    'launch=0 pool=copilot pick=0 charged=[1,"copilot",true]' \
+    "a $route Copilot launch with $reading usage charges its live pane when readings return"
+}
+while IFS='|' read -r reading route host_pool; do
+  copilot_claim_case "$reading" "$route" "$host_pool"
+done <<'ROWS'
+room|fresh
+room|relaunch
+refused|relaunch
+absent|fresh
+absent|fresh|cloud-credit
+ROWS
+COPILOT_CLAIM_SHIPPED="$OPEN_TERMINAL"
+OPEN_TERMINAL="$(mutant_scripts ctl-copilot-claim-pool/orch open-terminal)/open-terminal" || exit 1
+orch_fixture_shared_libs "$TMP_ROOT/ctl-copilot-claim-pool/orch"
+mutate_file "$OPEN_TERMINAL" \
+  'claim_pool="$(lane_pick_pool "$LAUNCH_HARNESS" "$LAUNCH_MODEL" "$claim_pool")"' \
+  'claim_pool="$(jq -r '\''.pool // "plan"'\'' <<<"${LANE_PICK_RECORD:-null}")"'
+COPILOT_SAVED_FAIL="$FAIL"; FAIL=0
+copilot_claim_case refused relaunch > "$TMP_ROOT/copilot-claim-pool-control.out"
+COPILOT_CLAIM_CONTROL="$FAIL"; FAIL="$COPILOT_SAVED_FAIL"; OPEN_TERMINAL="$COPILOT_CLAIM_SHIPPED"
+assert_eq "$COPILOT_CLAIM_CONTROL" 1 'control: the usage-dependent fallback loses the live Copilot relaunch claim'
 COPILOT_OT_SHIPPED="$OPEN_TERMINAL"
 OPEN_TERMINAL="$(mutant_scripts ctl-copilot-host/orch open-terminal)/open-terminal" || exit 1
 orch_fixture_shared_libs "$TMP_ROOT/ctl-copilot-host/orch"

@@ -95,9 +95,10 @@ cloud_body() {
 # fclaude a credit of 5 dollars; lclaude a locked credit; uclaude a spent week
 # and no credit reading at all, and mclaude one whose credit names no
 # remaining_dollars.
-for spec in "aclaude|10|" "gclaude|10|1:250:2099-09-01T00_00_00Z" "bclaude|100|241:250:2099-06-01T07_59_00Z" "cclaude|100|200:250:2099-03-01T00_00_00Z" \
+for spec in "aclaude|10|" "gclaude|10|20:250:2099-09-01T00_00_00Z" "bclaude|100|241:250:2099-06-01T07_59_00Z" "cclaude|100|200:250:2099-03-01T00_00_00Z" \
   "dclaude|100|200:250:2099-06-01T00_00_00Z" "eclaude|10|241:250:2020-01-01T00_00_00Z" "fclaude|10|5:250:2099-06-01T00_00_00Z" \
-  "lclaude|10|241:250:2099-06-01T00_00_00Z:overage" "uclaude|100|" "mclaude|10|241:250:2099-06-01T00_00_00Z"; do
+  "lclaude|10|241:250:2099-06-01T00_00_00Z:overage" "uclaude|100|" "mclaude|10|241:250:2099-06-01T00_00_00Z" \
+  "tclaude|10|10:250:2099-06-01T00_00_00Z"; do
   IFS='|' read -r name week credit <<<"$spec"
   make_lane "$H" "$name" 3600
   cloud_body "$week" "$credit" > "$FIXTURE_DIR/.$name.json"
@@ -260,6 +261,9 @@ table \
 
 CLOUD="ORCH_LANE_HOST=claude-cloud"
 CPICK='pick --harness claude --json'
+DEFAULT_FLOOR_ROW="the default shared floor refuses ten cloud dollars|$CLOUD;$(dirs tclaude);$(repos tclaude)|$CPICK|rc=3 walled=1 refusals[0].refusal.cause=cloud-credit"
+table "$DEFAULT_FLOOR_ROW" \
+  "credit above the default shared floor still launches|$CLOUD;$(dirs gclaude);$(repos gclaude)|$CPICK|rc=0 config_dir=$H/.gclaude"
 
 echo "=== tier 0 spends the expiring Claude cloud credit first ==="
 table \
@@ -397,6 +401,13 @@ cloud_control() {
   mutate_file "$CTRL/$2" "$3" "$4"
   LANES_UNDER_TEST="$CTRL/lanes" table "$5"
 }
+DEFAULT_FLOOR_MUTANT="$(cloud_mutant mutant-default-floor lanes)" || exit 1
+mutate_file "$DEFAULT_FLOOR_MUTANT/lanes" 'CLOUD_CREDIT_FLOOR="${ORCH_LANE_CLOUD_CREDIT_FLOOR:-10}"' \
+  'CLOUD_CREDIT_FLOOR="${ORCH_LANE_CLOUD_CREDIT_FLOOR:-0}"'
+DEFAULT_FLOOR_FAIL="$FAIL"; FAIL=0
+LANES_UNDER_TEST="$DEFAULT_FLOOR_MUTANT/lanes" table "$DEFAULT_FLOOR_ROW" > "$TMP_ROOT/default-floor-control.out"
+DEFAULT_FLOOR_RED="$FAIL"; FAIL="$DEFAULT_FLOOR_FAIL"
+assert_eq "$DEFAULT_FLOOR_RED" 1 'control: restoring the shared zero default makes the unchanged ten-dollar boundary fail'
 cloud_control mutant-tier-key lib/lane-model.sh 'sort_by([._seat, ._tier, ._expires, (._score | neg), .claims,' 'sort_by([(.selection_score | neg), .claims,' \
   "control: without the tier key plan room outranks the credit|$CLOUD;$(dirs gclaude bclaude);$(repos gclaude bclaude)|$CPICK|rc=0 config_dir=$H/.gclaude"
 # shellcheck disable=SC2016  # Keep the tier call as a jq comment in the mutant.
@@ -412,7 +423,7 @@ cloud_control mutant-cloud-lock lib/lane-model.sh ' and $c.locked_reason == null
 cloud_control mutant-cloud-expiry lib/lane-model.sh ' and $e > $now' '' \
   "control: without the expiry test an expired credit is picked|$CLOUD;$(dirs eclaude);$(repos eclaude)|$CPICK|rc=0 config_dir=$H/.eclaude"
 # shellcheck disable=SC2016
-cloud_control mutant-cloud-pool lib/lane-model.sh 'if $pool == "cloud-credit" and $read' 'if $read' \
+cloud_control mutant-cloud-pool lib/lane-model.sh 'if $credit_pool and $read' 'if $read' \
   "control: without the pool test a local kind spends the credit first|$(dirs gclaude bclaude)|$CPICK|rc=0 config_dir=$H/.bclaude"
 cloud_control mutant-cloud-repo lib/lane-model.sh 'else . + {verdict: "cloud-repo-unset"} end;' 'else . end;' \
   "control: without cloud-repo-unset an account with no entry is picked|$CLOUD;$(dirs gclaude bclaude);$(repos gclaude)|$CPICK|rc=0 config_dir=$H/.bclaude"
@@ -431,7 +442,7 @@ cloud_control mutant-cloud-partial lib/lane-model.sh '($read | not)' '(.credits 
 # The same optional grant body occurs with plan room. Borrowing that plan
 # must turn both the automatic and named missing-grant assertions red.
 CTRL="$(cloud_mutant mutant-cloud-credit-only lib/lane-model.sh)" || exit 1
-mutate_file "$CTRL/lib/lane-model.sh" 'elif $pool == "cloud-credit" then' 'elif false then'
+mutate_file "$CTRL/lib/lane-model.sh" 'elif $credit_pool then' 'elif false then'
 LANES_UNDER_TEST="$CTRL/lanes" table \
   "control: plan borrowing admits a missing grant in the automatic pick|$CLOUD;$(dirs aclaude);$(repos aclaude)|$CPICK|rc=0 config_dir=$H/.aclaude" \
   "control: plan borrowing admits a missing grant in the named pick|$CLOUD;$(dirs aclaude);$(repos aclaude)|pick --lane $H/.aclaude --harness claude --json|rc=0 config_dir=$H/.aclaude" \
