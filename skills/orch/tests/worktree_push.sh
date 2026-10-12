@@ -183,18 +183,22 @@ assert_eq "$(state_json "$work")" "$typo_before" "a push that printed no map rew
 echo
 echo "=== a rebase map is recorded and recorded fix SHAs rewritten ==="
 
-work="$TMP_ROOT/work-map"
-reset_state "$work"
-map_out="rebase-map: $OLD_A $NEW_A
+mapped_push_case() {
+  work="$TMP_ROOT/work-map"
+  reset_state "$work"
+  map_out="rebase-map: $OLD_A $NEW_A
 rebase-map: $OLD_B dropped"
-STUB_PUSH_STDOUT="$map_out" run_push "$work" --worktree "$wt" --issue KEN-1
-assert_eq "$RUN_RC" "0" "mapped push exits 0"
-assert_eq "$(state_json "$work" | jq -r ".rebase_map[\"$OLD_A\"]")" "$NEW_A" "old→new mapping recorded"
-assert_eq "$(state_json "$work" | jq -r ".rebase_map[\"$OLD_B\"]")" "dropped" "dropped mapping recorded literally"
-assert_eq "$(state_json "$work" | jq -r '.fixed_items[0].commit')" "${NEW_A:0:7}" "fixed_items short SHA rewritten, truncated to recorded length"
-assert_eq "$(state_json "$work" | jq -r '.pr_comment_review.fixes[0].commit')" "dropped:${OLD_B:0:8}" "dropped mapping marks the recorded commit unpublishable"
-assert_eq "$(state_json "$work" | jq -r '.pr_comment_review.fixes[1].commit')" "${NEW_A:0:10}" "pr_comment_review.fixes SHA rewritten, truncated to recorded length"
-assert_eq "$(grep '^sha-reconcile:' "$run_out")" "sha-reconcile: map_entries=2 fixed_items=1 pr_fixes=2" "reconcile summary reports what changed"
+  STUB_PUSH_STDOUT="$map_out" run_push "$work" --worktree "$wt" --issue KEN-1
+  assert_eq "$RUN_RC" "0" "mapped push exits 0"
+  assert_eq "$(state_json "$work" | jq -r ".rebase_map[\"$OLD_A\"]")" "$NEW_A" "old→new mapping recorded"
+  assert_eq "$(state_json "$work" | jq -r ".rebase_map[\"$OLD_B\"]")" "dropped" "dropped mapping recorded literally"
+  assert_eq "$(state_json "$work" | jq -r '.fixed_items[0].commit')" "${NEW_A:0:7}" "fixed_items short SHA rewritten, truncated to recorded length"
+  assert_eq "$(state_json "$work" | jq -r '.pr_comment_review.fixes[0].commit')" "dropped:${OLD_B:0:8}" "dropped mapping marks the recorded commit unpublishable"
+  assert_eq "$(state_json "$work" | jq -r '.pr_comment_review.fixes[1].commit')" "${NEW_A:0:10}" "pr_comment_review.fixes SHA rewritten, truncated to recorded length"
+  assert_eq "$(grep '^sha-reconcile:' "$run_out")" "sha-reconcile: map_entries=2 fixed_items=1 pr_fixes=2" "reconcile summary reports what changed"
+  assert_eq "$(state_json "$work" | jq -r '.restacks // 0')" "0" "a native push rebase adds no restack"
+}
+mapped_push_case
 
 echo
 echo "=== a second push chains through the already-rewritten SHA ==="
@@ -227,18 +231,39 @@ assert_eq "$([[ -e "$restack_map_file" ]] && echo present || echo absent)" "abse
 # Both hops in one call. Each reconciliation compares a record against its
 # original value, so only applying the restack hop first carries the record
 # from OLD_A through NEW_A to NEW_A2; one merged map would leave it at NEW_A.
-work="$TMP_ROOT/work-restack-chain"
-reset_state "$work"
-printf 'rebase-hop:\nrebase-map: %s %s\n' "$OLD_A" "$NEW_A" >"$restack_map_file"
-STUB_PUSH_STDOUT="rebase-map: $NEW_A $NEW_A2" run_push "$work" --worktree "$wt" --issue KEN-1
-assert_eq "$RUN_RC" "0" "both hops in one call exit 0"
-assert_eq "$(grep '^restack-reconcile:' "$run_out")" "restack-reconcile: map_entries=1 fixed_items=1 pr_fixes=1" \
-  "the restack hop reports first"
-assert_eq "$(grep '^sha-reconcile:' "$run_out")" "sha-reconcile: map_entries=1 fixed_items=1 pr_fixes=1" \
-  "the push hop reports second"
-assert_eq "$(state_json "$work" | jq -r '.fixed_items[0].commit')" "${NEW_A2:0:7}" \
-  "the record follows both hops to the final SHA"
-assert_eq "$([[ -e "$restack_map_file" ]] && echo present || echo absent)" "absent" "the chained call deletes the file too"
+restack_chain_case() {
+  work="$TMP_ROOT/work-restack-chain"
+  reset_state "$work"
+  printf 'rebase-hop:\nrebase-map: %s %s\n' "$OLD_A" "$NEW_A" >"$restack_map_file"
+  STUB_PUSH_STDOUT="rebase-map: $NEW_A $NEW_A2" run_push "$work" --worktree "$wt" --issue KEN-1
+  assert_eq "$RUN_RC" "0" "both hops in one call exit 0"
+  assert_eq "$(grep '^restack-reconcile:' "$run_out")" "restack-reconcile: map_entries=1 fixed_items=1 pr_fixes=1" \
+    "the restack hop reports first"
+  assert_eq "$(grep '^sha-reconcile:' "$run_out")" "sha-reconcile: map_entries=1 fixed_items=1 pr_fixes=1" \
+    "the push hop reports second"
+  assert_eq "$(state_json "$work" | jq -r '.fixed_items[0].commit')" "${NEW_A2:0:7}" \
+    "the record follows both hops to the final SHA"
+  assert_eq "$([[ -e "$restack_map_file" ]] && echo present || echo absent)" "absent" "the chained call deletes the file too"
+  assert_eq "$(state_json "$work" | jq -r '.restacks // 0')" "1" "a restack followed by a native push rebase counts only the restack"
+}
+restack_chain_case
+
+# Reuse both cases so the selector control fails their count assertions.
+PUSH_SAVED="$PUSH"
+PUSH="$(mutant_scripts push-counted-as-restack worktree-push)/worktree-push" || exit 1
+mutate_file "$PUSH" '$ENV.WTP_KEY == "restack-reconcile"' \
+  '($ENV.WTP_KEY == "restack-reconcile" or $ENV.WTP_KEY == "sha-reconcile")'
+for row in 'mapped_push_case|1' 'restack_chain_case|2'; do
+  IFS='|' read -r scenario wrong_count <<<"$row"
+  control_result="$(
+    FAIL=0
+    "$scenario" > "$TMP_ROOT/push-count-control.out"
+    printf '%s|%s\n' "$FAIL" "$(state_json "$work" | jq -r '.restacks // 0')"
+  )" || exit 1
+  assert_eq "$control_result" "1|$wrong_count" \
+    "control: $scenario rejects counting the native push rebase" "$TMP_ROOT/push-count-control.out"
+done
+PUSH="$PUSH_SAVED"
 
 # Two restacks before one push: one file, two hops. Read as one map, both would
 # be compared against the record's pre-hop SHA and it would stop at NEW_A, a
@@ -938,6 +963,81 @@ printf 'rebase-hop:\nrebase-map: %s %s\n' "$OLD_A" "$NEW_A" > "$restack_map_file
 STUB_PUSH_STDOUT='' run_push "$work" --worktree "$wt" --issue KEN-1
 assert_eq "$RUN_RC|$(jq -c '.stages // []' <<<"$(state_json "$work")")" '0|[]' 'control: dropping restack write fails stage observation'
 PUSH="$PUSH_SAVED"
+
+echo '=== one completed restack counts once, whatever validation route followed it ==='
+# worktree_create_restack.sh pins the one hop each guarded restack door,
+# `create --reuse` and `create --restack`, appends. Each row starts from that
+# hop and adds the records its merge-pr-restack.md step 2 route leaves, or the
+# implement run a reused worktree goes on to; the count reads none of them.
+restack_count() {
+  (source "$REPO_ROOT/skills/orch/scripts/lib/lane-gitfile.sh" \
+    && lane_state_rounds "$(state_json "$1")" "$run_err" \
+    && printf '%s\n' "$LANE_RESTACKS")
+}
+restack_route() { # ROUTE — prints EXIT|RESTACKS|VALIDATION_RECORDS
+  local route="$1" head
+  git -C "$wt" reset -q --hard "$timing_head"
+  reset_state "$work"
+  git -C "$wt" commit -q --allow-empty -m "restack-route-$route"
+  head="$(git -C "$wt" rev-parse HEAD)"
+  printf 'rebase-hop:\nrebase-map: %s %s\n' "$timing_head" "$head" > "$restack_map_file"
+  case "$route" in
+    range-run) validate_run_dir "$wt/tmp/dev-validate-route-range" range 0 "$head" 4 >/dev/null ;;
+    range-skip)
+      "$STATE" --state-dir "$work/tmp" update KEN-1 --arg head "$head" --arg validated "$timing_head" \
+        '.restack_skips=[{head:$head,condition:"no-conflict",validated_head:$validated,paths:[]}]' >/dev/null ;;
+    full) ;;
+    ci) validate_run_dir "$wt/tmp/dev-validate-route-ci" ci 0 "$head" 5 >/dev/null ;;
+    reuse)
+      "$STATE" --state-dir "$work/tmp" update KEN-1 \
+        '.validate_rounds=[{round_id:"r1",kind:"implement",mode:"full",seconds:60}]' >/dev/null ;;
+  esac
+  STUB_PUSH_STDOUT='' run_push "$work" --worktree "$wt" --issue KEN-1
+  printf '%s|%s|%s\n' "$RUN_RC" "$(restack_count "$work")" \
+    "$(state_json "$work" | jq -c '[(.validate_rounds // [])[] | "\(.kind):\(.mode)"] + [(.restack_skips // [])[] | "skip"]')"
+}
+# Two hops, the second malformed: the refusal keeps the file with one hop in
+# state, and the repaired re-run reconciles both again.
+restack_resume() {
+  local first second rc
+  git -C "$wt" reset -q --hard "$timing_head"
+  reset_state "$work"
+  git -C "$wt" commit -q --allow-empty -m restack-resume-first
+  first="$(git -C "$wt" rev-parse HEAD)"
+  git -C "$wt" commit -q --allow-empty -m restack-resume-second
+  second="$(git -C "$wt" rev-parse HEAD)"
+  printf 'rebase-hop:\nrebase-map: %s %s\nrebase-hop:\nrebase-map: not-a-sha %s\n' \
+    "$timing_head" "$first" "$second" > "$restack_map_file"
+  STUB_PUSH_STDOUT='' run_push "$work" --worktree "$wt" --issue KEN-1
+  rc="$RUN_RC|$(restack_count "$work")"
+  printf 'rebase-hop:\nrebase-map: %s %s\nrebase-hop:\nrebase-map: %s %s\n' \
+    "$timing_head" "$first" "$first" "$second" > "$restack_map_file"
+  STUB_PUSH_STDOUT='' run_push "$work" --worktree "$wt" --issue KEN-1
+  printf '%s|%s|%s\n' "$rc" "$RUN_RC" "$(restack_count "$work")"
+}
+RESTACK_ROUTES='range-run|0|1|["restack:range"]
+range-skip|0|1|["skip"]
+full|0|1|[]
+ci|0|1|["restack:ci"]
+reuse|0|1|["implement:full"]'
+while IFS='|' read -r route want_rc want_count want_records; do
+  assert_eq "$(restack_route "$route")" "$want_rc|$want_count|$want_records" \
+    "$route: one restack reads restacks=1 beside its own validation records" "$run_err"
+done <<<"$RESTACK_ROUTES"
+assert_eq "$(restack_resume)" '1|1|0|2' 'a re-run of a kept map counts each restack once' "$run_err"
+PUSH_SAVED="$PUSH"
+PUSH="$(mutant_scripts no-restack-count worktree-push)/worktree-push"
+mutate_file "$PUSH" 'then .restacks = ((.restacks // 0) + 1) else . end' 'then . else . end'
+while IFS='|' read -r route want_rc _ want_records; do
+  assert_eq "$(restack_route "$route")" "$want_rc|0|$want_records" \
+    "control: $route reads restacks=0 with the completion write removed" "$run_err"
+done <<<"$RESTACK_ROUTES"
+PUSH="$(mutant_scripts recount-restack worktree-push)/worktree-push"
+mutate_file "$PUSH" 'any($seen[.key] != .value)' 'true'
+assert_eq "$(restack_resume)" '1|1|0|3' 'control: a re-run counts a kept hop again without the seen-hop check' "$run_err"
+PUSH="$PUSH_SAVED"
+git -C "$wt" reset -q --hard "$timing_head"
+rm -rf -- "$wt/tmp/dev-validate-route-range" "$wt/tmp/dev-validate-route-ci"
 
 echo '=== a real publication retry keeps the reconciled restack timing identity ==='
 # The shipped push owner rebases before invoking Git's transport. Only that
