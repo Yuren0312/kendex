@@ -19,4 +19,4 @@
 ## Scratch files
 
 - Keep scratch work under `tmp/` in the [home layout](../README.md#home-layout), separate from user drafts and official records.
-- Remove scratch files when their work ends. Apply [accounts-and-secrets.md:Retention](accounts-and-secrets.md#retention) to any artifact still needed for an open obligation.
+- Remove scratch files when their work ends. Keep artifacts needed for an audit or open obligation under `tmp/retained/`. Apply [accounts-and-secrets.md:Retention](accounts-and-secrets.md#retention) to those artifacts.
