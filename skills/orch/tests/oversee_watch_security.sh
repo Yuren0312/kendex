@@ -11,6 +11,25 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/oversee-watch-harness.
 
 HEARTBEAT="EVENT heartbeat loops=1 interval=0s since=none"
 
+# The sticky temp root permits a caller-owned private file in another
+# account's directory. Root uses a private directory with a foreign owner.
+FOREIGN_PARENT="$(cd -- /tmp && pwd -P)" || exit 1
+if [[ "$EUID" -eq 0 ]]; then
+  FOREIGN_PARENT="$TMP_ROOT/foreign-parent"
+  mkdir "$FOREIGN_PARENT"
+  chmod 700 "$FOREIGN_PARENT"
+  chown 1 "$FOREIGN_PARENT"
+else
+  [[ ! -O "$FOREIGN_PARENT" && -k "$FOREIGN_PARENT" && -w "$FOREIGN_PARENT" ]] || {
+    printf 'oversee_watch_security: foreign-parent=unavailable path=%s\n' "$FOREIGN_PARENT" >&2
+    exit 1
+  }
+fi
+FOREIGN_PARENT_TOKEN="$(mktemp "$FOREIGN_PARENT/orch-parent-owner.XXXXXX")" || exit 1
+trap 'rm -f -- "$FOREIGN_PARENT_TOKEN"; rm -rf -- "${TMP_ROOT:?}"' EXIT
+chmod 600 "$FOREIGN_PARENT_TOKEN"
+[[ -f "$FOREIGN_PARENT_TOKEN" && -O "$FOREIGN_PARENT_TOKEN" && ! -O "$FOREIGN_PARENT" ]] || exit 1
+
 # run [ENV=VAL ...] -- ARGS...: one watch run; OUT, RC and ERR (a file)
 # are what the checks read. RUN_LOOPS overrides the single-loop default.
 RUN_SEQ=0
@@ -114,6 +133,7 @@ done
 # Replacement during the GraphQL read affects only the next long pass.
 new_case security_auth_rotation
 printf 'ghs_fixture_renewed\n' > "$STUB_DIR/next-alert-token"
+chmod 600 "$STUB_DIR/next-alert-token"
 RUN_LOOPS=2 run GH_TOKEN=ghs_fixture_lane --
 got="$(awk -F'\t' '
   $2 == "api" && ($3 == "graphql" || ($3 == "--paginate" && $4 ~ /\/alerts\?/)) { print $1 }
@@ -130,7 +150,7 @@ ghs_fixture_renewed' "one token snapshot per pass, renewed without restarting th
 # No usable token means no fallback API read. Alert rows and the heartbeat's
 # security-update mapping survive the outage, before recovery can repair them.
 # The table includes the control VM's missing file and interrupted/invalid writes.
-for shape in unset missing empty whitespace multiline; do
+while IFS='|' read -r shape cause; do
   new_case "security_auth_$shape"
   one_of_each
   printf '%s\n' "$DEPENDABOT_OPEN" > "$STUB_DIR/open.txt"
@@ -142,34 +162,112 @@ for shape in unset missing empty whitespace multiline; do
     empty) : > "$supplied" ;;
     whitespace) printf ' \t\n' > "$supplied" ;;
     multiline) printf 'ghs_fixture_overseer\nghs_fixture_renewed\n' > "$supplied" ;;
+    fifo) supplied="$STUB_DIR/token-fifo"; mkfifo "$supplied" ;;
+    directory) supplied="$STUB_DIR/token-directory"; mkdir "$supplied" ;;
+    mode-640) chmod 640 "$supplied" ;;
+    mode-604) chmod 604 "$supplied" ;;
+    parent)
+      mkdir "$STUB_DIR/shared-parent"
+      cp -p "$supplied" "$STUB_DIR/shared-parent/token"
+      supplied="$STUB_DIR/shared-parent/token"
+      chmod 770 "$STUB_DIR/shared-parent" ;;
+    parent-owner)
+      cp -p "$supplied" "$FOREIGN_PARENT_TOKEN"
+      supplied="$FOREIGN_PARENT_TOKEN" ;;
   esac
   : > "$STUB_DIR/gh.auth"
   run GH_TOKEN=ghs_fixture_lane "ORCH_SECURITY_ALERT_TOKEN_FILE=$supplied" --
   refused="$RC|$(unread)|$(events)"
+  refused_file="$supplied"
+  [[ "$shape" != parent ]] || refused_file="$STUB_DIR/shared-parent"
+  [[ "$shape" != parent-owner ]] || refused_file="$FOREIGN_PARENT"
+  assert_eq "$(grep '^orch_token_file_read: refused ' "$ERR")" \
+    "orch_token_file_read: refused file=$refused_file cause=$cause" "credential cause: $shape" "$ERR"
+  assert_not_contains "$(cat "$ERR")" ghs_fixture_overseer "credential refusal prints no token: $shape"
   run GH_TOKEN=ghs_fixture_lane "ORCH_SECURITY_ALERT_TOKEN_FILE=$supplied" --
   retained="$RC|$(unread)|$(events)|$(heartbeats)|$(grep -F $'owner/repo\t' <<<"$OUT" || true)"
   calls="$(awk -F'\t' '$2 == "api" && ($3 == "graphql" || ($3 == "--paginate" && $4 ~ /\/alerts\?/)) { n++ } END { print n+0 }' "$STUB_DIR/gh.auth")" || exit 1
   printf 'ghs_fixture_renewed\n' > "$STUB_DIR/alert-token"
+  chmod 600 "$STUB_DIR/alert-token"
   run --
   assert_eq "$refused|$retained|$calls|$RC|$(unread)|$(firsts)" "0|EVENT security-alerts-unread reads=installation-token:credential|none|0|none|none|1|owner/repo	bot-fix pr=12 alert=7|0|0|none|none" \
     "unusable token refuses fallback, retains the mapping during the outage and recovers with no alert a first report again: $shape" "$ERR"
-done
+done <<'EOF'
+unset|unset
+missing|not-regular
+empty|malformed
+whitespace|malformed
+multiline|malformed
+fifo|not-regular
+directory|not-regular
+mode-640|mode-640
+mode-604|mode-604
+parent|mode-770
+parent-owner|not-owned
+EOF
 
-# Must-fail control: keep the token file reader's read and checks but disable
-# their refusal. The credential row must fail rather than accept gh's fallback.
-scripts="$(mutant_scripts security-token-control/orch lib/gh-auth.sh)" || exit 1
-ln -s "$REPO_ROOT/skills/github" "$TMP_ROOT/security-token-control/github"
-mutate_file "$scripts/lib/gh-auth.sh" \
-  '  token="$(cat -- "$1")" || return 1' \
-  '  token="$(cat -- "$1")" || true'
-mutate_file "$scripts/lib/gh-auth.sh" \
-  '  [[ -n "$token" && "$token" != *[[:space:]]* ]] || return 1' \
-  '  [[ -n "$token" && "$token" != *[[:space:]]* ]] || true'
-for shape in missing empty; do
-  new_case "security_token_control_$shape"
-  case "$shape" in missing) rm -- "$STUB_DIR/alert-token" ;; empty) : > "$STUB_DIR/alert-token" ;; esac
-  WATCH_BIN="$scripts/oversee-watch" run GH_TOKEN=ghs_fixture_lane --
-  assert_eq "$RC|$(unread)" "0|none" "control: token refusal removed makes the credential row fail: $shape" "$ERR"
+# Each mutation removes one reader rule. Type uses a directory, so the control
+# cannot block opening a FIFO. The unchanged cause assertion would turn red.
+for rule in type owner mode parent parent-owner length malformed; do
+  scripts="$(mutant_scripts "security-token-$rule/orch" lib/gh-auth.sh)" || exit 1
+  ln -s "$REPO_ROOT/skills/github" "$TMP_ROOT/security-token-$rule/github"
+  new_case "security_token_control_$rule"
+  supplied="$STUB_DIR/alert-token"
+  case "$rule" in
+    type)
+      mutate_file "$scripts/lib/gh-auth.sh" '[[ ! -f "$file" ]]' '[[ ! -e "$file" ]]'
+      supplied="$STUB_DIR/token-directory"; mkdir "$supplied" ;;
+    owner)
+      mutate_file "$scripts/lib/gh-auth.sh" '[[ ! -O "$path" ]]' '[[ ! -e "$path" ]]'
+      supplied=/etc/passwd
+      if [[ -O "$supplied" ]]; then
+        supplied="$STUB_DIR/token-foreign"
+        cp -p "$STUB_DIR/alert-token" "$supplied"
+        chown 1 "$supplied"
+      fi
+      [[ ! -O "$supplied" ]] || exit 1 ;;
+    mode)
+      mutate_file "$scripts/lib/gh-auth.sh" '(( (8#$mode & permissions) == 0 ))' '(( (8#$mode & 0) == 0 ))'
+      chmod 640 "$supplied" ;;
+    parent)
+      mutate_file "$scripts/lib/gh-auth.sh" 'for path in "$file" "$parent"; do' 'for path in "$file"; do'
+      mkdir "$STUB_DIR/shared-parent"
+      cp -p "$supplied" "$STUB_DIR/shared-parent/token"
+      supplied="$STUB_DIR/shared-parent/token"
+      chmod 770 "$STUB_DIR/shared-parent" ;;
+    parent-owner)
+      mutate_file "$scripts/lib/gh-auth.sh" '[[ ! -O "$path" ]]' \
+        '[[ "$path" == "$file" && ! -O "$path" ]]'
+      cp -p "$supplied" "$FOREIGN_PARENT_TOKEN"
+      supplied="$FOREIGN_PARENT_TOKEN" ;;
+    length)
+      mutate_file "$scripts/lib/gh-auth.sh" 'read -r -n 4096 -d' 'read -r -n 8192 -d'
+      printf '%5000s' '' | tr ' ' x > "$supplied" ;;
+    malformed)
+      mutate_file "$scripts/lib/gh-auth.sh" \
+        '[[ -n "$token" && "$token" != *[[:space:]]* ]] || cause=malformed' \
+        '[[ -n "$token" && "$token" != *[[:space:]]* ]] || true'
+      : > "$supplied" ;;
+  esac
+  WATCH_BIN="$scripts/oversee-watch" run GH_TOKEN=ghs_fixture_lane "ORCH_SECURITY_ALERT_TOKEN_FILE=$supplied" --
+  case "$rule" in
+    parent-owner)
+      if [[ "$EUID" -eq 0 ]]; then
+        assert_eq "$RC|$(unread)" '0|none' 'control: foreign parent ownership refusal disappears' "$ERR"
+      else
+        assert_eq "$RC|$(unread)" '0|EVENT security-alerts-unread reads=installation-token:credential' \
+          'control: foreign parent reaches its mode refusal' "$ERR"
+        assert_contains "$(cat "$ERR")" "orch_token_file_read: refused file=$FOREIGN_PARENT cause=mode-" \
+          'control: skipping parent ownership reaches the next parent check' "$ERR"
+      fi
+      assert_not_contains "$(cat "$ERR")" "orch_token_file_read: refused file=$FOREIGN_PARENT cause=not-owned" \
+        'control: the foreign-parent not-owned row fails' "$ERR" ;;
+    type|owner)
+      forbidden=not-regular
+      [[ "$rule" != owner ]] || forbidden=not-owned
+      assert_not_contains "$(cat "$ERR")" "cause=$forbidden" "control: $rule cause disappears" "$ERR" ;;
+    *) assert_eq "$RC|$(unread)" '0|none' "control: $rule refusal disappears" "$ERR" ;;
+  esac
 done
 
 # One open alert of each kind prints one line each, the Dependabot line naming
