@@ -1342,9 +1342,9 @@ resolve_repo() {
 # render its OWN account onto that item and spend it there, with no claim taken
 # on it. The test names the LAUNCHER and not the terminal mode: a --wake reaches
 # open_wake in tmux mode too, since the gate above exempts a wake from the
-# tmux-only settings and not from the mode, and run_detached scrubs CLAUDECODE,
-# TMUX and TMUX_PANE while keeping CODEX_HOME. That child is the one launch here
-# that really does inherit this process's environment.
+# tmux-only settings and not from the mode, and run_detached scrubs the
+# session identity, TMUX and TMUX_PANE while keeping CODEX_HOME. That child is
+# the one launch here that really does inherit this process's environment.
 #
 # WHICH tmux scope, and in what order. tmux keeps a session environment beside a
 # global one, and a pane takes the session's entry wherever it has one. The
@@ -2292,7 +2292,7 @@ launch_session_resolve() { # TITLE
 # launch handed to a background job opens it before the hand-off, so the next
 # item's pick counts this account while the host is still preparing.
 tmux_window_open() { # DIR TITLE
-  local dir="$1" title="$2" last_idx pane spec server matches row idx id owner identity replace_idx=""
+  local dir="$1" title="$2" last_idx pane spec server matches row idx id owner identity replace_idx="" pane_shell pane_command
   local window_args=()
   tmux_server_named || { ot_message tmux-missing "item=$title" >&2; return 1; }
   launchable_dir "$dir" "$title" || return 1
@@ -2328,7 +2328,13 @@ tmux_window_open() { # DIR TITLE
   # The server pid rides along with the pane id: it is the other half of a
   # lane claim's liveness key, and taking both from the creating call means no
   # second tmux round trip and no window between them.
-  if ! spec=$(tmux new-window "${window_args[@]}" -n "$title" -c "$dir" -P -F '#{pid} #{pane_id}') || [[ -z "$spec" ]]; then
+  if ! pane_shell=$(tmux show-options -Av -t "=$LAUNCH_SESSION:" default-shell) \
+    || ! pane_command=$(tmux show-options -Av -t "=$LAUNCH_SESSION:" default-command); then
+    ot_message tmux-failed "operation=show-options" "item=$title" >&2
+    return 1
+  fi
+  lane_launch_shell_argv "$pane_shell" "$pane_command"
+  if ! spec=$(tmux new-window "${window_args[@]}" -n "$title" -c "$dir" -P -F '#{pid} #{pane_id}' "${LANE_LAUNCH_SHELL_ARGV[@]}") || [[ -z "$spec" ]]; then
     ot_message tmux-failed "operation=new-window" "item=$title" >&2
     return 1
   fi
@@ -2585,14 +2591,17 @@ open_gui() {
 }
 
 # Detached through lib/lane-launch.sh's lane_run_detached, which owns how a
-# child outlives this script. The environment is scrubbed: a child started
-# from inside tmux or Claude Code otherwise inherits TMUX, TMUX_PANE and
-# CLAUDECODE, reads as a tmux pane or a nested session, and pane-aware tools in
-# it act on the controller's server.
+# child outlives this script. The environment is scrubbed of the launching
+# session's identity (lib/lane-launch.sh LANE_LAUNCH_SCRUB) and of TMUX and
+# TMUX_PANE: a child started from inside tmux otherwise reads as a tmux pane,
+# and pane-aware tools in it act on the controller's server. A tmux window
+# gets a pane identity of its own, so those two are cleared here alone.
 run_detached() { # LOG COMMAND...
-  local log="$1"
+  local log="$1" name
+  local -a scrub=()
   shift
-  lane_run_detached "$log" "$log" env -u CLAUDECODE -u TMUX -u TMUX_PANE "$@"
+  for name in "${LANE_LAUNCH_SCRUB[@]}" TMUX TMUX_PANE; do scrub+=(-u "$name"); done
+  lane_run_detached "$log" "$log" env "${scrub[@]}" "$@"
 }
 
 # A resumed turn can run for a long time, so it runs detached from the caller,
@@ -2873,6 +2882,10 @@ launch_finish() {
     # A lane has no person to assign when it activates its work item.
     run="export KENDEX_USER_EMAIL='' && $run"
     run="$(lane_launch_line "$run" "$HARNESS" "" "" custom)" || return 1
+    # The host's shell runs on whatever environment its provider hands it,
+    # which can carry the launching session's identity. This text is POSIX
+    # shell (a hosted relaunch reads `$?`), so `unset` clears the list here.
+    run="unset ${LANE_LAUNCH_SCRUB[*]} && $run"
     # Keep the marked launch root when a lane's tool shell changes directory.
     run="export KENDEX_LANE_ORIGIN=$(lane_single_quote "$remote_path") && $run"
     cmd="$remote_prefix $(lane_single_quote "cd $(printf '%q' "$remote_path") && $run")"
@@ -2925,10 +2938,10 @@ launch_finish() {
     # A launch with none has no account to check and keeps the `unchecked` the
     # check reads as skip, whatever prefix the line below carries.
     [[ -z "$LANE_ENV" ]] || LANE_FORM="$launch_form"
-    cmd="$(lane_launch_line "$cmd" "$LAUNCH_HARNESS" "$launch_var" "$launch_home" "$launch_form")" || return 1
+    cmd="$(lane_launch_line "$cmd" "$LAUNCH_HARNESS" "$launch_var" "$launch_home" "$launch_form" "$CMD_TEMPLATE")" || return 1
   else
     launch_form="$(lane_launch_form "$cmd" "$HARNESS" "" "$CMD_TEMPLATE")" || return 1
-    cmd="$(lane_launch_line "$cmd" "$HARNESS" "" "" "$launch_form")" || return 1
+    cmd="$(lane_launch_line "$cmd" "$HARNESS" "" "" "$launch_form" "$CMD_TEMPLATE")" || return 1
   fi
   if [[ "$LANE_HOST" == local ]]; then
     cmd="export KENDEX_USER_EMAIL='' && $cmd"

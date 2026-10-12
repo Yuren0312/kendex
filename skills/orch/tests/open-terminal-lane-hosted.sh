@@ -128,7 +128,7 @@ assert_eq "$(observe "rc=0 creates=nolog launched=1 claim_lanes=eclaude") calls=
   "rc=0 creates=nolog launched=1 claim_lanes=eclaude calls=accounts;create,--item,KEN-40,--repo,o/r,--harness,claude,--account,eclaude;cat,--item,KEN-40,/srv/lane/.git;put,--item,KEN-40,/srv/clone/.git/lane-mail/ken-40;cat,--item,KEN-40,/srv/clone/.git/lane-mail/ken-40;put,--item,KEN-40,/srv/clone/.git/worktrees/lane/lane-refresh;put,--item,KEN-40,/srv/lane/tmp/lane-mail/KEN-40/context.json ssh=1 remote=1 env=0 opened=1" \
   "a hosted launch creates through lane-host, types ssh then the remote line, and renders no lane env prefix"
 assert_eq "$(ot_hosted_relaunch_text "$RUN/tmux.log")" \
-  "exec bash -lc 'cd /srv/lane && export KENDEX_LANE_ORIGIN='/srv/lane' && export KENDEX_USER_EMAIL='' && $CD_HARNESS --model opus --effort high $QUESTION_OFF_ALL'" \
+  "exec bash -lc 'cd /srv/lane && export KENDEX_LANE_ORIGIN='/srv/lane' && $SCRUB_UNSET export KENDEX_USER_EMAIL='' && $CD_HARNESS --model opus --effort high $QUESTION_OFF_ALL'" \
   "the remote shell exports the host's lane origin"
 assert_eq "$(cd_guard_result 0)" 'rc=0 cd=attempted harness=started' \
   'the hosted command starts its harness after a successful cd'
@@ -324,12 +324,64 @@ assert_eq "$HOSTED_RM_ENV" 'resume|unset|unset;fresh|unset|unset' \
   'control: the hosted mutant reaches both Claude processes with neither switch'
 assert_eq "$RM_CONTROL" 1 'control: the hosted resume and fallback children detect the missing environment words'
 OPEN_TERMINAL="$RM_OT_SHIPPED"
+
+# The same replay under a parent environment holding every name
+# LANE_LAUNCH_SCRUB lists: each hosted child, a relaunch's fallback included,
+# holds none of them.
+SCRUB_NAMES="$(bash -c 'source "$1/lib/lane-launch.sh" && printf "%s " "${LANE_LAUNCH_SCRUB[@]}"' _ "$SCRIPTS_DIR")" || exit 1
+ID_PROBE_BIN="$TMP_ROOT/id-probe-bin"
+mkdir -p "$ID_PROBE_BIN"
+cat > "$ID_PROBE_BIN/claude" <<'STUB'
+#!/usr/bin/env bash
+route=fresh held=""
+for arg in "$@"; do [[ "$arg" != --continue ]] || route=resume; done
+for name in $SCRUB_NAMES; do [[ -z "${!name+set}" ]] || held+="$name,"; done
+printf '%s|%s\n' "$route" "${held:--}" >> "$ID_PROBE_LOG"
+[[ "$route" != resume ]] || exit 1
+STUB
+chmod +x "$ID_PROBE_BIN/claude"
+ln -s "$ID_PROBE_BIN/claude" "$ID_PROBE_BIN/codex"
+hosted_identity() { # HARNESS FLAGS ROUTE; sets HOSTED_IDENTITY
+  local args=() line parent=() name
+  [[ "$3" != relaunch ]] || args+=(--relaunch)
+  run_ot "$HARNESS_UP;flags=$2" --host "$HOST_STUB" --harness "$1" \
+    --lane "$H/.eclaude" --repo o/r ${args[@]+"${args[@]}"} KEN-41
+  [[ "$RC" == 0 ]] || { HOSTED_IDENTITY=launch-failed; printf '%s\n' "$OUT" >&2; return; }
+  line="$(grep -m1 '^exec bash -lc ' "$RUN/tmux.log")" || { HOSTED_IDENTITY=unrendered; return; }
+  eval "set -- ${line#exec }" || { HOSTED_IDENTITY=undecodable; return; }
+  for name in $SCRUB_NAMES; do parent+=("$name=parent-$name"); done
+  : > "$RUN/id-env"
+  env -i PATH="$PATH" HOME="$TMP_ROOT" "${parent[@]}" SCRUB_NAMES="$SCRUB_NAMES" \
+    ID_PROBE_BIN="$ID_PROBE_BIN" ID_PROBE_LOG="$RUN/id-env" \
+    "$BASH" -lc 'PATH="$ID_PROBE_BIN:$PATH"; cd() { return 0; }; eval "$1"' \
+    id-probe "$3" > "$RUN/id-replay.out" 2> "$RUN/id-replay.err" || true
+  HOSTED_IDENTITY="$(paste -sd';' "$RUN/id-env")"
+}
+printf '%s\n' \
+  'claude|--model opus --effort high --dangerously-skip-permissions|fresh|fresh|-' \
+  'claude|--model opus --effort high --permission-mode dontAsk|fresh|fresh|-' \
+  'claude|--model opus --effort high --permission-mode dontAsk|relaunch|resume|-;fresh|-' \
+  'codex|-m gpt-6-astra -c model_reasoning_effort=high --dangerously-bypass-approvals-and-sandbox|fresh|fresh|-' \
+  > "$TMP_ROOT/hosted-id-rows"
+while IFS='|' read -r harness flags route expected; do
+  hosted_identity "$harness" "$flags" "$route"
+  assert_eq "$HOSTED_IDENTITY" "$expected" \
+    "the hosted $harness $route child holds none of the launching session's identity: $flags" "$RUN/id-replay.err"
+done < "$TMP_ROOT/hosted-id-rows"
+ID_OT_SHIPPED="$OPEN_TERMINAL"
+OPEN_TERMINAL="$(mutant_scripts hosted-scrub-removed/orch open-terminal)/open-terminal" || exit 1
+orch_fixture_shared_libs "$TMP_ROOT/hosted-scrub-removed/orch"
+mutate_file "$OPEN_TERMINAL" 'run="unset ${LANE_LAUNCH_SCRUB[*]} && $run"' 'run="$run"'
+hosted_identity claude '--model opus --effort high --permission-mode dontAsk' fresh
+assert_eq "$HOSTED_IDENTITY" "fresh|${SCRUB_NAMES// /,}" \
+  'control: without the hosted unset the child holds every identity name'
+OPEN_TERMINAL="$ID_OT_SHIPPED"
 # The flags a hosted claude command leads with, as the remote command quotes them.
 CLAUDE_LEAD="$Q--settings={\"env\":{\"DISABLE_AUTO_COMPACT\":\"1\"}}$Q $Q--disallowedTools=AskUserQuestion,EnterPlanMode$Q $Q--model$Q ${Q}opus$Q $Q--effort$Q ${Q}high$Q"
 # hosted_resume ITEM NAME BRIEF — the remote command of a hosted claude
 # relaunch, the continuation line and the start brief each closing on the
 # unattended words.
-hosted_resume() { printf "exec bash -lc 'cd /srv/lane && export KENDEX_LANE_ORIGIN=%s/srv/lane%s && export KENDEX_USER_EMAIL=%s%s && { claude %s --continue %s%s %s%s || [ \$? -ne 1 ] || exec claude -n %s %s %s%s %s%s; }'" "$Q" "$Q" "$Q" "$Q" "$CLAUDE_LEAD" "$Q" "$HOSTED_LINE" "$UNATTENDED_TEXT" "$Q" "$2" "$CLAUDE_LEAD" "$Q" "$3" "$UNATTENDED_TEXT" "$Q"; }
+hosted_resume() { printf "exec bash -lc 'cd /srv/lane && export KENDEX_LANE_ORIGIN=%s/srv/lane%s && $SCRUB_UNSET export KENDEX_USER_EMAIL=%s%s && { claude %s --continue %s%s %s%s || [ \$? -ne 1 ] || exec claude -n %s %s %s%s %s%s; }'" "$Q" "$Q" "$Q" "$Q" "$CLAUDE_LEAD" "$Q" "$HOSTED_LINE" "$UNATTENDED_TEXT" "$Q" "$2" "$CLAUDE_LEAD" "$Q" "$3" "$UNATTENDED_TEXT" "$Q"; }
 hosted_line() { printf 'Resume the orch workflow for %s from where this session stopped. Run .agents/skills/mailbox/scripts/lane-mail inbox --item %s first and act on every envelope it prints, answers and directives alike, as its text directs, then re-arm your mailbox monitor on .agents/skills/mailbox/scripts/lane-mail watch --item %s through your harness background wake.' "$1" "$1" "$1"; }
 HOSTED_LINE="$(hosted_line KEN-41)"
 run_ot "$HARNESS_UP;$CHOICE" --host "$HOST_STUB" --harness claude --lane auto --repo o/r --relaunch KEN-41
@@ -513,7 +565,7 @@ printf '{"copilot_tokens":"gho_fixture"}\n' > "$H/.1copilot/config.json"
 printf '%s\n' '{"quota_snapshots":{"premium_interactions":{"entitlement":1000,"remaining":900}}}' > "$FIXTURE_DIR/.1copilot.json"
 COPILOT_HOSTED="flags=--model claude-opus-5 --reasoning-effort high --allow-all"
 run_ot "$COPILOT_HOSTED" --host "$HOST_STUB" --harness copilot --lane "$H/.1copilot" --repo o/r KEN-1935
-COPILOT_REMOTE="exec bash -lc 'cd /srv/lane && export KENDEX_LANE_ORIGIN=${Q}/srv/lane$Q && export KENDEX_USER_EMAIL=$Q$Q && exec env -u COPILOT_GITHUB_TOKEN COPILOT_SKILLS_DIRS=\"\$HOME/.agents/skills\" COPILOT_ALLOW_ALL=true copilot $Q--autopilot$Q"
+COPILOT_REMOTE="exec bash -lc 'cd /srv/lane && export KENDEX_LANE_ORIGIN=${Q}/srv/lane$Q && $SCRUB_UNSET export KENDEX_USER_EMAIL=$Q$Q && exec env -u COPILOT_GITHUB_TOKEN COPILOT_SKILLS_DIRS=\"\$HOME/.agents/skills\" COPILOT_ALLOW_ALL=true copilot $Q--autopilot$Q"
 assert_eq "$(observe "rc=0 launched=1") create=$(host_call | tr ';' '\n' | grep -c '^create,--item,KEN-1935,--repo,o/r,--harness,copilot,--account,1copilot$') remote=$(typed "$COPILOT_REMOTE") local=$(typed COPILOT_HOME=)" \
   "rc=0 launched=1 create=1 remote=1 local=0" \
   "a hosted copilot launch creates with --harness copilot and runs copilot under the launch policy, the provider setting COPILOT_HOME"
