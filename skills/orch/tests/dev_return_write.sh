@@ -78,10 +78,12 @@ env ORCH_STATE_DIR="$FW/tmp" "$ROUND_WRITE" --worktree "$FW" --issue issue-776 -
   --item 1 "fix nil deref" "tools/guard on a staged render" --item 2 "review decision" "tools/guard on a staged render" >/dev/null
 # Further fix rounds on the same worktree, one per fix row below, each bound
 # to its own record. Every record's base is FIX_HEAD, where the runs start.
-for rid in 9-9 14-15 17-17 41-41 43-43; do
+for rid in 9-9 14-15 17-17 43-43; do
   growth_round_write "$STATE" "$ROUND_WRITE" --worktree "$FW" --issue issue-776 --round-id "$rid" \
     --item 1 "fix finding" "tools/guard on a staged render" >/dev/null
 done
+growth_round_write "$STATE" "$ROUND_WRITE" --worktree "$FW" --issue issue-776 --round-id 41-41 --pr-open true \
+  --item 1 "fix finding" "tools/guard on a staged render" >/dev/null
 VRUN_FIX="$(round_run_dir "$TMP_ROOT/validate-run-fix" "$FW" issue-776 7-7)"
 VRUN_FIX_9="$(round_run_dir "$TMP_ROOT/validate-run-fix-9" "$FW" issue-776 9-9)"
 VRUN_FIX_14="$(round_run_dir "$TMP_ROOT/validate-run-fix-14" "$FW" issue-776 14-15)"
@@ -189,7 +191,7 @@ table \
   "an inline --summary embeds the text|--worktree $WT --kind implement --issue issue-1236i --round-id 12-12 --branch b --commit %H --validate pass --validate-run-dir $VRUN --no-summary --summary inline+completion+summary|rc=0 .summary=inline+completion+summary roundtrip=valid" \
   "a --validate-note is recorded verbatim beside a strictly enumerated pass|--worktree $WT --kind implement --issue issue-note --round-id $RID --branch b --commit %H --validate pass --validate-run-dir $VRUN --validate-note 80/80+on+re-run;+first+run+flaked|rc=0 .validate=pass .validate_note=80/80+on+re-run;+first+run+flaked" \
   "a FAILING verdict carries a note too|--worktree $WT --kind implement --issue issue-failnote --round-id $RID --branch b --commit %H --validate FAILING:+lint --validate-note lint+fails+only+under+--release|rc=0 .validate=FAILING:+lint .validate_note=lint+fails+only+under+--release" \
-  "a pass beside its round's ci run records the ci mode and round-trips|--worktree %FW --kind fix --issue issue-776 --round-id 41-41 --branch b --commit $FIX_HEAD --validate pass --validate-run-dir $VRUN_FIX_CI --item 1 Applied fixed|rc=0 .validate=pass .validate_mode=ci roundtrip=valid" \
+  "a CI receipt expands a seven-character commit and round-trips|--worktree %FW --kind fix --issue issue-776 --round-id 41-41 --branch b --commit ${FIX_HEAD:0:7} --validate pass --validate-run-dir $VRUN_FIX_CI --item 1 Applied fixed|rc=0 .commit=$FIX_HEAD .commit|length=40 .validate_mode=ci roundtrip=valid" \
   "a range validation is recorded as the mode that ran|--worktree %FW --kind fix --issue issue-776 --round-id 17-17 --branch b --commit c --validate pass --validate-run-dir $VRUN_FIX_RANGE --item 1 Applied fixed|rc=0 .validate_mode=range" \
   "a FAILING result beside a run that passed, another gate failing, records the run's mode and wall time|--worktree $WT --kind implement --issue issue-gatefail --round-id 20-20 --branch b --commit %H --validate FAILING:+doc-limits --validate-run-dir $VRUN|rc=0 .validate=FAILING:+doc-limits .validate_mode=full .validate_time.seconds=3300" \
   "a FAILING result beside an unfinished run records the run's mode and no wall time|--worktree $WT --kind implement --issue issue-lost --round-id 21-21 --branch b --commit %H --validate FAILING:+lost --validate-run-dir $VRUN_UNFINISHED|rc=0 .validate=FAILING:+lost .validate_mode=full has:validate_time=true .validate_time|tojson=null roundtrip=valid" \
@@ -204,6 +206,17 @@ table \
   "double-dash prose is accepted as --item REASONING|--worktree %FW --kind fix --issue issue-776 --round-id 14-15 --branch b --commit c --validate pass --validate-run-dir $VRUN_FIX_14 --item 1 Skipped --force+would+be+needed|rc=0 .items[0].reasoning=--force+would+be+needed"
 assert_eq "$(find "$WT/tmp" -maxdepth 1 -name '.dev-return-*' | wc -l | tr -d ' ')" "0" "a successful write leaves no temp file behind"
 assert_eq "$("$CHECK" --worktree "$FW" --issue issue-776 --round-id 7-7 --expect-items-from-round | jq -r '.reason')" "valid" "the fix record round-trips through the bound round's authorization"
+
+assert_eq "$("$CHECK" --worktree "$FW" --issue issue-776 --round-id 41-41 --expect-items-from-round | jq -r '.reason')" "valid" "the full-ID CI receipt passes round acceptance"
+WRITE_LIVE="$WRITE"
+WRITE="$(mutant_scripts short-commit-mutant dev-return-write)/dev-return-write" || exit 1
+mutate_file "$WRITE" 'rev-parse --verify "$commit^{commit}"' 'rev-parse --verify --short=7 "$commit^{commit}"'
+table "control: storing the short commit refuses the CI receipt|--worktree %FW --kind fix --issue issue-776 --round-id 41-41 --branch b --commit ${FIX_HEAD:0:7} --validate pass --validate-run-dir $VRUN_FIX_CI --item 1 Applied fixed|rc=0 .commit=${FIX_HEAD:0:7}"
+CHECK_RC=0
+CHECK_OUT="$("$CHECK" --worktree "$FW" --issue issue-776 --round-id 41-41 --expect-items-from-round 2>/dev/null)" || CHECK_RC=$?
+assert_eq "$CHECK_RC $(jq -r '.reason' <<<"$CHECK_OUT")" "1 ci_head_mismatch" "the reader rejects the short-ID round"
+WRITE="$WRITE_LIVE"
+table "CI refuses a tree as a commit|--worktree %FW --kind fix --issue issue-776 --round-id 41-41 --branch b --commit $FIX_HEAD^{tree} --validate pass --validate-run-dir $VRUN_FIX_CI --item 1 Applied fixed|rc=2 written=no stderr~dev-return-write:+ci-contents-mismatch=true"
 
 # The runner's snapshot may precede the workflow commit. A CI receipt binds
 # that existing snapshot to committed contents, not just an ancestor HEAD.
