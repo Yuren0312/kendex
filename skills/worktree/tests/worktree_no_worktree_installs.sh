@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# No worktree command runs a package-manager install: a worktree gets its
-# dependencies through a WORKTREE_SYMLINKS entry for node_modules, and when a
+# Without WORKTREE_SETUP_CMD no worktree command runs an install. When a
 # JS worktree has nothing linked the setup warns and names the main checkout
 # as the place to run the install. Setup also warns about npm ci on linked
 # node_modules. One table, a row per
@@ -14,9 +13,11 @@ set -euo pipefail
 # The fixtures' origin is a local path that names no GitHub repository, so
 # the suite names the default branch.
 export WORKTREE_DEFAULT_BRANCH=main
+export MSYS=winsymlinks:nativestrict
 # A pre-commit hook exports GIT_DIR and GIT_INDEX_FILE, which point every git
 # call below at the real repository; -C overrides neither.
 unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE
+unset WORKTREE_SETUP_CMD WORKTREE_TEST_PR_HEAD
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/messages.sh
@@ -47,7 +48,13 @@ assert_eq() {
 # command returns, so a manager the command forked and did not wait for is
 # outside this suite; create has no such path.
 mkdir -p "$TMP_ROOT/bin"
-printf '#!/usr/bin/env bash\nexit 0\n' >"$TMP_ROOT/bin/gh"
+cat >"$TMP_ROOT/bin/gh" <<'GH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}:${2:-}" == pr:view && -n "${WORKTREE_TEST_PR_HEAD:-}" ]]; then
+  printf 'feature\t%s\tfalse\n' "$WORKTREE_TEST_PR_HEAD"
+fi
+GH
 chmod +x "$TMP_ROOT/bin/gh"
 # shellcheck disable=SC2016
 for pm in npm pnpm yarn bun corepack npx; do
@@ -233,7 +240,7 @@ a private dependency directory gets no link warning|repo pkg create:issue-privat
 must-fail: suppressing the linked warning loses its required record|repo pkg installed link:node_modules unfixed-linked-warning|create issue-linked|0|wt:issue-linked|-|pm=- wt=base.txt,node_modules-><main>/node_modules,package.json
 '
 
-echo "=== no worktree command installs dependencies ==="
+echo "=== dependency setup without a configured command ==="
 n=0
 while IFS= read -r row; do
   [[ -n "$row" ]] || continue
@@ -253,6 +260,220 @@ while IFS= read -r row; do
   assert_eq "$(run "$command")" "rc=$rc out=$(out_text "$out") err=$(err_text "$err") $want_state" "$label"
 done <<<"$ROWS"
 [[ "$((PASS + FAIL))" -gt 0 ]] || { echo "no row was asserted (a probe run renders rows instead)" >&2; exit 2; }
+
+# The configured command proves ordering by reading every setup product before
+# writing its marker. The marker records its physical working directory.
+setup_fixture() {
+  local mode="$1"
+  mkdir -p "$MAIN/config"
+  printf 'secret\n' >"$MAIN/config/local.txt"
+  printf 'copy\n' >"$MAIN/copied.txt"
+  cat >"$MAIN/kendex.settings.toml" <<'SETTINGS'
+[env]
+WORKTREE_SYMLINKS = "config/local.txt"
+WORKTREE_COPIES = "copied.txt"
+WORKTREE_MKDIRS = "tmp"
+WORKTREE_RELATIVE_SYMLINKS = "relative.link=base.txt"
+WORKTREE_SETUP_CMD = 'test -f config/local.txt && test -f copied.txt && test -d tmp && test -L relative.link || exit 9; echo "$PWD" >> setup-marker; echo a7f4c9; echo b1d8e2 >&2; exit "${SETUP_TEST_EXIT:-0}"'
+SETTINGS
+  git -C "$MAIN" add kendex.settings.toml
+  git -C "$MAIN" commit -q -m settings
+  git -C "$MAIN" push -q origin main
+  WT="$ROOT/.worktrees/repo/issue-setup"
+  case "$mode" in
+    unset) sed '/^WORKTREE_SETUP_CMD =/d' "$MAIN/kendex.settings.toml" >"$ROOT/settings"; mv "$ROOT/settings" "$MAIN/kendex.settings.toml" ;;
+    fail|retry-fail|retry-ok|transfer|transfer-retry) printf 'export SETUP_TEST_EXIT="1"\n' >"$MAIN/.env.local" ;;
+  esac
+  case "$mode" in
+    retry-fail|retry-ok)
+      tool create issue-setup
+      [[ -f "$WT/setup-marker" ]] || { echo 'FIXTURE: failed setup did not leave its marker' >&2; exit 2; }
+      [[ "$mode" != retry-ok ]] || printf 'export SETUP_TEST_EXIT="0"\n' >"$MAIN/.env.local"
+      ;;
+    codex|claude|branch) git -C "$MAIN" worktree add -q -b app-created "$WT" main ;;
+    hosted) WT="$ROOT/.worktrees/repo/lane" ;;
+    transfer|transfer-retry)
+      git -C "$MAIN" checkout -q -b issue-setup
+      printf 'preserved\n' >"$MAIN/base.txt"
+      printf 'staged\n' >"$MAIN/staged.txt"
+      git -C "$MAIN" add staged.txt
+      printf 'untracked\n' >"$MAIN/untracked.txt"
+      if [[ "$mode" == transfer-retry ]]; then
+        tool create issue-setup --transfer issue-setup
+        printf 'export SETUP_TEST_EXIT="0"\n' >"$MAIN/.env.local"
+      fi
+      ;;
+  esac
+  case "$mode" in
+    claim) tool create issue-setup --no-checkout ;;
+    repair) tool create issue-setup ;;
+    branch) tool codex-setup "$WT" ;;
+    keep|keep-fail)
+      git -C "$MAIN" worktree add -q -b issue-setup "$WT" main
+      printf 'feature\n' >"$WT/base.txt"
+      git -C "$WT" add base.txt
+      git -C "$WT" commit -q -m feature
+      printf 'main\n' >"$MAIN/base.txt"
+      git -C "$MAIN" add base.txt
+      git -C "$MAIN" commit -q -m main-change
+      git -C "$MAIN" push -q origin main
+      [[ "$mode" != keep-fail ]] || printf 'export SETUP_TEST_EXIT="1"\n' >"$MAIN/.env.local"
+      ;;
+    unavailable)
+      mkdir -p "$ROOT/pkg"
+      cp -R "${ORIGINAL_WORKTREE_SCRIPT%/scripts/worktree}" "$ROOT/pkg/worktree"
+      WORKTREE_SCRIPT="$ROOT/pkg/worktree/scripts/worktree"
+      ;;
+  esac
+}
+
+setup_result() {
+  local mode="$1" command="$2" rc=0 calls=0 marker=ok registered=no stash=no preserved=yes line listing err_records consumer_output
+  local -a argv
+  read -r -a argv <<<"${command//<wt>/$WT}"
+  (cd "$MAIN" && "$WORKTREE_SCRIPT" "${argv[@]}" >"$ROOT/out" 2>"$ROOT/err") || rc=$?
+  if [[ -f "$WT/setup-marker" ]]; then
+    while IFS= read -r line; do
+      calls=$((calls + 1))
+      [[ "$line" == "$WT" ]] || marker=wrong-directory
+    done <"$WT/setup-marker"
+  fi
+  [[ ! -e "$MAIN/setup-marker" ]] || marker=main-written
+  listing="$(git -C "$MAIN" worktree list --porcelain)"
+  if grep -Fxq "worktree $WT" <<<"$listing"; then registered=yes; fi
+  if git -C "$MAIN" rev-parse --verify refs/stash >/dev/null 2>&1; then stash=yes; fi
+  if [[ "$mode" == transfer || "$mode" == transfer-retry ]]; then
+    [[ "$(cat "$WT/base.txt")" == preserved && "$(cat "$WT/untracked.txt")" == untracked &&
+       "$(git -C "$WT" show :staged.txt)" == staged ]] || preserved=no
+  fi
+  # Consumer output is arbitrary stderr, not a worktree protocol record.
+  err_records="$(awk '/^worktree-[a-z-]+:/ { print }' "$ROOT/err")"
+  consumer_output="$(awk '/^a7f4c9$|^b1d8e2$/ { print }' "$ROOT/err" | paste -s -d ';' -)"
+  printf 'rc=%s out=%s err=%s calls=%s marker=%s registered=%s stash=%s preserved=%s consumer=%s' \
+    "$rc" "$(alias_text <"$ROOT/out")" "$(alias_text <<<"$err_records")" "$calls" "$marker" "$registered" "$stash" "$preserved" "$consumer_output"
+}
+
+SETUP_CASE_SERIAL=0
+setup_row() {
+  local mode="$1" command="$2" rc="$3" calls="$4" out="$5" err="$6" stash="$7" consumer="${8:-a7f4c9;b1d8e2}"
+  [[ "$consumer" != - ]] || consumer=""
+  SETUP_CASE_SERIAL=$((SETUP_CASE_SERIAL + 1))
+  build "setup-$mode-$SETUP_CASE_SERIAL" repo
+  setup_fixture "$mode"
+  local want_out="" want_err=""
+  case "$out" in path) want_out="$WT" ;; codex|claude) want_out="worktree-$out-configured: $WT" ;; branch) want_out='worktree-codex-branch-ready: issue-setup' ;; links) want_out="worktree-links-restored: $WT" ;; esac
+  case "$err" in
+    fail) want_err="worktree-setup-command-failed: path=$WT status=1" ;;
+    dirty-fail) want_err="worktree-setup-command-failed: path=$WT status=1" ;;
+    dirty) want_err="worktree-reuse-dirty: $WT" ;;
+    keep) want_err="worktree-reuse-unrebased: $WT" ;;
+    unavailable) want_err="worktree-setup-command-unavailable: path=$WT" ;;
+  esac
+  want_out="$(alias_text <<<"$want_out")"
+  want_err="$(alias_text <<<"$want_err")"
+  assert_eq "$(setup_result "$mode" "$command")" \
+    "rc=$rc out=$want_out err=$want_err calls=$calls marker=ok registered=yes stash=$stash preserved=yes consumer=$consumer" "$mode: $command"
+}
+
+echo "=== configured setup commands ==="
+# mode|command|status|marker-lines|stdout|stderr|stash|consumer-bytes-on-stderr
+SETUP_ROWS='success|create issue-setup|0|1|path|-|no|a7f4c9;b1d8e2
+unset|create issue-setup|0|0|path|-|no|-
+fail|create issue-setup|1|1|-|fail|no|a7f4c9;b1d8e2
+retry-fail|create issue-setup --reuse|1|2|-|dirty-fail|no|a7f4c9;b1d8e2
+retry-ok|create issue-setup --reuse|0|2|path|dirty|no|a7f4c9;b1d8e2
+transfer|create issue-setup --transfer issue-setup|1|1|-|fail|yes|a7f4c9;b1d8e2
+transfer-retry|create issue-setup --reuse|0|2|path|dirty|yes|a7f4c9;b1d8e2
+codex|codex-setup <wt>|0|1|codex|-|no|a7f4c9;b1d8e2
+claude|claude-setup <wt>|0|1|claude|-|no|a7f4c9;b1d8e2
+branch|codex-branch issue-setup <wt>|0|1|branch|-|no|-
+hosted|create issue-setup --hosted|0|1|path|-|no|a7f4c9;b1d8e2
+no-checkout|create issue-setup --no-checkout|0|0|path|-|no|-
+claim|create issue-setup --reuse|0|1|path|-|no|a7f4c9;b1d8e2
+repair|fix-links <wt>|0|1|links|-|no|-
+keep|create issue-setup --reuse --keep-on-conflict|76|1|path|keep|no|a7f4c9;b1d8e2
+keep-fail|create issue-setup --reuse --keep-on-conflict|1|1|-|fail|no|a7f4c9;b1d8e2
+unavailable|create issue-setup|1|0|-|unavailable|no|-'
+while IFS='|' read -r mode command rc calls out err stash consumer; do
+  setup_row "$mode" "$command" "$rc" "$calls" "$out" "$err" "$stash" "$consumer"
+done <<<"$SETUP_ROWS"
+
+hosted_recovery_row() {
+  local route="$1" command="" mode=success stash=no git_dir="" record=missing
+  SETUP_CASE_SERIAL=$((SETUP_CASE_SERIAL + 1))
+  build "hosted-$route-$SETUP_CASE_SERIAL" repo
+  setup_fixture success
+  WT="$ROOT/.worktrees/repo/lane"
+  printf 'export SETUP_TEST_EXIT="1"\n' >"$MAIN/.env.local"
+  case "$route" in
+    branch) command='create issue-setup feature --hosted' ;;
+    from) command='create issue-setup feature --hosted --from main' ;;
+    base|pr)
+      git -C "$MAIN" branch feature
+      git -C "$MAIN" push -q origin feature
+      if [[ "$route" == pr ]]; then
+        WORKTREE_TEST_PR_HEAD="$(git -C "$MAIN" rev-parse feature)"
+        export WORKTREE_TEST_PR_HEAD
+        command='create issue-setup --hosted --pr 1'
+      else
+        command='create issue-setup --hosted --base feature'
+      fi
+      ;;
+    transfer)
+      git -C "$MAIN" checkout -q -b feature
+      printf 'preserved\n' >"$MAIN/base.txt"
+      printf 'staged\n' >"$MAIN/staged.txt"
+      git -C "$MAIN" add staged.txt
+      printf 'untracked\n' >"$MAIN/untracked.txt"
+      command='create issue-setup --hosted --transfer feature'
+      mode=transfer stash=yes
+      ;;
+  esac
+  assert_eq "$(setup_result "$mode" "$command")" \
+    'rc=1 out= err=worktree-setup-command-failed: path=<root>/.worktrees/repo/lane status=1 calls=1 marker=ok registered=yes stash='"$stash"' preserved=yes consumer=a7f4c9;b1d8e2' "$route: failed hosted setup keeps its files"
+  git_dir="$(git -C "$WT" rev-parse --absolute-git-dir)"
+  [[ ! -f "$git_dir/kendex-issue" ]] || record="$(cat "$git_dir/kendex-issue")"
+  assert_eq "$record" issue-setup "$route: failed hosted setup keeps its issue identity"
+  printf 'export SETUP_TEST_EXIT="0"\n' >"$MAIN/.env.local"
+  assert_eq "$(setup_result "$mode" 'create issue-setup --hosted --reuse')" \
+    'rc=0 out=<root>/.worktrees/repo/lane err=worktree-reuse-dirty: <root>/.worktrees/repo/lane calls=2 marker=ok registered=yes stash='"$stash"' preserved=yes consumer=a7f4c9;b1d8e2' "$route: hosted reuse retries setup in the retained tree"
+  assert_eq "$(git -C "$WT" branch --show-current)" feature "$route: hosted retry preserves its non-issue branch"
+  unset WORKTREE_TEST_PR_HEAD
+}
+echo '=== hosted setup recovery on non-issue branches ==='
+for route in branch from base pr transfer; do
+  hosted_recovery_row "$route"
+done
+
+# Mutants stay outside the worktree and install the bounded-runner dependency
+# beside the copied package. The same rows must reject each planted defect.
+setup_control() {
+  local name="$1" needle="$2" replacement="$3" mode="$4" rc="$5" calls="$6" out="$7" err="$8"
+  local copy="$TMP_ROOT/control-$name" mutant
+  mkdir -p "$copy/github/scripts" "$copy/rows"
+  cp -R "${ORIGINAL_WORKTREE_SCRIPT%/scripts/worktree}" "$copy/worktree"
+  cp -R "${ORIGINAL_WORKTREE_SCRIPT%/worktree/scripts/worktree}/github/scripts/lib" "$copy/github/scripts/lib"
+  mutant="$copy/worktree/scripts/worktree"
+  [[ -f "$mutant" && ! -L "$mutant" && "$(grep -cF "$needle" "$mutant")" == 1 ]] || { echo 'FIXTURE: setup mutation match is not unique' >&2; exit 2; }
+  awk -v needle="$needle" -v replacement="$replacement" '{ if (index($0, needle)) print replacement; else print }' "$mutant" >"$copy/changed"
+  cmp -s "$mutant" "$copy/changed" && { echo 'FIXTURE: setup mutation changed nothing' >&2; exit 2; }
+  cat "$copy/changed" >"$mutant"
+  if (TMP_ROOT="$copy/rows"; ORIGINAL_WORKTREE_SCRIPT="$mutant"; PASS=0; FAIL=0
+      if [[ "$mode" == hosted-recovery ]]; then hosted_recovery_row from
+      else setup_row "$mode" 'create issue-setup' "$rc" "$calls" "$out" "$err" no; fi
+      [[ "$FAIL" -gt 0 ]]); then
+    PASS=$((PASS + 1)); printf '  ok    must-fail: %s\n' "$name"
+  else
+    FAIL=$((FAIL + 1)); printf '  FAIL  must-fail: %s\n' "$name"
+  fi
+}
+setup_control missing-call 'run_worktree_setup_command "$wt" || return 1' '    :' success 0 1 path -
+setup_control ignored-status 'if [[ "$status" -ne 0 ]]; then' '  if false && [[ "$status" -ne 0 ]]; then' fail 1 1 - fail
+setup_control discarded-output \
+  '  (cd -P -- "$wt" && kendex_github_run_bounded 3600 "$BASH" -c "$WORKTREE_SETUP_CMD" </dev/null) >&2 || status=$?' \
+  '  (cd -P -- "$wt" && kendex_github_run_bounded 3600 "$BASH" -c "$WORKTREE_SETUP_CMD" </dev/null) >/dev/null 2>&1 || status=$?' \
+  success 0 1 path -
+setup_control lost-identity 'record_worktree_issue "$wt" "$issue" || return 1' '      :' hosted-recovery 0 0 - -
 
 echo
 printf 'pass: %d   fail: %d\n' "$PASS" "$FAIL"
