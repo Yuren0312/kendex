@@ -58,13 +58,18 @@ when its settings files change. Other settings need slack setup or a restart.
 While SLACK_JARVIS_SESSION_FILE is younger than SLACK_JARVIS_SESSION_MAX_AGE a Jarvis session
 answers the overseer, and the relay holds mailbox posts except replies to
 messages the owner typed in the channel, which still post in their threads.
-Reading the channel goes on. When the file goes stale or
+Reading the channel goes on. A reload that renames the file keeps the
+replaced one: the hold stands while either is fresh, and the replaced file
+is dropped once the new one is fresh or the replaced one stale. An emptied
+setting ends the hold. When the file goes stale or
 absent the relay resumes. The Jarvis session's watch writes its last mailbox read
 count as one bare integer in tmp/lane-mail/overseer/to-overseer.seen. A resume
-skips notices on lines at or below that count and journals their ids; later
-notices post. A missing or unreadable seen file skips nothing. The count is
-clamped to the lines listed. Open asks post whatever their line. Held answers
+skips notices and asks, including closed asks, on lines at or below that count, with no post and
+no mention, and journals their ids; later ones post. A missing or unreadable
+seen file skips nothing. The count is clamped to the lines listed. Held answers
 still post; closure records update thread state independently of post age.
+`slack post --mention` checks the root's OS hold lock, including a renamed
+file's hold. Its current presence file also holds a post between polls.
 
 A relay imports its modules once, so a package update reaches a running relay
 only through a new image. The relay fingerprints its code at start and again
@@ -106,6 +111,7 @@ from store import (
     Binding,
     Journal,
     RelayLock,
+    JARVIS_LOCK,
     State,
     Thread,
 
@@ -214,6 +220,32 @@ def overdue_id(ask_id: str) -> str:
     return f"{ask_id}:overdue"
 
 
+def touched_at(path: str) -> Optional[float]:
+    """A presence file's mtime; None for an empty setting or an absent
+    file, which is no Jarvis session."""
+    if not path:
+        return None
+    try:
+        return os.stat(path).st_mtime
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        raise Refusal("jarvis-session-file-unreadable", f"{path} ({err.strerror})") from err
+
+
+def presence_fresh(touched: Optional[float], presence: Presence, now: float) -> bool:
+    """Whether a presence file touched at `touched` holds posts at `now`."""
+    return touched is not None and now - touched < presence.jarvis_session_max_age
+
+
+def jarvis_session_held(root: Path, presence: Presence, now: float) -> bool:
+    """The relay's OS lock retains a renamed file's hold. The current
+    file can also start a hold between polls."""
+    if RelayLock(root, JARVIS_LOCK).held():
+        return True
+    return presence_fresh(touched_at(presence.jarvis_session_file), presence, now)
+
+
 def mention(binding: Binding) -> str:
     return " ".join(f"<@{binding.owner_ids[o]}>" for o in binding.owners if o in binding.owner_ids)
 
@@ -224,6 +256,10 @@ class RootRelay:
         self.settings = settings
         self.presence = presence
         self.presence_files = self.presence_stamp()
+        # The presence file a reload renamed away from, which still holds
+        # until the new file is fresh or the replaced one is stale: a delegate
+        # writes the new file only after the rename.
+        self.replaced_session_file = ""
         self.api = api
         self.clock = clock
         self.mail = LaneMail(path)
@@ -231,6 +267,7 @@ class RootRelay:
         self.state: State = read_journal(path)
         self.journal = Journal(path, self.state)
         self.lock = RelayLock(path)
+        self.hold_lock = RelayLock(path, JARVIS_LOCK)
         self.skipped: set = set()
         self.last_ok: Optional[float] = None
         self.post_failed: Optional[Refusal] = None
@@ -296,8 +333,9 @@ class RootRelay:
             self.seed()
 
     def poll(self, bot_user: str) -> None:
-        self.ready()
         self.post_failed = None
+        self.prepare_hold()
+        self.ready()
         self.mark_seen(self.state.delivered)
         for message in list(self.pending_live.values()):
             try:
@@ -316,15 +354,11 @@ class RootRelay:
                 print_refusal(err)
                 self.catch_up_at = self.clock() + err.retry_after
         self.mark_read()
-        stamp = self.presence_stamp()
-        if stamp != self.presence_files:
-            presence = load_presence(self.path)
-            changed_private = presence.private_file != self.presence.private_file
-            self.presence = presence
-            self.presence_files = stamp[:2] + self.presence_stamp((presence.private_file,)) if changed_private else stamp
+        if self.post_failed is not None:
+            raise self.post_failed
+        touched = self.refresh_hold()
         now = self.clock()
-        touched = self.jarvis_session_touched()
-        if touched is not None and now - touched < self.presence.jarvis_session_max_age:
+        if presence_fresh(touched, self.presence, now):
             if not self.state.held:
                 self.journal.append(t="hold", at=format_at(touched))
             self.post_events([routed for routed in self.routes(self.mail.events()) if routed[1] == "reply"])
@@ -337,6 +371,34 @@ class RootRelay:
         if self.post_failed is not None:
             raise self.post_failed
         self.last_ok = self.clock()
+
+    def prepare_hold(self) -> None:
+        # Presence failures stop outbound posts. Inbound owner messages still
+        # need delivery, so the post step reports a refusal from this read.
+        try:
+            self.refresh_hold()
+        except Refusal as err:
+            self.post_failed = err
+
+    def refresh_hold(self) -> Optional[float]:
+        """Publish the current or retained presence hold before Slack can wait.
+        Status age reports health; OS ownership carries this hold until release."""
+        stamp = self.presence_stamp()
+        if stamp != self.presence_files:
+            presence = load_presence(self.path)
+            changed_private = presence.private_file != self.presence.private_file
+            if presence.jarvis_session_file != self.presence.jarvis_session_file:
+                # An emptied setting ends the hold; a renamed one keeps the old file.
+                self.replaced_session_file = self.presence.jarvis_session_file if presence.jarvis_session_file else ""
+            self.presence = presence
+            self.presence_files = stamp[:2] + self.presence_stamp((presence.private_file,)) if changed_private else stamp
+        touched = self.jarvis_session_touched()
+        if presence_fresh(touched, self.presence, self.clock()):
+            if self.hold_lock.handle is None:
+                self.hold_lock.acquire()
+        else:
+            self.hold_lock.release()
+        return touched
 
     def live(self, thread: Thread) -> bool:
         """Whether catch-up re-reads a known thread within its lookback."""
@@ -589,17 +651,17 @@ class RootRelay:
     # -- outbound: the mailbox to Slack --------------------------------------
 
     def jarvis_session_touched(self) -> Optional[float]:
-        """SLACK_JARVIS_SESSION_FILE's mtime; None for an empty setting or an absent
-        file, which is no Jarvis session."""
-        path = self.presence.jarvis_session_file
-        if not path:
-            return None
-        try:
-            return os.stat(path).st_mtime
-        except FileNotFoundError:
-            return None
-        except OSError as err:
-            raise Refusal("jarvis-session-file-unreadable", f"{path} ({err.strerror})") from err
+        """SLACK_JARVIS_SESSION_FILE's mtime, or the replaced file's while it
+        is fresh and the new one is not. Drop the replaced file when the
+        new file is fresh or the replaced file is stale."""
+        touched = touched_at(self.presence.jarvis_session_file)
+        now = self.clock()
+        if self.replaced_session_file and not presence_fresh(touched, self.presence, now):
+            replaced = touched_at(self.replaced_session_file)
+            if presence_fresh(replaced, self.presence, now):
+                return replaced
+        self.replaced_session_file = ""
+        return touched
 
     def jarvis_session_read(self, events: List[Dict]) -> Optional[int]:
         """The Jarvis session's seen line count, clamped to this mailbox snapshot;
@@ -619,8 +681,8 @@ class RootRelay:
         return min(count, lines)
 
     def resume(self, events: List[Dict]) -> None:
-        """End a hold, post unread notices and open asks, then journal the
-        seen count, skipped notice ids and asks whose posts landed."""
+        """End a hold, post unread notices and asks, then journal the seen
+        count, skipped notice and ask ids and asks whose posts landed."""
         seen = self.jarvis_session_read(events)
         routed = self.routes(events, seen or 0)
         skipped = [str(envelope["id"]) for envelope, route, _ in routed if route == "seen"]
@@ -640,8 +702,9 @@ class RootRelay:
 
     def routes(self, events: List[Dict], seen: int = 0) -> List[Tuple[Dict, str, Dict]]:
         """Each envelope not yet carried and what it takes: `ask`, `notice`, `reply`,
-        `answer`, `resolution`, `seen` for a notice the Jarvis session read on resume,
-        `overdue` for a carried reserved ask open past its deadline, or `skip`
+        `answer`, `resolution`, `seen` for a notice or an ask the Jarvis session read on resume,
+        `overdue` for a reserved ask with a posted thread or unresolved post
+        open past its deadline, or `skip`
         for another that never posts; answers carry their ask's record."""
         closures = {str(e["id"]): e for e in events
                     if e.get("box") == "to-lane" and e.get("mail_class") == "close"}
@@ -663,7 +726,10 @@ class RootRelay:
                     routed.append((envelope, "resolution", {}))
                 if envelope["kind"] == "resolution":
                     continue
+            # A resume carries skipped asks without a post. A reminder needs
+            # a posted thread or a post whose response remains unknown.
             if (envelope.get("reserved") is True and env_id in state.carried and env_id not in closed
+                    and (env_id in state.by_envelope or env_id in state.unknown)
                     and env_id not in answered and overdue_id(env_id) not in state.carried
                     and at_epoch(str(envelope["deadline"])) <= self.clock()):
                 routed.append((envelope, "overdue", {}))
@@ -675,7 +741,7 @@ class RootRelay:
             owner = box == "to-overseer" and envelope.get("to") == "owner"
             # `store.compact` drops an `out` line by this same age, so an
             # envelope whose line it may drop must never post again.
-            if owner and kind == "notice" and envelope["line"] is not None and envelope["line"] <= seen:
+            if owner and kind in ("notice", "ask") and envelope["line"] is not None and envelope["line"] <= seen:
                 route = "seen"
             elif at < horizon:
                 route = "skip"
@@ -955,6 +1021,7 @@ class Relay:
         self.by_channel = {root.channel: root for root in self.roots}
         for root in self.roots:
             root.lock.acquire()
+            root.prepare_hold()
         self.bot_user = str(api.get("auth.test")["user_id"])
         self.socket: Optional[WebSocket] = None
         # `connected`, `reconnecting` while the relay tries to open a
