@@ -153,9 +153,9 @@ assert_eq "$rc" 0 "a Write outside any repository passes"
 run_tool reviewer-test Write file_path "$SCRATCH/deeper/not/yet/fixture.rs"
 assert_eq "$rc" 0 "a Write under directories that do not exist yet, outside any repository, passes"
 run_payload '{"agent_type":"reviewer-test","tool_name":"Write","tool_input":{"content":"x"}}'
-assert_eq "$rc" 2 "a Write naming no file_path is refused"
+assert_eq "$rc" 0 "a Write naming no file_path warns"
 run_payload '{"agent_type":"reviewer-test","tool_name":"Write","tool_input":{"file_path":7}}'
-assert_eq "$rc" 2 "a file_path that is not a string is refused"
+assert_eq "$rc" 0 "a file_path that is not a string warns"
 
 echo "reviewer-read-only: a reviewer commits and pushes nothing"
 for cmd in 'git commit -m x' 'git push' 'git push origin HEAD' "git -C $REPO commit -am x" \
@@ -183,16 +183,16 @@ done
 run_payload '{"agent_type":"reviewer-security","tool_name":"Bash","tool_input":{}}'
 assert_eq "$rc" 0 "a Bash payload naming no command passes"
 run_payload '{"agent_type":"reviewer-security","tool_name":"Bash","tool_input":{"command":["git","commit"]}}'
-assert_eq "$rc" 2 "a command that is not a string is refused"
+assert_eq "$rc" 0 "a command that is not a string warns"
 
 echo "reviewer-read-only: a payload it cannot read refuses"
 run_payload '{"agent_type":"reviewer-test","tool_name":"Edit"'
-assert_eq "rc=$rc first=$(first_line)" "rc=2 first=reviewer-read-only: payload=invalid-json" \
+assert_eq "rc=$rc first=$(first_line)" "rc=0 first=reviewer-read-only: payload=invalid-json" \
   "a truncated JSON payload refuses rather than skipping the guard"
 run_payload '{"agent_type":["reviewer-test"],"tool_name":"Edit"}'
-assert_eq "$rc" 2 "an agent_type that is not a string refuses"
+assert_eq "$rc" 0 "an agent_type that is not a string warns"
 run_payload '{"agent_type":"reviewer-test","tool_name":false}'
-assert_eq "$rc" 2 "a tool_name that is not a string refuses"
+assert_eq "$rc" 0 "a tool_name that is not a string warns"
 run_payload '{"agent_type":"reviewer-test","tool_name":"Read","tool_input":{"file_path":"x"}}'
 assert_eq "$rc" 0 "a tool the hook does not judge passes"
 
@@ -210,7 +210,7 @@ printf '{"agent_type":"reviewer-test","tool_name":"Write","tool_input":{"file_pa
   | env HOME="$TMP_ROOT" PATH="$BROKEN_BIN:$PATH" "$BASH_BIN" "$HOOK" >/dev/null 2>"$TMP_ROOT/stderr"
 rc=$?
 set -e
-assert_eq "rc=$rc first=$(first_line)" "rc=2 first=reviewer-read-only: git=unreadable" \
+assert_eq "rc=$rc first=$(first_line)" "rc=0 first=reviewer-read-only: git=unreadable" \
   "a git failure that is not 'not a git repository' refuses the write"
 assert_contains "$(cat "$TMP_ROOT/stderr")" "unable to read the repository configuration" "carries git's own failure"
 
@@ -219,6 +219,11 @@ echo "reviewer-read-only: without the tools it runs"
 # that one: the refusal names the missing tool and nothing is judged without
 # it. A row per tool is what keeps the inventory honest — an absent grep does
 # not stall this hook, it passes the call through.
+# The shared payload runner measures the hook, not an early-closing pipe.
+. "$TEST_DIR/lib/payload-rows.sh"
+PAYLOAD_ROOT="$TMP_ROOT"
+PAYLOAD_PREFIX='reviewer-read-only: '
+PAYLOAD_BASH="$BASH_BIN"
 tools_table() { # TOOLS
   local tool other bin before=$((PASS + FAIL))
   for tool in $1; do
@@ -231,9 +236,10 @@ tools_table() { # TOOLS
       [ -n "$real" ] && [ -x "$real" ] || continue
       ln -sf "$real" "$bin/$other"
     done
-    run_payload '{"agent_type":"generalist","tool_name":"Edit","tool_input":{"file_path":"x"}}' "$bin"
-    assert_eq "rc=$rc first=$(first_line)" "rc=2 first=reviewer-read-only: missing-tools=$tool" \
-      "without $tool the call is refused, and the value names it"
+    got=$(payload_run "$HOOK" "$PWD" "$bin" '{"agent_type":"generalist","tool_name":"Edit","tool_input":{"file_path":"x"}}')
+    assert_eq "$got" "rc=0 first=missing-tools=$tool" \
+      "without $tool the call warns, and the value names it"
+    assert_eq "$(grep -cF -- "$PAYLOAD_PREFIX" "$TMP_ROOT/stderr")" 1 "without $tool warns once"
   done
   # A world holding none of them: the value is the whole list, in check order.
   # A row per tool cannot see an accumulator that overwrites instead of
@@ -241,9 +247,10 @@ tools_table() { # TOOLS
   bin="$TMP_ROOT/without-everything"
   rm -rf -- "$bin"
   mkdir -p "$bin"
-  run_payload '{"agent_type":"generalist","tool_name":"Edit","tool_input":{"file_path":"x"}}' "$bin"
-  assert_eq "rc=$rc first=$(first_line)" "rc=2 first=reviewer-read-only: missing-tools=${1// /,}" \
+  got=$(payload_run "$HOOK" "$PWD" "$bin" '{"agent_type":"generalist","tool_name":"Edit","tool_input":{"file_path":"x"}}')
+  assert_eq "$got" "rc=0 first=missing-tools=${1// /,}" \
     "with none of them the value is the whole list, in check order"
+  assert_eq "$(grep -cF -- "$PAYLOAD_PREFIX" "$TMP_ROOT/stderr")" 1 "without all tools warns once"
   [ "$((PASS + FAIL))" -gt "$before" ] || { echo "tools: no row was asserted" >&2; exit 2; }
 }
 tools_table "jq git cat grep dirname"

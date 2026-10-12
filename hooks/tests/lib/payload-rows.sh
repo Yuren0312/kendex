@@ -122,10 +122,13 @@ payload_first() { # -> line 1's key=value, `refusal`, or `malformed`
 
 payload_run() { # hook dir path payload -> "rc=N first=KEY=VALUE"
   local hook="$1" dir="$2" path="$3" payload="$4" rc=0
-  printf '%s' "$payload" | (
+  # A dependency warning can exit before stdin is read. A pipe would then
+  # measure printf's SIGPIPE rather than the hook's advisory exit status.
+  printf '%s' "$payload" >"$PAYLOAD_ROOT/input"
+  (
     cd "$dir" && env -i HOME="$HOME" PWD="$dir" PATH="$path" "$PAYLOAD_BASH" "$hook" \
       >/dev/null 2>"$PAYLOAD_ROOT/stderr"
-  ) || rc=$?
+  ) <"$PAYLOAD_ROOT/input" || rc=$?
   printf 'rc=%s first=%s' "$rc" "$(payload_first)"
 }
 
@@ -192,6 +195,9 @@ payload_table() { # hook refusing passing [dir]
         exit 1
         ;;
     esac
+    if [ "${PAYLOAD_ADVISORY:-}" = 1 ]; then
+      case "$first" in missing-tools=* | payload=*) rc=0 ;; esac
+    fi
     got="$(payload_run "$hook" "$dir" "$path" "$(payload_json "$shape" "$text" "$dir")")"
     # A rendering aid for writing rows; the run is refused after the loop.
     if [ "${HOOKS_TABLE_PROBE:-}" = 1 ]; then
@@ -199,6 +205,10 @@ payload_table() { # hook refusing passing [dir]
       continue
     fi
     assert_eq "$got" "rc=$rc first=${first//\{tools\}/$PAYLOAD_TOOLS}" "$label"
+    if [ "${PAYLOAD_ADVISORY:-}" = 1 ] && [ "$rc" = 0 ] && [ "$first" != - ]; then
+      warnings=$(grep -cF -- "$PAYLOAD_PREFIX" "$PAYLOAD_ROOT/stderr") || warnings=0
+      assert_eq "$warnings" 1 "$label warns once"
+    fi
   done <<<"$PAYLOAD_ROWS"
   [ "$((PASS + FAIL))" -gt "$before" ] || { echo "no row was asserted (a probe run renders rows instead)" >&2; exit 2; }
 }

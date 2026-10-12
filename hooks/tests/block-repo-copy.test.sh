@@ -64,6 +64,7 @@ run_payload() { # raw-json -> rc, stderr in ERR_FILE
 
 # The hook's dependency list, in the order it checks them: the shared table
 # pins it as the value of the world that has none of them.
+PAYLOAD_ADVISORY=1
 PAYLOAD_TOOLS=jq,cat
 
 # shellcheck source=lib/payload-rows.sh
@@ -207,7 +208,7 @@ a two-word verb reaches the set's own spelling|command|2|block-repo-copy: refuse
 the blanks the command spelled are not part of the verb|command|2|block-repo-copy: refused=git clone|git   clone $REPO/.git /tmp/copy
 the verb on the far side of a pipe is the one that matched|command|2|block-repo-copy: refused=tar|tar -cf - $REPO/target | tar -xf - -C /tmp
 a copy the hook allows says nothing|command|0|-|cp -r $REPO/docs /tmp/copy
-a payload that is not JSON is refused unread|payload|2|block-repo-copy: payload=invalid-json|not JSON
+a payload that is not JSON is refused unread|payload|0|block-repo-copy: payload=invalid-json|not JSON
 "
 run_hook "cp -r $REPO/target /tmp/copy"
 assert_contains "$err" "cp -r $REPO/target /tmp/copy" 'the refusal quotes the command it judged'

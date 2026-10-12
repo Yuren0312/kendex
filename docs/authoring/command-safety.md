@@ -12,9 +12,9 @@ An absent setting applies the shipped host-safety pattern, so a fresh install re
 (^|[^[:alnum:]_-])systemd-run[[:space:]][^&;|]*Memory(Max|High)=[[:punct:]]?[0-9]+[KkMm]([^[:alnum:]]|$)
 ```
 
-A cap that small starved a build's cgroup into a kernel allocation failure inside a filesystem transaction, and the host's root volume went read-only. A cap in gigabytes, or a run with no cap, passes. A project that sets the key replaces this pattern, so its own pattern keeps this rule where it still wants it; the value `^$` turns matching off, and the refusals below still apply. Outside a Git worktree the hook stays inactive, which lets a global installation run there. An explicitly empty value, invalid pattern, unreadable setting, or unreadable tool input refuses the command.
+A cap that small starved a build's cgroup into a kernel allocation failure inside a filesystem transaction, and the host's root volume went read-only. A cap in gigabytes, or a run with no cap, passes. A project that sets the key replaces this pattern, so its own pattern keeps this rule where it still wants it; the value `^$` turns matching off, and the warnings below still apply. Outside a Git worktree the hook stays inactive, which lets a global installation run there. An explicitly empty value, invalid pattern, missing tool, unreadable setting or unreadable tool input produces one keyed warning and allows the command.
 
-A malformed value on any `[env]` key refuses every command, not only a malformed pattern. The settings loader reads the file whole, like every kendex settings reader, so a policy read past the bad line would come from a file the rest of the toolchain rejects. The refusal replays the loader's line naming the file, the line and the key to rewrite.
+A malformed value on any `[env]` key produces one keyed warning and allows the command, not only a malformed pattern. The settings loader reads the file whole, like every kendex settings reader, so a policy read past the bad line would come from a file the rest of the toolchain rejects. The warning replays the loader's line naming the file, the line and the key to rewrite.
 
 The hook matches tool command text both as received and with backslash-newline pairs removed. For an argument array, it joins the arguments with spaces. Quotes and comments are still text, so a matching literal example is also refused. Put isolated validation behind a script whose invocation does not match the pattern.
 
@@ -25,4 +25,4 @@ For a Quickshell project, this example blocks direct `qs -c vshell`, `qs -p quic
 COMMAND_SAFETY_DENY_PATTERN = "(^|[[:space:];|&])qs[[:space:]]+(-c[[:space:]]+vshell|-p[[:space:]]+quickshell/vshell)([[:space:];|&]|$)|(^|[[:space:];|&])pkill([[:space:]]+-[^[:space:];|&]+)*[[:space:]]+quickshell([[:space:];|&]|$)"
 ```
 
-Missing settings support refuses the command because the hook cannot determine whether a policy exists. Keep the pattern specific to the commands the project must prohibit. The hook does not classify commands hidden inside scripts.
+Missing settings support produces one keyed warning and allows the call because the hook cannot determine whether a policy exists. Repair the installed commit-guards support. Keep the pattern specific to the commands the project must prohibit. The hook does not classify commands hidden inside scripts.

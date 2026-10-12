@@ -68,6 +68,7 @@ run_payload() { # raw-json -> rc, stderr in ERR_FILE
 
 # The hook's dependency list, in the order it checks them: the shared table
 # pins it as the value of the world that has none of them.
+PAYLOAD_ADVISORY=1
 PAYLOAD_TOOLS=jq,cat,grep,sed
 
 # shellcheck source=lib/payload-rows.sh
@@ -89,7 +90,7 @@ first_table "\
 a line that is only a cd reaches the refused key|command|2|block-bare-cd: refused=bare-cd|cd /tmp
 a bare cd with no operand reaches the same one|command|2|block-bare-cd: refused=bare-cd|cd
 a scoped move says nothing|command|0|-|(cd /tmp && ls)
-a payload that is not JSON is refused unread|payload|2|block-bare-cd: payload=invalid-json|not JSON
+a payload that is not JSON is refused unread|payload|0|block-bare-cd: payload=invalid-json|not JSON
 "
 run_hook 'cd'
 assert_contains "$ERR_FILE" '(cd /path && command)' 'the refusal names the subshell rewrite'

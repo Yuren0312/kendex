@@ -58,6 +58,7 @@ run_payload() { # raw-json -> rc, stderr in ERR_FILE
 
 # The hook's dependency list, in the order it checks them: the shared table
 # pins it as the value of the world that has none of them.
+PAYLOAD_ADVISORY=1
 PAYLOAD_TOOLS=jq,cat
 
 # shellcheck source=lib/payload-rows.sh
@@ -107,17 +108,17 @@ first_table "\
 the verb the command spelled is the value|command|2|block-argv-kill: refused=pkill|pkill -f mutation-stability
 the other verb is a value of its own|command|2|block-argv-kill: refused=killall|killall node
 a command it read and allows says nothing|command|0|-|kill 1234
-an empty payload refuses rather than passing as an absent command|payload|2|block-argv-kill: payload=empty|-
-a whitespace-only payload refuses the same way|payload|2|block-argv-kill: payload=empty| \t
-a payload that is not JSON is refused unread|payload|2|block-argv-kill: payload=invalid-json|not JSON
+an empty payload refuses rather than passing as an absent command|payload|0|block-argv-kill: payload=empty|-
+a whitespace-only payload refuses the same way|payload|0|block-argv-kill: payload=empty| \t
+a payload that is not JSON is refused unread|payload|0|block-argv-kill: payload=invalid-json|not JSON
 "
 set +e
 "$BASH_BIN" "$HOOK" <"$TMP_ROOT" >/dev/null 2>"$ERR_FILE"
 rc=$?
 set -e
 assert_eq "rc=$rc first=$(first_line) cause=$(cause_below)" \
-  'rc=2 first=block-argv-kill: payload=unreadable cause=present' \
-  'a stdin that cannot be read refuses with the keyed line first and the cause under it'
+  'rc=0 first=block-argv-kill: payload=unreadable cause=present' \
+  'a stdin that cannot be read allows with the keyed line first and the cause under it'
 
 payload_table "$HOOK" 'pkill -f x' 'kill 1234'
 

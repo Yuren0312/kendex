@@ -3,9 +3,9 @@
 # name: command-safety
 # event: PreToolUse
 # matcher: Bash
-# description: On harnesses that execute hooks, refuse shell tool command text matching COMMAND_SAFETY_DENY_PATTERN from project settings. An absent setting applies the shipped host-safety pattern, which refuses a systemd-run memory cap measured in kilobytes or megabytes; an explicit `^$` turns matching off, while unreadable input or settings still refuse. Matching is textual, including quoted text, and does not inspect the desktop or running processes.
-# summary: Refuses shell commands matching a project's deny pattern, a kilobyte or megabyte systemd-run memory cap by default, and every command while its settings file cannot be read.
-# safety: When executed, blocks command text matching the project's policy, or the shipped default where the project sets none, before the shell tool runs. Unreadable input, missing settings support, unreadable project settings (even where the unreadable part is a key this hook does not read), and invalid or explicitly empty patterns refuse execution. Every refusal opens with `command-safety: <key>=<value>`; what a command this hook runs writes is captured at the site and replayed under that line, so nothing precedes the key.
+# description: On harnesses that execute hooks, refuse shell tool command text matching COMMAND_SAFETY_DENY_PATTERN from project settings. An absent setting applies the shipped host-safety pattern, which refuses a systemd-run memory cap measured in kilobytes or megabytes; an explicit `^$` turns matching off, while unreadable input or settings warn and allow the call. Matching is textual, including quoted text, and does not inspect the desktop or running processes.
+# summary: Refuses command text matching the project deny pattern or the default systemd-run memory-cap rule. Missing tools and unreadable input, settings or support warn once and allow the call.
+# safety: Matches raw command text and text with backslash-newline continuations joined, including quoted examples and comments. Actual policy matches refuse at exit 2. Missing tools, unreadable payload, installed support or project settings, and invalid or empty patterns produce one keyed warning and allow the call. The settings loader reads its whole table, so an unrelated malformed key also warns and allows. Every diagnostic starts with command-safety: <key>=<value>; captured support or command output follows that line.
 # timeout: 10
 # requires-skills: [commit-guards]
 # ---
@@ -24,6 +24,7 @@ set -euo pipefail
 # cannot carry a failure out: a write that fails there would leave with the
 # writer's status rather than the refusal's, which the harness runs past.
 refuse() { # KEY VALUE [CAUSE]
+  loading=""
   {
     printf 'command-safety: %s=%s\n' "$1" "$2"
     case "$1=$2" in
@@ -35,6 +36,7 @@ refuse() { # KEY VALUE [CAUSE]
         git=unreadable) echo "the Git working directory could not be resolved" ;;
       hook=unlocatable) echo "this hook's own directory could not be read, so its installed dependencies cannot be found" ;;
       settings=no-loader) echo "the command-safety bundle requires the installed commit-guards settings loader" ;;
+      support=unreadable) echo "the installed commit-guards support could not be loaded; repair that installation; its diagnostic follows" ;;
       settings=unreadable) echo "the project settings could not be read, so COMMAND_SAFETY_DENY_PATTERN is unknown; the loader's line below names what to fix" ;;
       settings=empty) echo "COMMAND_SAFETY_DENY_PATTERN must be configured" ;;
       settings=invalid-pattern) echo "COMMAND_SAFETY_DENY_PATTERN is not a readable POSIX ERE" ;;
@@ -49,21 +51,40 @@ refuse() { # KEY VALUE [CAUSE]
     # replayed here: under the keyed line, never ahead of it.
     [ -z "${3:-}" ] || printf '%s\n' "$3"
   } >&2 || :
-  exit 2
+  case "$1" in
+    refused | path) exit 2 ;;
+    *)
+      echo "Check skipped. Repair the hook installation, tools or payload adapter; retry the command." >&2
+      exit 0 ;;
+  esac
 }
 # An exit that is neither a verdict (0) nor a refusal (2) is a check that did
-# not complete, and it leaves as a refusal. The EXIT trap is what reaches every
+# not complete, and it leaves with a warning. The EXIT trap is what reaches every
 # such exit on Bash 3.2 too: an ERR trap inherited through `set -E` fires there
 # inside a command substitution even when the substitution stands on the left
 # of `||`, which reads the settings loader's guarded probes as failures.
-trap 'rc=$?; case $rc in 0 | 2) ;; *) refuse exit "$rc" ;; esac' EXIT
+# Support can explicitly exit with a guard's verdict status. While sourcing,
+# that status is a support failure, not an executable-command refusal.
+loading=""
+trap '
+  rc=$?
+  if [ -n "$loading" ]; then
+    cause=$loading
+    while IFS= read -r detail <&5 || [ -n "$detail" ]; do
+      cause="$cause
+  $detail"
+    done
+    refuse support unreadable "$cause" 2>&3
+  fi
+  case $rc in 0 | 2) ;; *) refuse exit "$rc" ;; esac
+' EXIT
 MISSING=""
-for dependency in jq git grep cat dirname; do
+for dependency in jq git grep cat dirname mktemp rm; do
   command -v "$dependency" >/dev/null 2>&1 || MISSING="$MISSING,$dependency"
 done
 [ -z "$MISSING" ] || refuse missing-tools "${MISSING#,}"
 input="$(cat 2>&1)" || refuse payload unreadable "$input"
-fields="$(jq -r '
+fields="$(jq -er '
   def command_arg:
     if type == "object" then (.command // .cmd)
     elif type == "string" then
@@ -124,8 +145,7 @@ levels=0
 # above hooks. A wider walk can reach executable files outside the install.
 while [ "$levels" -lt 3 ] && [ "$at" != "$root" ] && [ "$at" != / ]; do
   candidate="$at/skills/commit-guards/scripts/lib"
-  if [ -e "$candidate/common.sh" ] || [ -L "$candidate/common.sh" ] \
-    || [ -e "$candidate/settings.sh" ] || [ -L "$candidate/settings.sh" ]; then
+  if [ -f "$candidate/common.sh" ] && [ -f "$candidate/settings.sh" ]; then
     lib="$candidate"
     break
   fi
@@ -134,16 +154,33 @@ while [ "$levels" -lt 3 ] && [ "$at" != "$root" ] && [ "$at" != / ]; do
   levels=$((levels + 1))
 done
 if [ -z "$lib" ]; then
+  # Choose the shared scope once. A global hook can use HOME's installed
+  # dependency, but cannot source a project selected by the payload.
   case "$hook_dir" in
     "$root"/*) lib="$root/.agents/skills/commit-guards/scripts/lib" ;;
+    *) lib="${HOME:+$HOME/.agents/skills/commit-guards/scripts/lib}" ;;
   esac
 fi
 [ -f "$lib/common.sh" ] && [ -f "$lib/settings.sh" ] || refuse settings no-loader
 GG_CHECK=command-safety
+# Keep nested support reads under errexit. A source on the left of || would
+# continue past a failed nested import. EXIT owns the advisory outcome, and
+# its saved stderr survives the source command's diagnostic redirection.
+exec 3>&2
+# Capture installed support's stderr in an owned file. Open separate write and
+# read descriptions before unlinking it; EXIT can read from the beginning even
+# while source's stderr redirection remains active. Process exit owns teardown.
+support_capture=$(mktemp 2>&1) || refuse support unreadable "$support_capture"
+exec 4>"$support_capture" 5<"$support_capture"
+capture_err=$(rm -- "$support_capture" 2>&1) || refuse support unreadable "$capture_err"
+loading="$lib/common.sh"
 # shellcheck source=../skills/commit-guards/scripts/lib/common.sh
-source "$lib/common.sh"
+source "$lib/common.sh" 2>&4
+loading="$lib/settings.sh"
 # shellcheck source=../skills/commit-guards/scripts/lib/settings.sh
-source "$lib/settings.sh"
+source "$lib/settings.sh" 2>&4
+loading=""
+exec 3>&- 4>&- 5<&-
 # cd runs twice on purpose: a substitution cannot move this shell, so the
 # probe is what carries the cause into the refusal and the second one is the
 # move. The second failure is unreachable in practice — the probe just
@@ -156,11 +193,8 @@ cd -- "$root" || refuse cwd "$root"
 # failure the substitution holds the loader's keyed line — for a value in
 # another shape, the file, the line and the key — and a successful read is
 # silent, so the pattern is not mixed with a diagnostic.
-# A malformed value on a key this hook never reads still refuses: the loader
-# judges the [env] table whole, as every kendex settings reader does, so a
-# policy read past the bad line would come from a file the rest of the
-# toolchain rejects. The replayed line names what to fix, so the caller can
-# clear the refusal.
+# A failed whole-table settings read warns; the shell call remains available
+# so the operator can repair that file.
 # The default is the host-safety rule every install gets: a systemd-run memory
 # cap in K or M starved a build's cgroup into a kernel allocation failure that
 # left a host's root volume read-only. skills/commit-guards'

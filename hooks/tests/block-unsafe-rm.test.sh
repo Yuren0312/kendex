@@ -58,6 +58,7 @@ run_payload() { # raw-json -> rc, stderr in ERR_FILE
 
 # The hook's dependency list, in the order it checks them: the shared table
 # pins it as the value of the world that has none of them.
+PAYLOAD_ADVISORY=1
 PAYLOAD_TOOLS=jq,cat
 
 # shellcheck source=lib/payload-rows.sh
@@ -261,12 +262,14 @@ first_table "\
 the refused shape is the value|command|2|block-unsafe-rm: refused=recursive-rm|rm -rf \$CACHE/\$KEY
 a variable root before flags reaches the same value|command|2|block-unsafe-rm: refused=recursive-rm|rm \$DIR/sub -rf
 an operand that cannot collapse says nothing|command|0|-|rm -rf -- \"\${P:?}/save\"
-a payload that is not JSON is refused unread|payload|2|block-unsafe-rm: payload=invalid-json|not JSON
+a payload that is not JSON is refused unread|payload|0|block-unsafe-rm: payload=invalid-json|not JSON
 "
 run_hook 'rm -rf $CACHE/$KEY'
 assert_contains "$ERR_FILE" 'rm -- "${NAME:?}/file"' 'the guarded rewrite adds no delete flags'
 assert_contains "$ERR_FILE" 'rm -- /absolute/literal/path' 'the literal rewrite adds no delete flags'
 assert_contains "$ERR_FILE" 'rm -rf $CACHE/$KEY' 'the refusal quotes the command it judged'
+
+first_table 'reported-adjacent-redirection|command|2|block-unsafe-rm: refused=shared-root|rm>/dev/null -rf "$HOME"'
 
 payload_table "$HOOK" 'rm -rf $X/sub' 'rm -rf -- "${X:?}/sub"'
 
