@@ -11,12 +11,14 @@
 # --interval. A check that finds an event records it and the pass runs on to
 # the next check, so no kind starves another: a reducer line on every pass or
 # a lane parked on its limit banner would otherwise be the only thing the watch
-# ever said. The block carries the latest pr-watch context once. Live tracker and pane reads remain
+# ever said. Events carry only reducer lines whose keys rose; the heartbeat
+# carries the full pr-watch context. Live tracker and pane reads remain
 # authoritative; persisted state holds only edge keys. Usage, event details,
 # configuration, and failure contracts live in usage(), which lib/oversee-watch-text.sh
 # holds beside the message catalog.
 # Stdout is the overseer protocol: the EVENT records documented in usage(),
-# their record or pane payloads, and the optional `pr-watch rc=N` context block.
+# their record or pane payloads, and at heartbeat the optional `pr-watch rc=N`
+# context block.
 # Consumers handle every EVENT in order. Those records are not prose messages.
 
 set -euo pipefail
@@ -4390,6 +4392,7 @@ check_report() {
 OWED_PR_LIMIT=1000
 OWED_LINES=""
 VERIFYING_LINES=""
+VERIFYING_EVENT_LINES=""
 # The heartbeat's own caches: one listing per host, one verdict per host,
 # harness and model, and the answers owed_accounts and owed_wall hand back.
 OWED_ACCOUNTS=""
@@ -4399,6 +4402,7 @@ OWED_VERDICT=""
 owed_read() {
   OWED_LINES=""
   VERIFYING_LINES=""
+  VERIFYING_EVENT_LINES=""
   [[ -n "$STATE_FILE" ]] || return 0
   local errf="$WORK_DIR/owed.err" out items rows rc=0 n
   local id state priority lane host harness model delivery key verdict line asked answer
@@ -4517,7 +4521,7 @@ owed_accounts() { # HOST
 # lane filtering. Deadlines remain per box in the issue description.
 verifying_read() { # SAFE_ITEMS
   local lib="$SKILLS_DIR/linear/scripts/lib/issue-validation.sh"
-  local rows row id boxes merged merged_repos repo lines due prior key rc
+  local rows row id boxes merged merged_repos repo lines due prior key selected rc
   local state="${PW_SEEN[0]}" errf="$WORK_DIR/verifying.err"
   rows="$(jq -c '.[] | select(.state == "verifying")' <<<"$1")" \
     || die tracker-list-invalid "" "team=$LINEAR_TEAM"
@@ -4563,17 +4567,34 @@ verifying_read() { # SAFE_ITEMS
     VERIFYING_LINES+="$lines"$'\n'
     due="$(jq -r '.[] | select(.status == "due" or .status == "overdue")
       | "box=\(.number) trigger=\(.trigger | tojson) status=\(.status) deadline=\(.deadline)"' <<<"$boxes")" || die verifying-invalid "" "issue=$id"
-    [[ -n "$due" ]] || continue
+    # The existing row also records a valid read with no due boxes. This
+    # distinguishes first-read completion from an unchanged empty due set.
+    key="${due//$'\n'/|}"
+    [[ -n "$key" ]] || key=-
+    [[ "$lines" != "verifying $id boxes=0" ]] || key=boxes=0
     prior="$(lane_row_get verifying-deadline "${PW_SEEN[0]}" "$id")" \
       || die state-read-failed "" "row=verifying-deadline" "issue=$id"
-    state="$(lane_row_set verifying-deadline "$state" "$id" "${due//$'\n'/|}")"
-    [[ "$prior" != "${due//$'\n'/|}" ]] || continue
+    state="$(lane_row_set verifying-deadline "$state" "$id" "$key")"
+    [[ "$prior" != "$key" ]] || continue
+    if [[ "$key" == boxes=0 ]]; then
+      VERIFYING_EVENT_LINES+="$lines"$'\n'
+      echo "EVENT verifying-deadline $id boxes=0"
+      PASS_EVENT=1
+    fi
+    [[ -n "$due" ]] || continue
     while IFS= read -r row; do
+      # The saved row already holds each due box key. A changed sibling must
+      # not repeat this box's instructions before the full heartbeat.
+      [[ "|$prior|" != *"|$row|"* ]] || continue
+      selected="$(awk -v box="${row%% *}" '$3 == box' <<<"$lines")" \
+        || die verifying-invalid "" "issue=$id"
+      VERIFYING_EVENT_LINES+="$selected"$'\n'
       echo "EVENT verifying-deadline $id $row"
+      PASS_EVENT=1
     done <<<"$due"
-    PASS_EVENT=1
   done <<<"$rows"
   VERIFYING_LINES="${VERIFYING_LINES%$'\n'}"
+  VERIFYING_EVENT_LINES="${VERIFYING_EVENT_LINES%$'\n'}"
   lane_row_commit "$state"
 }
 
@@ -4675,8 +4696,8 @@ heartbeat() {
 # sets for this process belongs there. The baselines it committed are what the
 # next long pass reads, never this process's copy of them.
 LONG_PASSES=0
-LONG_RETURNS=(LONG_EVENT LONG_FAILED OWNER_TRACKER_DELIVERED OVERSEER_SUCCEEDED OVERSEER_STOP PW_PASSES PW_RC PW_EVENT
-  PW_OUT PW_ERR LANE_PROBE_NOTED OVERSEER_NOTED ACCOUNT_ROSTER ACCOUNT_ROSTER_RC OWED_LINES VERIFYING_LINES)
+LONG_RETURNS=(LONG_EVENT LONG_FAILED OWNER_TRACKER_DELIVERED OVERSEER_SUCCEEDED OVERSEER_STOP PW_PASSES PW_RC
+  PW_OUT PW_ERR LANE_PROBE_NOTED OVERSEER_NOTED ACCOUNT_ROSTER ACCOUNT_ROSTER_RC OWED_LINES VERIFYING_LINES VERIFYING_EVENT_LINES)
 long_pass() {
   local i state_file
   PASS_EVENT=0
@@ -4883,8 +4904,8 @@ mail_turn() { # [overseer]
 # row exists without the clock that earned it.
 PASS_NOW=""
 # Set by any check that printed an event this run, mail or long. Every check
-# runs on either way; the run ends once, with the pr-watch context closing the
-# block, when no long pass is left in flight.
+# runs on either way; the run ends once when no long pass is left in flight.
+# The full pr-watch context prints only at heartbeat.
 PASS_EVENT=0
 PASS_FAILED=0
 PASS_FAILED_ITEMS=""
@@ -4929,13 +4950,15 @@ run_end() {
     PASS_NOW="$(date -u +%s)" || die time-failed "" "clock=UTC"
     mail_turn
   fi
+  if [[ "$PASS_EVENT" -eq 1 || "$PASS_FAILED" -eq 1 ]]; then
+    # The deadline rows already advanced. A failed pass must deliver their
+    # selected instructions too, or later event passes would omit them.
+    [[ -z "$VERIFYING_EVENT_LINES" ]] || printf '%s\n' "$VERIFYING_EVENT_LINES"
+  fi
   if [[ "$PASS_FAILED" -eq 1 ]]; then
-    pr_watch_context
     exit 2
   fi
   if [[ "$PASS_EVENT" -eq 1 ]]; then
-    [[ -z "$VERIFYING_LINES" ]] || printf '%s\n' "$VERIFYING_LINES"
-    pr_watch_context
     exit 0
   fi
   [[ "$LONG_PASSES" -lt "$MAX_LOOPS" ]] || heartbeat
