@@ -170,12 +170,14 @@ Overseer side:
               reads no cursor, since no directive is printed, so a cursor
               read that missed refuses neither
   events --item ITEM [--box to-lane|to-overseer [--after N]]
-              print every envelope of both files, to-overseer.jsonl then
+              print public envelopes of both files, to-overseer.jsonl then
               to-lane.jsonl, each with `box` naming the file it came from,
               `line` its logical line number and `count` that file's logical
               line count, including lines filtered as invalid JSON,
               and `mail_class` on to-lane records from the shared mailbox rule,
-              answered asks and their answers included. With --box, read
+              answered asks and their answers included. Without --box, hold
+              an owner ask whose tracker outcome is pending for up to 300
+              seconds from its `at`. With --box, read
               that file alone: print its header (below), then its envelopes
               whose `line` is past --after N (0 when not given), in file
               order. Logical numbers survive compaction, so a watcher keeps
@@ -391,6 +393,7 @@ delivery_id), thread_ts and parent (threaded owner directives only),
 closes (false on new owner answers; absent on legacy closing answers),
 draft (a draft ask only: recipient, medium, text and text_hash),
 reserved (true on a reserved ask only), issue (a configured item ask),
+tracker_pending (true on the immutable ask while its tracker outcome is missing),
 tracker_posted (a boolean projected by mailbox reads after the complete tracker
 question is confirmed), tracker_label (the confirmed label used for close
 when settings change or cannot be read),
@@ -403,11 +406,16 @@ verb writes the item, a send into the overseer's own mailbox and a `resolve
 --default` included, writes `overseer:<repository>`. The repository is the `[marketplace]` name in the
 caller's kendex.toml, else the last segment of its origin URL, else the
 checkout's own directory name.
-A private tracker-posted record confirms an immutable ask by its re and issue.
-Reads fold it into that ask before cursor filtering and never emit it as an
+A private tracker-posted or tracker-failed record carries an immutable ask's
+outcome by its re and issue. Failure records carry the failed operation in cause.
+Reads fold the outcome into that ask and clear tracker_pending before cursor filtering. They never emit it as an
 ordinary event. Line counts include it. Without confirmation, an item ask
 keeps the full chat presentation and chat deadline route. Closure still uses
 its issue to clean up partial tracker writes.
+Full event snapshots, including the Slack relay's imported mailbox reader,
+hold pending tracker asks for 300 seconds from at. An outcome releases the ask.
+At that bound, a missing outcome releases the full question. Cursored events,
+pending and drain still include pending asks, so their cursors cannot lose a later outcome.
 Reads of legacy closing answers warn `lane-mail: legacy-close=<id>` on stderr.
 The old format remains readable through kendex 1.4.
 
@@ -1383,22 +1391,30 @@ lm_header() { # FILE
 # parse is dropped here and counted above. Events name BOX to carry logical
 # line numbers before that filtering, aligned with the Jarvis session's seen count.
 lm_objects() { # FILE [BOX [AFTER]]
-  local count=0 numbers=/dev/null
+  local count=0 numbers=/dev/null snapshot=false now=0
   [ "$ITEM" != overseer ] || mailbox_warn_legacy "$1" || return 2
   if [ -n "${2:-}${3:-}" ]; then
     count="$(lm_count "$1")" || return 1
     numbers="$1.index"
   fi
+  if [ "$VERB" = events ] && [ -z "${3:-}" ]; then
+    snapshot=true
+    now="$(date -u +%s)" || return 1
+  fi
   # Posting is confirmed after the immutable ask. Fold that evidence before
   # cursor selection, while keeping the ask's original logical position.
   jq -c -R -n --arg box "${2:-}" --arg after "${3:-}" --argjson count "$count" \
-    --slurpfile numbers "$numbers" "$MAILBOX_CLASS_JQ$OWNER_TRACKER_JQ"'
+    --argjson snapshot "$snapshot" --argjson now "$now" \
+    --slurpfile numbers "$numbers" "$MAILBOX_TIME_JQ$MAILBOX_CLASS_JQ$OWNER_TRACKER_JQ"'
     [inputs | input_line_number as $physical | (fromjson? // empty) | objects
       | {physical: $physical, envelope: .}] as $rows
-    | [$rows[].envelope | select(.kind == "tracker-posted")] as $posted
+    | [$rows[].envelope | select(.kind == "tracker-posted" or .kind == "tracker-failed")] as $posted
     | $rows[] | .physical as $physical | .envelope
-    | select(.kind != "tracker-posted")
+    | owner_tracker_public
     | owner_tracker_record($posted)
+    # Snapshot consumers reread every ask; cursor consumers must retain pending
+    # asks at their original line. The bound releases interrupted tracker writes.
+    | if $snapshot then owner_tracker_snapshot($now) else . end
     | select($after == "" or $numbers[$physical - 1] > ($after | tonumber))
     | if $box == "" then . else . + {box: $box, line: $numbers[$physical - 1], count: $count}
         + (if $box == "to-lane" then {mail_class: overseer_mail_class} else {} end)
@@ -2102,6 +2118,9 @@ case "$VERB" in
       fi
     fi
     LINE="$(lm_envelope "$VERB")"
+    if [ "$OWNER_TRACKER_ACTIVE" -eq 1 ]; then
+      LINE="$(jq -c '.tracker_pending = true' <<<"$LINE")" || refuse write-failed "$TO_OVERSEER"
+    fi
     [ "$VERB" != notice ] || lm_receipt_fields "$LINE"
     # An owner notice is judged on its text for a day, under the lock after
     # the minute check, so a retry inside the minute keeps its `duplicate`.
@@ -2114,12 +2133,17 @@ case "$VERB" in
       lm_append_local "$TO_OVERSEER" "$LINE"
     fi
     if [ "$OWNER_TRACKER_ACTIVE" -eq 1 ]; then
-      owner_tracker_ask "$SCRIPT_DIR/../../linear/scripts/linear.sh" "$LINE" "$WORK_DIR"
+      if ! owner_tracker_ask "$SCRIPT_DIR/../../linear/scripts/linear.sh" "$LINE" "$WORK_DIR"; then
+        owner_tracker_unwritten "$ISSUE" "$OWNER_TRACKER_CAUSE"
+      fi
       if [ "$OWNER_TRACKER_POSTED" -eq 1 ]; then
         POSTED_LINE="$(jq -c --arg label "$OWNER_TRACKER_LABEL" '{id: (.id + "-tracker"), kind: "tracker-posted", at, from,
           re: .id, issue, tracker_label: $label, text: ""}' <<<"$LINE")" || refuse write-failed "$TO_OVERSEER"
-        lm_append_local "$TO_OVERSEER" "$POSTED_LINE"
+      else
+        POSTED_LINE="$(jq -c --arg cause "$OWNER_TRACKER_CAUSE" '{id: (.id + "-tracker"), kind: "tracker-failed", at, from,
+          re: .id, issue, cause: $cause, text: ""}' <<<"$LINE")" || refuse write-failed "$TO_OVERSEER"
       fi
+      lm_append_local "$TO_OVERSEER" "$POSTED_LINE"
     fi
     if [ "$VERB" = ask ]; then
       printf 'id=%s\n' "$(cat -- "$WORK_DIR/id")"
