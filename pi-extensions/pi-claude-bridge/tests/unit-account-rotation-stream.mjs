@@ -5,7 +5,7 @@ import { waitFor } from "./lib/wait-for.mjs";
 import "./lib/debug-env.mjs";
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -19,13 +19,16 @@ import {
 import * as piAi from "@earendil-works/pi-ai";
 import { buildModels } from "../src/models.ts";
 import { resolveGetModels } from "../src/pi-ai-compat.ts";
+import { DEBUG_LOG_PATH } from "../src/debug.ts";
 import { buildNativeProvider } from "../src/native-provider.ts";
 import { RATE_LIMIT_TOKEN } from "../src/rate-limit.ts";
 import { setExtensionApi } from "../src/bridge-state.ts";
 import { CLAUDE_ACCOUNT_ROUTER_SYMBOL } from "../src/account-router.ts";
 import { setConnectorCallAuditSink } from "../src/connector-audit.ts";
-import { ctx, resetStack } from "../src/query-state.ts";
+import { ctx, deleteQueryLane, resetStack } from "../src/query-state.ts";
 import { runInRequestLane } from "../src/request-lane.ts";
+import { assertSourceControl } from "./lib/source-control.mjs";
+import { piContext } from "./lib/transcript.mjs";
 
 const model = {
 	id: "claude-haiku-4-5",
@@ -39,7 +42,10 @@ const model = {
 	contextWindow: 200000,
 	maxTokens: 8192,
 };
-const context = { messages: [{ role: "user", content: "hello", timestamp: Date.now() }] };
+const context = piContext({
+	messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
+	tools: [{ name: "echo", description: "Return a supplied value", parameters: { type: "object", properties: { value: { type: "string" } } } }],
+});
 
 
 function makeRouter(observed, options = {}) {
@@ -640,15 +646,14 @@ describe("managed account stream rotation", () => {
 
 		const events = await collect(streamClaudeAgentSdk(fableModel, context, { sessionId: "fable-spent" }));
 		assert.equal(queryOptions.model, "claude-opus-5");
-		assert.equal(queryOptions.fallbackModel, "claude-opus-4-8");
+		assert.equal(Object.hasOwn(queryOptions, "fallbackModel"), false);
 		assert.equal(queryOptions.env.CLAUDE_CONFIG_DIR, "/profiles/b");
 		assert.ok(textEvents(events).includes("opus-after-fable"));
 	});
 
 	it("selects registered Fable 5.1 without skipping another managed account", async () => {
 		const observed = observedState();
-		const getModels = await resolveGetModels(piAi);
-		const provider = buildNativeProvider(piAi, buildModels(getModels("anthropic")), streamClaudeAgentSdk);
+		const provider = buildNativeProvider(piAi, buildModels([{ ...model, id: "claude-fable-5-1", name: "Claude Fable 5.1" }]), streamClaudeAgentSdk);
 		const fableModel = provider.getModels()[0];
 		assert.equal(fableModel.name, "Claude Fable 5.1");
 		globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL] = makeRouter(observed);
@@ -665,6 +670,115 @@ describe("managed account stream rotation", () => {
 		assert.equal(queryOptions.model, "claude-fable-5-1");
 		assert.equal(queryOptions.fallbackModel, undefined);
 	});
+
+	it("passes an unknown model unchanged with one warning per session", async () => {
+		const unknownModel = { ...model, id: "claude-fixture-99" };
+		const logStart = existsSync(DEBUG_LOG_PATH) ? readFileSync(DEBUG_LOG_PATH, "utf8").length : 0;
+		const resolutionIds = () => [...readFileSync(DEBUG_LOG_PATH, "utf8").slice(logStart).matchAll(/\] model-resolution: unknown=([^\n]+)\n/g)].map((match) => match[1]);
+		const options = [];
+		__testSetSdkQueryFactory((input) => {
+			options.push(input.options);
+			return fakeSdkQuery([
+				{ type: "system", subtype: "init", session_id: "unknown-session" },
+				{ type: "result", subtype: "success", result: "unknown-model-answer" },
+			], "a", observedState());
+		});
+		for (const sessionId of ["unknown-a", "unknown-a", "unknown-b"]) {
+			await collect(streamClaudeAgentSdk(unknownModel, context, { sessionId }));
+		}
+		assert.deepEqual(options.map((option) => option.model), ["claude-fixture-99", "claude-fixture-99", "claude-fixture-99"]);
+		assert.equal(options.every((option) => !Object.hasOwn(option, "fallbackModel")), true);
+		assert.deepEqual(notifications.map((notice) => notice.level), ["warning", "warning"]);
+		assert.deepEqual(resolutionIds(), [unknownModel.id, unknownModel.id]);
+		for (const notice of notifications) {
+			assert.equal(notice.message.includes("model-resolution:"), false);
+			assert.equal(notice.message.includes("\n"), false);
+		}
+		deleteQueryLane("unknown-a");
+		await collect(streamClaudeAgentSdk(unknownModel, context, { sessionId: "unknown-a" }));
+		assert.deepEqual(notifications.map((notice) => notice.level), ["warning", "warning", "warning"]);
+		assert.deepEqual(resolutionIds(), [unknownModel.id, unknownModel.id, unknownModel.id]);
+	});
+
+	it("announces a safety fallback reported by Claude Code", async () => {
+		__testSetSdkQueryFactory(() => fakeSdkQuery([
+			{ type: "system", subtype: "init", session_id: "native-fallback-session" },
+			{ type: "system", subtype: "model_refusal_fallback", original_model: model.id, fallback_model: "claude-fixture-98" },
+			{ type: "result", subtype: "success", result: "native-fallback-answer" },
+		], "a", observedState()));
+		const events = await collect(streamClaudeAgentSdk(model, context, { sessionId: "native-fallback" }));
+		assert.equal(events.find((event) => event.type === "done")?.message.model, "claude-fixture-98");
+		assert.deepEqual(notifications.map((notice) => notice.level), ["info"]);
+	});
+
+	it("uses registry labels for native fallback IDs and preserves unknown IDs", async () => {
+		const registry = (await resolveGetModels(piAi))("anthropic");
+		const known = registry.filter((entry) => entry.name !== entry.id).slice(0, 2);
+		assert.equal(known.length, 2);
+		const unknown = { id: "claude-fixture-98", name: "claude-fixture-98" };
+		for (const [original, fallback] of [[known[0], known[1]], [known[0], unknown], [unknown, known[1]], [unknown, unknown]]) {
+			__testSetSdkQueryFactory(() => fakeSdkQuery([
+				{ type: "system", subtype: "init", session_id: "registry-fallback-session" },
+				{ type: "system", subtype: "model_refusal_fallback", original_model: original.id, fallback_model: fallback.id },
+				{ type: "result", subtype: "success", result: "native-fallback-answer" },
+			], "a", observedState()));
+			notifications.length = 0;
+			const events = await collect(streamClaudeAgentSdk({ ...model, id: known[0].id, name: known[0].name }, context, { sessionId: "registry-fallback" }));
+			assert.equal(events.find((event) => event.type === "done")?.message.model, fallback.id);
+			assert.deepEqual(notifications.map((notice) => notice.level), ["info"]);
+			const { message } = notifications[0];
+			for (const entry of [original, fallback]) {
+				assert.equal(message.includes(entry.name), true);
+				if (entry.name !== entry.id) assert.equal(message.includes(entry.id), false);
+			}
+		}
+	});
+
+	const noticeControls = [
+		{
+			name: "rejects missing unknown-model debug details",
+			source: "src/index.ts",
+			before: 'debug(`model-resolution: unknown=${queryModel.id}`);',
+			after: 'if (false) debug(`model-resolution: unknown=${queryModel.id}`);',
+			pattern: "passes an unknown model unchanged",
+			failure: /(?:not ok|✖) .*passes an unknown model unchanged/,
+		},
+		{
+			name: "rejects machine-format unknown-model toast details",
+			source: "src/index.ts",
+			before: 'safeNotify(`Pi Claude uses ${queryModel.id} as requested. Claude Code chooses its fallback.`, "warning");',
+			after: 'safeNotify(`model-resolution: unknown=${queryModel.id}\\nPi Claude uses this model as requested.`, "warning");',
+			pattern: "passes an unknown model unchanged",
+			failure: /(?:not ok|✖) .*passes an unknown model unchanged/,
+		},
+		{
+			name: "rejects repeated unknown-model warnings",
+			source: "src/query-state.ts",
+			before: "if (state.reportedUnknownModel) return false;",
+			after: "if (state.reportedUnknownModel) return true;",
+			pattern: "passes an unknown model unchanged",
+			failure: /(?:not ok|✖) .*passes an unknown model unchanged/,
+		},
+		{
+			name: "rejects raw known model IDs in native fallback notices",
+			source: "src/consume-query.ts",
+			before: '${modelDisplayName(originalModel)} to ${modelDisplayName(fallbackModel)}',
+			after: '${originalModel} to ${fallbackModel}',
+			pattern: "uses registry labels for native fallback IDs",
+			failure: /(?:not ok|✖) .*uses registry labels for native fallback IDs/,
+		},
+		{
+			name: "rejects a suppressed native safety-fallback notice",
+			source: "src/consume-query.ts",
+			before: 'if (typeof fallbackModel === "string" && typeof originalModel === "string") {',
+			after: 'if (typeof fallbackModel === "number" && typeof originalModel === "string") {',
+			pattern: "announces a safety fallback reported",
+			failure: /(?:not ok|✖) .*announces a safety fallback reported/,
+		},
+	];
+	for (const { name, ...control } of noticeControls) {
+		it(name, () => assertSourceControl({ ...control, suite: "unit-account-rotation-stream.mjs" }));
+	}
 
 	it("surfaces an unavailable pool without starting Claude Code", async () => {
 		const observed = observedState();
@@ -842,7 +956,7 @@ describe("stream-independent metadata capture (C3)", () => {
 		__testSetSdkQueryFactory(() => fakeSdkQuery([
 			{ type: "system", subtype: "init", session_id: "session-a" },
 			{ type: "stream_event", event: { type: "message_start", message: { id: "m1", model: model.id, usage: { input_tokens: 1 } } } },
-			{ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "call-1", name: "mytool", input: {} } } },
+			{ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "call-1", name: "mcp__custom-tools__echo", input: {} } } },
 			{ type: "stream_event", event: { type: "content_block_stop", index: 0 } },
 			{ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 5 } } },
 			{ type: "stream_event", event: { type: "message_stop" } },
@@ -868,7 +982,7 @@ describe("stream-independent metadata capture (C3)", () => {
 				// Child-executed connector call (not mirrored, does not end the turn)…
 				{ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "conn-1", name: "mcp__claude_ai_Gmail__search_threads", input: {} } } },
 				// …then a Pi tool call that DOES end the Pi turn.
-				{ type: "stream_event", event: { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "call-1", name: "mytool", input: {} } } },
+				{ type: "stream_event", event: { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "call-1", name: "mcp__custom-tools__echo", input: {} } } },
 				{ type: "stream_event", event: { type: "content_block_stop", index: 1 } },
 				{ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 5 } } },
 				{ type: "stream_event", event: { type: "message_stop" } },

@@ -2,6 +2,14 @@
 
 ## Consumer-impacting changes
 
+### Unreleased
+
+- **Breaking:** The model menu offers Pi's Anthropic registry entries at run time. A model absent from that registry no longer appears in the menu. A saved `pi-claude` selection absent from the registry uses Pi's initial model with Pi's fallback message. Claude Code chooses the safety fallback. New registry entries need no bridge release. An unknown model request handed to the bridge keeps its ID and shows one notice per session.
+
+  You do: Select a `pi-claude` model from Pi's model menu if your saved model is absent from the list.
+
+- Safety fallback notices use registry display names when available. Unknown model notices show one plain line. Model resolution details go to the debug log.
+
 ### 4.2.0
 
 - A managed Claude profile keeps `CLAUDE_CODE_OAUTH_TOKEN` when its config directory matches the launch account, including the default account. Other profiles discard the inherited token. Without a token, the child uses the profile folder login.

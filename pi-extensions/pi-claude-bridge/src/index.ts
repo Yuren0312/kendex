@@ -4,17 +4,16 @@ import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createSdkMcpServer, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
 import { PROVIDER_ID, messageContentToText } from "./convert.js";
-import { buildModels, modelDisplayName } from "./models.js";
+import { MODELS, modelDisplayName } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX } from "./skills.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
-import { QueryContext, ctx, deleteQueryLane, drainPendingToolCalls, drainStrandedToolCalls, popContext, stackDepth, pushContext, failedTurnOutput, summarizeDroppedUserMessages, takeQueuedOrParkedResult, toolCallDrainCause, type DeferredUserMessage, type QueryRestartRequest } from "./query-state.js";
+import { QueryContext, ctx, deleteQueryLane, drainPendingToolCalls, drainStrandedToolCalls, popContext, stackDepth, pushContext, failedTurnOutput, summarizeDroppedUserMessages, takeQueuedOrParkedResult, takeUnknownModelNotice, toolCallDrainCause, type DeferredUserMessage, type QueryRestartRequest } from "./query-state.js";
 import { abortSdkQuery, closeSdkQuery, teardownQuery } from "./query-teardown.js";
 import { loadConfig, recordProjectTrust, registerExternalConfigResolver } from "./config.js";
 import { installSettingsCacheRefresh } from "./package-config.js";
 import { hasClaudeCredentials } from "./auth-presence.js";
 import { NATIVE_PROVIDER_UNSUPPORTED_MESSAGE, buildNativeProvider, supportsNativeProvider } from "./native-provider.js";
 import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
-import { resolveGetModels } from "./pi-ai-compat.js";
 // Re-exported from the extension entry point ON PURPOSE. Consuming apps
 // regenerate their vendored package.json with a CLOSED exports map
 // ({".": "./bundle/index.js"}), which makes Node reject BOTH a subpath import
@@ -103,7 +102,6 @@ export {
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
-const getModels = await resolveGetModels(_piAi) as (provider: string) => Array<Model<any>>;
 const newAssistantMessageEventStream: () => AssistantMessageEventStream =
 	typeof _piAi.createAssistantMessageEventStream === "function"
 		? _piAi.createAssistantMessageEventStream
@@ -177,11 +175,6 @@ type BridgeStreamOptions = SimpleStreamOptions & {
 	[ROTATION_STATE_KEY]?: RotationRequestState;
 	[HISTORY_RESTART_KEY]?: HistoryRestartState;
 };
-
-// MODELS is buildModels(getModels("anthropic")) — projection kept in models.js.
-const MODELS = buildModels(getModels("anthropic"));
-
-
 
 // Pi doesn't pass tool results directly — it appends them to the context and calls
 // the provider again. Thin wrapper over extract-tool-results.js that adds per-turn
@@ -1032,6 +1025,10 @@ function streamClaudeAgentSdkInLane(model: Model<any>, context: Context, options
 	const queryModel = account?.modelId && account.modelId !== model.id
 		? { ...model, id: account.modelId, name: modelDisplayName(account.modelId) }
 		: model;
+	if (!MODELS.some((entry) => entry.id === queryModel.id) && takeUnknownModelNotice()) {
+		debug(`model-resolution: unknown=${queryModel.id}`);
+		safeNotify(`Pi Claude uses ${queryModel.id} as requested. Claude Code chooses its fallback.`, "warning");
+	}
 	if (queryModel.id !== model.id) {
 		// Stamp the output model on EVERY attempt (each retry resets turn state),
 		// but toast each distinct model at most once per request: with up to 16
@@ -1146,7 +1143,6 @@ function streamClaudeAgentSdkInLane(model: Model<any>, context: Context, options
 	// connector, prompt-append, setting-source, effort, and env rationale.
 	const built = buildClaudeQueryOptions({
 		cwd,
-		requestedModel: model,
 		queryModel,
 		account,
 		bridgeConfig,
@@ -1164,7 +1160,7 @@ function streamClaudeAgentSdkInLane(model: Model<any>, context: Context, options
 	debug("provider: fresh query",
 		`model=${queryModel.id} requested=${model.id} msgs=${context.messages.length} tools=${mcpTools.length}`,
 		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${built.effort ?? "default"} account=${account?.label ?? "legacy"}`,
-		`fallback=${built.fallbackModel ?? "none"}`,
+		"fallback=harness-default",
 		() => `appendSys=${built.appendSystemPrompt} promptCtx=${built.promptContextLabels.join(",") || "none"} strictMcp=${built.strictMcpConfigEnabled} fastMode=${providerSettings.fastMode === true} connectors=${built.enableCloudMcp}`,
 		`claudeExec=${claudeExecutablePreflight ? `${claudeExecutablePreflight.fileType}:${claudeExecutablePreflight.path}` : "sdk-default"}`,
 		`prompt ${describePrompt(promptText, promptBlocks)}`);
