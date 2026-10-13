@@ -329,7 +329,7 @@ assert_eq "$(provider_calls)" "$((calls + 1))" 'a retirement date that arrives a
 # argv: `check` takes one directory, and --harness names the record's harness.
 # The state dir is named apart from every mutant, which mutant_scripts clears.
 READER_DISPATCH='[[ -n "$LANE_ARG" ]] || die missing-value check'
-READER_BODY='prune_usage_cache() { :; }; validate_lane_settings; read_usage_cache "$HARNESS" "$LANE_ARG" "$(date +%s)" ""; exit $?'
+READER_BODY='prune_usage_cache() { :; }; validate_lane_settings; read_usage_cache "$HARNESS" "$LANE_ARG" ""; exit $?'
 state="$TMP_ROOT/reader-state"
 cache_run "$state" ORCH_LANE_EXCLUDE= list --json --no-cache > "$TMP_ROOT/out"
 reader_dir="$(mutant_scripts reader lanes)"
@@ -397,8 +397,8 @@ assert_eq "$(find "$state/usage" -name 'host-accounts-*.json' | wc -l | tr -d ' 
 
 # Removing only read-time rows must not conceal bodies retained by the writer.
 control_dir="$(mutant_scripts control-write lanes)"
-mutate_file "$control_dir/lanes" 'rows="$(host_account_rows "$rows" all cache)" || return 1' \
-  ': "$rows" || return 1'
+mutate_file "$control_dir/lanes" 'rows="$(host_account_rows "$rows" all cache)" || { usage_lock_release; return 1; }' \
+  ': "$rows" || { usage_lock_release; return 1; }'
 LANES="$control_dir/lanes"
 cache_run "$TMP_ROOT/writer" ORCH_LANE_EXCLUDE=claude host-accounts --json --no-cache > "$TMP_ROOT/out"
 assert_eq "$(jq -r '.usage.rows' "$TMP_ROOT/writer"/usage/host-accounts-*.json | grep -c 'weekly-pct=20' || true)" \

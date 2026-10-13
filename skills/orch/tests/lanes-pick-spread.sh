@@ -50,6 +50,26 @@ git -C "$NOSETTINGS" config maintenance.auto false
 # this process and a listed pane is live.
 BIN="$TMP_ROOT/bin"; mkdir -p "$BIN"
 virtual_clock_install "$BIN" "$TMP_ROOT/clock"
+virtual_clock_bash_env "$TMP_ROOT/elapsed-clock.env" || exit 1
+export BASH_ENV="$TMP_ROOT/elapsed-clock.env"
+# The exact projection rows below share this elapsed clock. An independently
+# fixed SECONDS value proves the helper overrides real time for lanes too.
+CLOCK_DRIVER='RUN_NOW=100; RUN_STARTED_SECONDS=0; unset SECONDS; SECONDS=7; now="$((RUN_NOW + SECONDS - RUN_STARTED_SECONDS))"; printf "%s\n" "$now"'
+CLOCK_EXPECTED="$(<"$STUB_CLOCK")"
+assert_eq "$(bash -c "$CLOCK_DRIVER")" "$CLOCK_EXPECTED" "elapsed clock uses the fixture epoch"
+sed 's/SECONDS=$((_virtual_now - RUN_NOW + RUN_STARTED_SECONDS))/SECONDS=7/' \
+  "$TEST_DIR/lib/virtual-clock.sh" > "$TMP_ROOT/elapsed-clock-control.sh"
+BASH_ENV= bash -c 'source "$1"; virtual_clock_bash_env "$2"' _ \
+  "$TMP_ROOT/elapsed-clock-control.sh" "$TMP_ROOT/elapsed-clock-control.env" || exit 1
+CLOCK_CONTROL="$(BASH_ENV="$TMP_ROOT/elapsed-clock-control.env" bash -c "$CLOCK_DRIVER")"
+( source "$TEST_DIR/lib/assertions.sh"
+  assert_eq "$CLOCK_CONTROL" "$CLOCK_EXPECTED" "elapsed clock uses the fixture epoch"
+  [[ "$FAIL" == 0 ]]
+) > "$TMP_ROOT/elapsed-clock-control.log"
+CLOCK_CONTROL_RC=$?
+assert_eq "$CLOCK_CONTROL_RC" 1 "control: the fixture epoch rule rejects an uncontrolled lanes timer"
+assert_file_contains "$TMP_ROOT/elapsed-clock-control.log" 'FAIL  elapsed clock uses the fixture epoch' \
+  "control: the elapsed timer defect reaches the same clock assertion"
 cat > "$BIN/tmux" <<'STUBEOF'
 #!/usr/bin/env bash
 [[ "${1:-}" == "list-panes" ]] || exit 0
@@ -302,7 +322,7 @@ mutate_file "$CTRL/lib/lane-model.sh" 'then (.usage_rate_pct_per_min * 60) / (if
 LANES_UNDER_TEST="$CTRL/lanes" ACCOUNT_HARNESS=codex table \
   "control: charging the whole account rate walls the twelve-claim account|ORCH_LANE_DIRS=$H/.1codex|claim:1:12|1:22:20:12:628|pick --harness codex --model gpt-6.1-sol --json|rc=3 walled=1"
 CTRL="$(mutant_scripts mutant-sample-count lanes)" || exit 1
-mutate_file "$CTRL/lanes" 'sample_claims="$(account_claims "$2" "$1")"' 'sample_claims=1'
+mutate_file "$CTRL/lanes" 'sample_claims="$ACCOUNT_CLAIMS"' 'sample_claims=1'
 LANES_UNDER_TEST="$CTRL/lanes" ACCOUNT_HARNESS=codex table \
   "control: omitting the sampled count records one instead of twelve|ORCH_LANE_DIRS=$H/.1codex|claim:1:12||list --harness codex --json|rc=0 sample_claims=1"
 
