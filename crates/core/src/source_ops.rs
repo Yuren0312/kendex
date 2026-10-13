@@ -183,7 +183,9 @@ pub fn add_source(env: &Env, scope: &Scope, name: &str, reference: &str) -> Resu
 
 mod collection;
 mod subscribe;
-pub use collection::{CollectionStep, SourceAction, collection_steps};
+pub use collection::{
+    CollectionStep, PreparedCollection, SourceAction, collection_steps, prepare_collection,
+};
 pub use subscribe::{
     Subscribed, install_from, install_project_carrying, install_project_from_personal, subscribe,
     subscribe_and_install, subscribe_project_to,
@@ -230,7 +232,12 @@ impl PreparedSourceChange {
     pub fn plan(self, env: &Env) -> Result<EngineReport> {
         let mut report = persist_and_plan(env, &self.scope, self.manifest)?;
         if let Some((name, decl)) = self.subscription {
-            subscribe::announce_subscription(env, &mut report, &self.scope, &name, &decl);
+            subscribe::announce_subscriptions(
+                env,
+                &mut report,
+                &self.scope,
+                [(name.as_str(), &decl)],
+            );
         }
         Ok(report)
     }
