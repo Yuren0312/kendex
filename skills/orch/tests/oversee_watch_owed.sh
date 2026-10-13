@@ -970,6 +970,44 @@ read|fail|pr-list-failed repo=owner/repo state=merged branch=ken-1
 page|page|merged-search-truncated repo=owner/repo item=KEN-1 limit=1000
 ROWS
 
+# Only this suite's fake search needs the shared OR query. Keep unrelated
+# rows in the input, so restoring the broad search reaches the real cap.
+mutate_file "$TMP_ROOT/bin/gh" '--arg key "$key"' '--arg key "$key" --arg search "$search"'
+mutate_file "$TMP_ROOT/bin/gh" '# newest-created first, like gh:' 'if ! jq -en --arg search "$search" '\''($search | length) <= 256 and ($search | [scan("\\b(AND|OR|NOT)\\b")] | length) <= 5'\'' >/dev/null; then
+        echo "query-limit repo=$repo" >&2; exit 22
+      fi
+      # newest-created first, like gh:'
+mutate_file "$TMP_ROOT/bin/gh" '| (.headRepositoryOwner //= {login: $owner})' '| select(($search | contains(" OR ") | not) or
+      (. as $pr | any(($search | [scan("head:([A-Za-z0-9_-]+)")[]])[]; . == $pr.headRefName) or
+        any(($search | [scan("\"([^\"]+)\"")[]])[]; . as $key |
+          (($pr.title // "") + " " + ($pr.body // "") | contains($key)))))
+    | (.headRepositoryOwner //= {login: $owner})'
+while IFS='|' read -r name branch title body; do
+  release_world "release_shared_over_page_$name"
+  fleet '[]'
+  jq 'map(select(.state == "Verifying") | .created_at = "2026-09-01T00:00:00Z")' \
+    "$STUB_DIR/tracker.out" >"$STUB_DIR/scoped-items.json"
+  mv -- "$STUB_DIR/scoped-items.json" "$STUB_DIR/tracker.out"
+  jq -n --arg branch "$branch" --arg title "$title" --arg body "$body" \
+    '[range(1001) | {number: (. + 10), headRefName: "other", title: "unrelated", mergedAt: "2026-10-01T00:00:00Z"}]
+     + [{number: 1, headRefName: $branch, title: $title, body: $body, mergedAt: "2026-10-01T00:00:00Z"}]' >"$STUB_DIR/merged.json"
+  watch_pass -- --state "$STUB_DIR/state.json"
+  assert_eq "$RC" 0 "$name: unrelated history over one page completes Verifying" "$ERR"
+  assert_contains "$(verification_lines)" 'deadline=2026-10-02T12:00:00Z' "$name: Verifying uses the item's merge" "$ERR"
+  assert_eq "$(grep -c '^pr list .*--state merged' "$STUB_DIR/gh.calls" || true)" 1 "$name: one shared merged read" "$ERR"
+  MUTANT_DIR="$TMP_ROOT/scoped-control-$name"
+  MUTANT_WATCH="$(mutant_scripts "scoped-control-$name/orch" oversee-watch)/oversee-watch" || exit 1
+  ln -s "$REPO_ROOT/skills/github" "$MUTANT_DIR/github"
+  ln -s "$REPO_ROOT/skills/linear" "$MUTANT_DIR/linear"
+  mutate_verifying "$MUTANT_WATCH" 'IFS=$'\''\t'\'' read -ra searches <<<"${7:-${floor:+merged:>=$floor}}"' 'searches=("${floor:+merged:>=$floor}")'
+  WATCH_BIN="$MUTANT_WATCH" watch_pass -- --state "$STUB_DIR/state.json"
+  assert_eq "rc=$RC key=$(grep -cxF 'oversee-watch: merged-search-truncated repo=owner/repo item=KEN-1 limit=1000' "$ERR" || true)" 'rc=2 key=1' "$name: broad-search control refuses at the cap" "$ERR"
+done <<'ROWS'
+branch|ken-1|feature|
+title|cloud/session|fix(KEN-1): feature|
+body|cloud/session|feature|Closes KEN-1
+ROWS
+
 # The stage reads each issue and builds its box results in bulk records. Per
 # issue: its inventory record, the parser's description read, done_when_parse,
 # box selection, the judge's box records, its results and the printed lines,
@@ -1036,10 +1074,10 @@ WORK_BASE="$WORK"
 WORK_ROWS='merge_one|1|KEN-30=t|6
 merge_boxes|1|KEN-30=t,t,t,t|6
 merge_issues|1|KEN-30=t KEN-31=t KEN-32=t|18
-release_one|1|KEN-30=r|10
-release_boxes|1|KEN-30=r,r,r|12
-release_candidates|5|KEN-30=r|10
-mixed|5|KEN-30=r,t KEN-31=t,t KEN-32=r,r|27'
+release_one|1|KEN-30=r|11
+release_boxes|1|KEN-30=r,r,r|13
+release_candidates|5|KEN-30=r|11
+mixed|5|KEN-30=r,t KEN-31=t,t KEN-32=r,r|28'
 while IFS='|' read -r name candidates issues want; do
   # shellcheck disable=SC2086 # ISSUES is a word list of ID=BOXES specs.
   work_world "work_$name" "$candidates" $issues
@@ -1054,13 +1092,24 @@ shared_reads_world() {
   jq 'map(select(.state == "Verifying") | .created_at = (if .id == "KEN-39" then "2026-09-01T00:00:00.142Z" else "2026-09-20T00:00:00Z" end))' \
     "$STUB_DIR/tracker.out" >"$STUB_DIR/shared-reads.json"
   mv -- "$STUB_DIR/shared-reads.json" "$STUB_DIR/tracker.out"
+  if [[ $# -gt 1 ]]; then
+    jq 'map(select(.id == "KEN-30" or .id == "KEN-31" or .id == "KEN-32" or .id == "KEN-39"))
+      | .[0].description as $release | map(.description = $release)' \
+      "$STUB_DIR/tracker.out" >"$STUB_DIR/shared-reads.json"
+    mv -- "$STUB_DIR/shared-reads.json" "$STUB_DIR/tracker.out"
+    jq --argjson copies "$2" '[to_entries[] as $item | range($copies) as $n
+      | {number: ($item.key * $copies + $n + 1), headRefName: ($item.value.id | ascii_downcase), title: $item.value.id,
+         mergedAt: ("2026-10-01T00:00:" + ($item.key | tostring) + "0Z"),
+         mergeCommit: {oid: "1111111111111111111111111111111111111111"}}]' \
+      "$STUB_DIR/tracker.out" >"$STUB_DIR/merged.json"
+  fi
 }
 shared_reads_contract() {
-  local count="${1:-1}"
+  local count="${1:-1}" batches="${2:-4}"
   assert_eq "$RC" 0 'the shared repository reads complete verification' "$ERR"
-  assert_eq "$(grep -c '^pr list .*--state merged' "$STUB_DIR/gh.calls" || true)" "$count" 'Verifying items share one merged pull request read per repository' "$ERR"
+  assert_eq "$(grep -c '^pr list .*--state merged' "$STUB_DIR/gh.calls" || true)" "$((count * batches))" 'Verifying items share each bounded merged batch per repository' "$ERR"
   assert_eq "$(grep -c '^release list ' "$STUB_DIR/gh.calls" || true)" "$count" 'release boxes share one release read per repository' "$ERR"
-  assert_eq "$(grep -c -- '--search merged:>=2026-09-01T00:00:00Z' "$STUB_DIR/gh.calls" || true)" "$count" 'each repository read includes the oldest Verifying creation floor' "$ERR"
+  assert_eq "$(grep -c -- '--search merged:>=2026-09-01T00:00:00Z' "$STUB_DIR/gh.calls" || true)" "$((count * batches))" 'each repository batch includes the oldest Verifying creation floor' "$ERR"
 }
 shared_reads_world verifying_shared_reads
 watch_pass -- --state "$STUB_DIR/state.json"
@@ -1081,14 +1130,62 @@ cp "$STUB_DIR/compare.owner_repo_compare_111111111111111111111111111111111111111
 watch_pass -- --repo owner/repo --repo owner/other --state "$STUB_DIR/state.json"
 shared_reads_contract 2
 for repo in owner/repo owner/other; do
-  assert_eq "$(grep -c "^pr list --repo $repo .*--state merged" "$STUB_DIR/gh.calls" || true)" 1 "$repo has one merged pull request read" "$ERR"
+  assert_eq "$(grep -c "^pr list --repo $repo .*--state merged" "$STUB_DIR/gh.calls" || true)" 4 "$repo shares its merged pull request batches" "$ERR"
   assert_eq "$(grep -c "^release list --repo $repo " "$STUB_DIR/gh.calls" || true)" 1 "$repo has one release read" "$ERR"
 done
+# GitHub can return complete batches whose combined repository cache exceeds
+# one search page. A capped batch still refuses the whole inventory.
+while IFS='|' read -r name copies want; do
+  shared_reads_world "verifying_shared_history_$name" "$copies"
+  watch_pass -- --state "$STUB_DIR/state.json"
+  if [[ "$want" == complete ]]; then
+    shared_reads_contract 1 2
+    assert_eq "$(verification_lines | awk '{ for (i = 3; i <= NF; i++) if ($i ~ /^merged=/) print $2 " " $i }')" \
+      'KEN-30 merged=2026-10-01T00:00:00Z
+KEN-31 merged=2026-10-01T00:00:10Z
+KEN-32 merged=2026-10-01T00:00:20Z
+KEN-39 merged=2026-10-01T00:00:30Z' 'each shared-history item receives its own matched merge' "$ERR"
+    MUTANT_DIR="$TMP_ROOT/shared-history-cap"
+    MUTANT_WATCH="$(mutant_scripts shared-history-cap/orch oversee-watch)/oversee-watch" || exit 1
+    ln -s "$REPO_ROOT/skills/github" "$MUTANT_DIR/github"
+    ln -s "$REPO_ROOT/skills/linear" "$MUTANT_DIR/linear"
+    mutate_verifying "$MUTANT_WATCH" '[[ -n "${6:-}" || "$rows" -lt "$MERGED_SEARCH_PAGE" ]]' '[[ "$rows" -lt "$MERGED_SEARCH_PAGE" ]]'
+    WATCH_BIN="$MUTANT_WATCH" watch_pass -- --state "$STUB_DIR/state.json"
+  fi
+  assert_eq "rc=$RC lines=$(verification_lines) key=$(grep -cxF 'oversee-watch: merged-search-truncated repo=owner/repo item=KEN-30 limit=1000' "$ERR" || true)" \
+    'rc=2 lines= key=1' "$name: the incomplete batch or aggregate-cap control refuses verification" "$ERR"
+done <<'ROWS'
+complete|260|complete
+capped|334|capped
+ROWS
+while IFS='|' read -r prefix batches from to; do
+  shared_reads_world "verifying_query_limits_$batches"
+  jq --arg prefix "$prefix" '[range(70) as $n | .[0] |
+    .id = ($prefix + "-" + (($n + 4000) | tostring))]' "$STUB_DIR/tracker.out" >"$STUB_DIR/query-items.json"
+  mv -- "$STUB_DIR/query-items.json" "$STUB_DIR/tracker.out"
+  jq '[.[] | {number: (.id[-4:] | tonumber), headRefName: (.id | ascii_downcase), title: .id,
+    mergedAt: "2026-10-01T00:00:00Z", mergeCommit: {oid: "1111111111111111111111111111111111111111"}}]' \
+    "$STUB_DIR/tracker.out" >"$STUB_DIR/merged.json"
+  watch_pass -- --state "$STUB_DIR/state.json"
+  assert_eq "$RC" 0 "$prefix: seventy keys stay inside query limits" "$ERR"
+  assert_eq "$(grep -c '^pr list .*--state merged' "$STUB_DIR/gh.calls" || true)" "$batches" "$prefix: each bounded batch is read once" "$ERR"
+  assert_eq "$(verification_lines | wc -l | tr -d ' ')" 70 "$prefix: every item receives its merge result" "$ERR"
+  MUTANT_DIR="$TMP_ROOT/query-limit-control-$batches"
+  MUTANT_WATCH="$(mutant_scripts "query-limit-control-$batches/orch" oversee-watch)/oversee-watch" || exit 1
+  ln -s "$REPO_ROOT/skills/github" "$MUTANT_DIR/github"
+  ln -s "$REPO_ROOT/skills/linear" "$MUTANT_DIR/linear"
+  mutate_verifying "$MUTANT_WATCH" "$from" "$to"
+  WATCH_BIN="$MUTANT_WATCH" watch_pass -- --state "$STUB_DIR/state.json"
+  assert_eq "rc=$RC key=$(grep -c '^query-limit repo=owner/repo$' "$ERR" || true)" 'rc=2 key=1' "$prefix: unbounded-query control is refused" "$ERR"
+done <<'ROWS'
+KEN|24|>= 3|>= 1000
+TEAM-ABCDEFGHIJKLMNOPQRSTUVWX|35|> 256|> 100000
+ROWS
 MUTANT_DIR="$TMP_ROOT/shared-reads-base"
 MUTANT_WATCH="$(mutant_scripts shared-reads-base/orch oversee-watch)/oversee-watch" || exit 1
 ln -s "$REPO_ROOT/skills/github" "$MUTANT_DIR/github"
 ln -s "$REPO_ROOT/skills/linear" "$MUTANT_DIR/linear"
-mutate_verifying "$MUTANT_WATCH" 'merged_item_read "$id" "$repo" null null "$floor" "$read_dir"' 'merged_item_read "$id" "$repo" null'
+mutate_verifying "$MUTANT_WATCH" 'merged_item_read "$id" "$repo" null null "$floor" "$read_dir" "$search"' 'merged_item_read "$id" "$repo" null'
 mutate_verifying "$MUTANT_WATCH" '"$MERGED_SEARCH_PAGE" gh "$read_dir"' '"$MERGED_SEARCH_PAGE" gh'
 shared_reads_world verifying_shared_reads_base
 WATCH_BIN="$MUTANT_WATCH" watch_pass -- --state "$STUB_DIR/state.json"
