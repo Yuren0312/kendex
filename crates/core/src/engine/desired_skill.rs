@@ -246,12 +246,33 @@ pub(super) fn desired_skill(ctx: &ItemCtx, state: &mut DesiredState) -> Result<(
     if trees[owner].is_some() {
         cross_read_note(ctx, method, state);
     }
+    // Rendering collects requirements only. A copy comparison must not
+    // launch host commands while it proves the installed bytes.
+    collect_command_dependencies(ctx, state, &trees);
     for (group, tree) in groups.iter().zip(trees) {
         if let Some(tree) = tree {
             push_installs(ctx, state, group, tree, enabled, method)?;
         }
     }
     Ok(())
+}
+
+fn collect_command_dependencies(ctx: &ItemCtx, state: &mut DesiredState, trees: &[Option<Tree>]) {
+    if !ctx.decl.enabled {
+        return;
+    }
+    let Some(tree) = trees.iter().flatten().next() else {
+        return;
+    };
+    let (_, bytes) = tree
+        .files
+        .iter()
+        .find(|(path, _)| crate::render::skill::carries_name(path))
+        .unwrap_or_else(|| unreachable!("validated skill tree has no skill entry"));
+    let declared = super::deps::declared_in(&String::from_utf8_lossy(bytes));
+    state
+        .command_dependencies
+        .insert(ctx.name.to_owned(), declared.commands);
 }
 
 /// Why the tree standing at the in-place source installs nothing, or
