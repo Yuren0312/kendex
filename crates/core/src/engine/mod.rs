@@ -884,3 +884,26 @@ pub fn plan_apply(env: &Env, scope: &Scope, options: &PlanOptions) -> Result<Eng
     unmanaged_rows(env, scope, &empty, &lock, &[], &mut report.drift)?;
     Ok(report)
 }
+
+/// Check this scope's selected readings before planning. The held-manifest
+/// rule supplies the revisions to check.
+pub fn check_catalog_compatibility(env: &Env, scope: &Scope, options: &PlanOptions) -> Result<()> {
+    let Some(manifest) = manifest::load_current(&manifest::manifest_path(env, scope))? else {
+        return Ok(());
+    };
+    check_catalog_compatibility_for(env, scope, &manifest, options)
+}
+
+/// Check a prepared manifest before rendering. Source edits select a
+/// manifest that is not yet on disk.
+pub fn check_catalog_compatibility_for(
+    env: &Env,
+    scope: &Scope,
+    manifest: &Manifest,
+    options: &PlanOptions,
+) -> Result<()> {
+    crate::source::check_catalog_compatibility(env, scope, manifest)?;
+    let lock = crate::lock::load(&lock_path(env, scope))?;
+    desired::hold::held_planning(env, scope, manifest, &lock, options)?;
+    Ok(())
+}

@@ -82,11 +82,16 @@ pub(crate) const COLLECTION_ID: &str = "aB3-_dEf12345678";
 /// away: the base URL the binary reads as `KENDEX_API`.
 #[allow(clippy::unwrap_used)]
 pub(crate) fn resolver(commit: &str) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
     let body = format!(
         r#"{{"schema":1,"id":"{COLLECTION_ID}","name":"starter","description":null,"members":[{{"repo":"acme/kit","kind":"skill","name":"gh","commit":"{commit}"}}]}}"#
     );
+    resolver_body(body)
+}
+
+#[allow(clippy::unwrap_used)]
+fn resolver_body(body: String) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut request = Vec::new();
@@ -101,6 +106,177 @@ pub(crate) fn resolver(commit: &str) -> String {
         stream.write_all(response.as_bytes()).unwrap();
     });
     base
+}
+
+/// The shipped resolver returns snapshot commits. A cached main branch
+/// can match that snapshot even when upstream advanced before the command.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn collection_subscriptions_and_snapshots_pass_before_a_fresh_step_installs() {
+    for gate in ["compatible", "snapshot", "reused-tip", "replacement"] {
+        let (_tmp, home, project, mut snapshots) = collection_world();
+        if gate == "replacement" {
+            snapshots[1] = historical_collection_member(&home, &project);
+        } else if gate != "compatible" {
+            let upstream = home.join("git/acme/zkit");
+            fs::write(upstream.join("kendex.toml"), "min_kendex = '999999.0.0'\n").unwrap();
+            git(&upstream, &["add", "-A"]);
+            git(&upstream, &["commit", "-q", "-m", "engine requirement"]);
+            if gate == "snapshot" {
+                // A new repository's incompatible snapshot must also stop
+                // the command before the earlier compatible step writes.
+                fs::write(
+                    project.join("kendex.toml"),
+                    "schema = 7\n[install]\nharnesses = ['claude']\nmethod = 'copy'\n",
+                )
+                .unwrap();
+                snapshots[1] = git(&upstream, &["rev-parse", "HEAD"]);
+            }
+        }
+        let members = if gate == "replacement" {
+            format!(
+                r#"{{"repo":"acme/zkit","kind":"skill","name":"last","commit":"{}"}}"#,
+                snapshots[1]
+            )
+        } else {
+            format!(
+                r#"{{"repo":"acme/akit","kind":"skill","name":"first","commit":"{}"}},{{"repo":"acme/zkit","kind":"skill","name":"last","commit":"{}"}}"#,
+                snapshots[0], snapshots[1]
+            )
+        };
+        let body = format!(
+            r#"{{"schema":1,"id":"{COLLECTION_ID}","name":"starter","description":null,"members":[{members}]}}"#
+        );
+        let before = crate::deps_cli::tree(&project);
+        let link = format!("https://kendex.ai/c/{COLLECTION_ID}");
+        let output = kendex(
+            &home,
+            &project,
+            &resolver_body(body),
+            &["add", &link, "--throwaway", "-y", "--leave"],
+        );
+        if matches!(gate, "compatible" | "replacement") {
+            assert!(output.status.success(), "{}", said(&output));
+            let installed = if gate == "replacement" {
+                &["last"][..]
+            } else {
+                &["first", "last"][..]
+            };
+            for skill in installed {
+                assert!(
+                    project
+                        .join(format!(".claude/skills/{skill}/SKILL.md"))
+                        .is_file()
+                );
+            }
+            if gate == "replacement" {
+                let lock = kendex_core::lock::load(&project.join(".kendex-lock.json")).unwrap();
+                let last = lock
+                    .entries
+                    .values()
+                    .find(|entry| entry.name == "last")
+                    .unwrap();
+                assert_eq!(last.source_commit.as_deref(), Some(snapshots[1].as_str()));
+            }
+        } else {
+            assert_eq!(output.status.code(), Some(1), "{}", said(&output));
+            // Consumer refresh automation consumes the version-bearing line.
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .filter(|line| line.contains("catalog-needs-engine"))
+                    .collect::<Vec<_>>(),
+                [format!(
+                    "Error: catalog-needs-engine min=999999.0.0 engine={}",
+                    env!("CARGO_PKG_VERSION")
+                )]
+            );
+            assert_eq!(
+                crate::deps_cli::tree(&project),
+                before,
+                "{gate} installed an earlier step"
+            );
+        }
+    }
+}
+
+#[allow(clippy::unwrap_used)]
+fn collection_world() -> (tempfile::TempDir, PathBuf, PathBuf, Vec<String>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = rooted(&tmp);
+    let project = home.join("consumer");
+    fs::create_dir_all(project.join(".claude")).unwrap();
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    let mut snapshots = Vec::new();
+    for (repo, skill) in [("acme/akit", "first"), ("acme/zkit", "last")] {
+        let upstream = home.join("git").join(repo);
+        crate::verify_records::write(
+            &upstream.join(format!("skills/{skill}/SKILL.md")),
+            &format!("---\nname: {skill}\ndescription: fixture\n---\nBody.\n"),
+        );
+        crate::verify_records::write(&upstream.join("kendex.toml"), "min_kendex = '0.0.0'\n");
+        git(&upstream, &["init", "-q", "-b", "main"]);
+        git(&upstream, &["config", "gc.auto", "0"]);
+        git(&upstream, &["config", "maintenance.auto", "false"]);
+        git(&upstream, &["add", "-A"]);
+        git(&upstream, &["commit", "-q", "-m", "snapshot"]);
+        snapshots.push(git(&upstream, &["rev-parse", "HEAD"]));
+    }
+    fs::write(project.join("kendex.toml"),
+            "schema = 7\n[sources.last]\nrepo = 'acme/zkit'\nrev = 'main'\n[install]\nharnesses = ['claude']\nmethod = 'copy'\n").unwrap();
+    let cached = kendex(
+        &home,
+        &project,
+        "http://127.0.0.1:1",
+        &["source", "refresh"],
+    );
+    assert!(cached.status.success(), "{}", said(&cached));
+    (tmp, home, project, snapshots)
+}
+
+/// A released reader can record a minimum it ignores. Keep the real add
+/// record and change only its commit to that historical catalog. Package
+/// bytes match the compatible replacement that the collection requests.
+#[allow(clippy::unwrap_used)]
+fn historical_collection_member(home: &Path, project: &Path) -> String {
+    let added = kendex(
+        home,
+        project,
+        "http://127.0.0.1:1",
+        &[
+            "add",
+            "last",
+            "--skill",
+            "last",
+            "--throwaway",
+            "-y",
+            "--leave",
+        ],
+    );
+    assert!(added.status.success(), "{}", said(&added));
+    let upstream = home.join("git/acme/zkit");
+    fs::write(upstream.join("kendex.toml"), "min_kendex = '999999.0.0'\n").unwrap();
+    git(&upstream, &["add", "-A"]);
+    git(&upstream, &["commit", "-q", "-m", "historical minimum"]);
+    let historical = git(&upstream, &["rev-parse", "HEAD"]);
+    let fetched = kendex(home, project, "http://127.0.0.1:1", &["source", "refresh"]);
+    assert!(fetched.status.success(), "{}", said(&fetched));
+    fs::write(upstream.join("kendex.toml"), "min_kendex = '0.0.0'\n").unwrap();
+    git(&upstream, &["add", "-A"]);
+    git(&upstream, &["commit", "-q", "-m", "compatible replacement"]);
+    let tip = git(&upstream, &["rev-parse", "HEAD"]);
+    let fetched = kendex(home, project, "http://127.0.0.1:1", &["source", "refresh"]);
+    assert!(fetched.status.success(), "{}", said(&fetched));
+    let path = project.join(".kendex-lock.json");
+    let mut lock = kendex_core::lock::load(&path).unwrap();
+    let last = lock
+        .entries
+        .values_mut()
+        .find(|entry| entry.name == "last")
+        .unwrap();
+    last.source_commit = Some(historical);
+    kendex_core::lock::save(&path, &lock).unwrap();
+    tip
 }
 
 /// A home holding the upstream and a project to install into. The tool is
