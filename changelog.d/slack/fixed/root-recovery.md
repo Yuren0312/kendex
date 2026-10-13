@@ -1,0 +1,1 @@
+- The Slack relay skips a root after a local start or poll refusal and retries it each later poll. Other roots continue. A held listen lock stops a duplicate relay. Jarvis hold lock contention affects only its root.
