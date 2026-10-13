@@ -3,7 +3,7 @@ use crate::env::Env;
 use crate::error::Result;
 use crate::lock::{Lock, LockFile, lock_path};
 use crate::manifest::{self, Manifest};
-use crate::model::{ItemKind, Scope};
+use crate::model::{HarnessId, ItemKind, Scope};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod adopt;
@@ -12,7 +12,7 @@ mod agent_skills;
 mod antigravity;
 pub(crate) mod bundles;
 mod catalog;
-mod config_edits;
+pub(crate) mod config_edits;
 mod copilot;
 pub mod deps;
 pub mod desired;
@@ -264,6 +264,7 @@ fn plan_scope_with_lock_base(
     )?;
     scope_writes::record_entry_selectors(&state, &mut new_lock, &item_pass, &kept);
     stale::stale_instruction_rows(env, scope, lock, &new_lock, &state.items, &mut config_edits)?;
+    plan_claude_project_defaults(env, scope, &new_lock, &state, &mut config_edits);
     let edited = plan_config_edits(scope, config_edits, &mut new_lock, &mut ops)?;
     let set_changes = set_changes(lock, &new_lock, &said, &state.retired);
     let notices = desired::retired_notices(scope, &state, &retired);
@@ -278,8 +279,6 @@ fn plan_scope_with_lock_base(
     let wanted = wanted(&manifest, &state);
     plan_lock_write(env, scope, declared, lock_base, &new_lock, &mut ops)?;
     let generated = generated_paths::plan(scope, &state, &planned_shims, &drift, &trees, &mut ops)?;
-    let instruction_shims = planned_shims;
-
     let planned = Planned {
         drift,
         ops,
@@ -290,7 +289,7 @@ fn plan_scope_with_lock_base(
         retired,
         kept,
         safety,
-        instruction_shims,
+        instruction_shims: planned_shims,
         item_pass,
         resolved_sources,
         generated,
@@ -302,6 +301,66 @@ fn plan_scope_with_lock_base(
         held,
     };
     report(env, scope, &manifest, lock, options, state, planned)
+}
+
+fn plan_claude_project_defaults(
+    env: &Env,
+    scope: &Scope,
+    lock: &Lock,
+    state: &desired::DesiredState,
+    config_edits: &mut config_edits::ConfigEditPlan,
+) {
+    if let Some((path, edit)) = claude_project_default_edit(
+        env,
+        scope,
+        lock.claude_project_default,
+        lock,
+        &registrations(state),
+    ) {
+        config_edits.push(path, "Claude project defaults".into(), edit);
+    }
+}
+
+/// The scope default transition, with ownership from the document's record
+/// and surviving installations, shared by planning and replay. New insertion
+/// needs a settings registration because file and tree installs alone have
+/// no shared settings position. Owned defaults retain their lock-based
+/// lifetime even when this pass does not rebuild a surviving registration.
+pub(crate) fn claude_project_default_edit(
+    env: &Env,
+    scope: &Scope,
+    ownership: Option<crate::lock::ClaudeProjectDefault>,
+    lock: &Lock,
+    registrations: &Registrations,
+) -> Option<(std::path::PathBuf, crate::configedit::ConfigEdit)> {
+    if !matches!(scope, Scope::Project { .. }) {
+        return None;
+    }
+    let settings = targets::claude_settings(env, scope);
+    let edit = match ownership {
+        None => registrations
+            .iter()
+            .any(|(key, edits)| {
+                lock.entries
+                    .get(key)
+                    .is_some_and(|entry| entry.harness == HarnessId::Claude && entry.enabled)
+                    && edits.iter().any(|(path, _)| path == &settings)
+            })
+            .then_some(crate::configedit::ConfigEdit::ClaudeProjectDefaults)?,
+        Some(crate::lock::ClaudeProjectDefault::Owned) => {
+            if lock
+                .entries
+                .values()
+                .any(|entry| entry.harness == HarnessId::Claude && entry.enabled)
+            {
+                crate::configedit::ConfigEdit::ClaudeProjectDefaults
+            } else {
+                crate::configedit::ConfigEdit::RemoveClaudeProjectDefaults
+            }
+        }
+        Some(crate::lock::ClaudeProjectDefault::Released) => return None,
+    };
+    Some((settings, edit))
 }
 
 /// What the passes of [`plan_scope`] planned, beside the desired state,
@@ -780,6 +839,7 @@ fn fresh_lock(
         // Carried until the shim pass settles them: the record of a write
         // stands until a pass takes the write back.
         shims: lock.shims.clone(),
+        claude_project_default: lock.claude_project_default,
     };
     (fresh, readings)
 }

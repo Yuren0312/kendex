@@ -69,6 +69,12 @@ use crate::model::{HarnessId, ItemKind, Scope};
 /// Older verification can reject a record carrying them because its
 /// serialization omits them. Refresh with a build that knows selectors
 /// records them again.
+///
+/// Version 11 also gained [`Lock::claude_project_default`] without a bump.
+/// Older writers drop its ownership and deletion record. After a user
+/// deletes the default and an older build writes the lock, a later build
+/// can insert `switchModelsOnFlag=true` again. This mixed-version loss is
+/// accepted rather than requiring lock recovery for the added default.
 pub const LOCK_VERSION: u32 = 11;
 
 /// The lock file a project scope carries, committed with the renders it
@@ -114,6 +120,21 @@ pub struct Lock {
     /// `engine::instruction_shims::recorded_shims`'s.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub shims: BTreeSet<KeyedShim>,
+    /// Whether the project default was inserted here or left to the user.
+    /// A released record also preserves a user's deletion across later applies.
+    #[serde(
+        default,
+        rename = "claudeProjectDefault",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub claude_project_default: Option<ClaudeProjectDefault>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaudeProjectDefault {
+    Owned,
+    Released,
 }
 
 /// One instruction shim written as a key into a document whose other keys

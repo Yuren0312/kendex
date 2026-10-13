@@ -1748,6 +1748,369 @@ fn a_file_two_registrations_wrote_from_nothing_is_replayed_in_the_writers_order(
     );
 }
 
+type ClaudeDefaultReplayCase = (
+    &'static str,
+    Option<bool>,
+    Option<Option<bool>>,
+    ClaudeDefaultReplayBase,
+    ClaudeDefaultAction,
+    Option<bool>,
+    bool,
+);
+
+const CLAUDE_DEFAULT_REPLAY_CASES: &[ClaudeDefaultReplayCase] = {
+    use ClaudeDefaultAction::{AddSkill, Apply, Disable, Unreachable};
+    use ClaudeDefaultReplayBase::{BeforeInstall, Installed, Legacy, OwnedDeletion};
+    &[
+        ("owned-remove", None, None, Installed, Disable, None, false),
+        (
+            "preexisting-true",
+            Some(true),
+            None,
+            Installed,
+            Disable,
+            Some(true),
+            false,
+        ),
+        (
+            "preexisting-false",
+            Some(false),
+            None,
+            Installed,
+            Disable,
+            Some(false),
+            false,
+        ),
+        (
+            "released-false",
+            None,
+            Some(Some(false)),
+            Installed,
+            Disable,
+            Some(false),
+            false,
+        ),
+        (
+            "released-true",
+            None,
+            Some(Some(true)),
+            Installed,
+            Disable,
+            Some(true),
+            false,
+        ),
+        (
+            "recorded-deletion",
+            None,
+            Some(None),
+            Installed,
+            Disable,
+            None,
+            false,
+        ),
+        (
+            "owned-active",
+            None,
+            None,
+            Installed,
+            Apply,
+            Some(true),
+            false,
+        ),
+        (
+            "current-hook-insert",
+            None,
+            None,
+            Legacy,
+            Apply,
+            Some(true),
+            false,
+        ),
+        (
+            "owned-deletion-before-apply",
+            None,
+            None,
+            OwnedDeletion,
+            Apply,
+            None,
+            false,
+        ),
+        (
+            "default-and-style-insert",
+            None,
+            None,
+            BeforeInstall,
+            Apply,
+            Some(true),
+            true,
+        ),
+        (
+            "owned-unreachable-catalog",
+            None,
+            None,
+            Installed,
+            Unreachable,
+            Some(true),
+            false,
+        ),
+        (
+            "owned-kept-add",
+            None,
+            None,
+            Installed,
+            AddSkill,
+            Some(true),
+            false,
+        ),
+    ]
+};
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn claude_scope_default_transitions_replay_without_changing_user_settings() {
+    let world = world();
+    write(
+        &world.catalog.join("output-styles/STE.md"),
+        "---\nname: STE\ndescription: Short sentences\nkeep-coding-instructions: true\n---\nWrite short sentences.\n",
+    );
+    commit(&world.catalog, "an output style");
+    let declared = format!(
+        "[sources.cat]\n{}\n[hooks.guard]\nsource = \"cat\"\n",
+        source_path(&world.catalog)
+    );
+    for &(name, initial, change, base, action, expected, style) in CLAUDE_DEFAULT_REPLAY_CASES {
+        let declarations = if style {
+            format!("{declared}[output-styles.STE]\nsource = \"cat\"\n")
+        } else {
+            declared.clone()
+        };
+        let project =
+            claude_default_replay_base(&world, name, &declarations, initial, change, base);
+        let settings = project.join(".claude/settings.json");
+        let permissions = serde_json::json!({"allow": ["Read"]});
+        let mut user = serde_json::json!({"permissions": permissions});
+        if let Some(value) = initial {
+            user["switchModelsOnFlag"] = value.into();
+        }
+        let transition = claude_default_transition(&world, &project, action, name);
+        assert!(transition.status.success(), "{name}: {}", said(&transition));
+        let actual: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(actual["switchModelsOnFlag"].as_bool(), expected, "{name}");
+        assert_eq!(
+            actual["permissions"],
+            if style {
+                serde_json::Value::Null
+            } else {
+                permissions
+            },
+            "{name}"
+        );
+        if style {
+            assert_eq!(actual["outputStyle"], "STE", "{name}");
+        }
+        if matches!(action, ClaudeDefaultAction::Disable) {
+            let mut retained = user.clone();
+            retained
+                .as_object_mut()
+                .unwrap()
+                .shift_remove("switchModelsOnFlag");
+            if let Some(value) = expected {
+                retained["switchModelsOnFlag"] = value.into();
+            }
+            assert_eq!(actual, retained, "{name}");
+        }
+        let (output, document) =
+            verify_from(&world.home, &project, "project", Some("default-base"));
+        assert!(output.status.success(), "{name}: {}", said(&output));
+        let mut expected_keys = vec![(
+            "hook",
+            "guard",
+            ".claude/settings.json",
+            Some(Foreign::Unchanged),
+        )];
+        if style {
+            expected_keys.push((
+                "output-style",
+                "STE",
+                ".claude/settings.json",
+                Some(Foreign::Unchanged),
+            ));
+        }
+        let mut actual_keys = keys_positions(&document);
+        expected_keys.sort_by_key(|position| (position.0, position.1, position.2));
+        actual_keys.sort_by_key(|position| (position.0, position.1, position.2));
+        assert_eq!(actual_keys, expected_keys, "{name}");
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ClaudeDefaultAction {
+    Apply,
+    Disable,
+    Unreachable,
+    AddSkill,
+}
+
+#[allow(clippy::unwrap_used)]
+fn claude_default_transition(
+    world: &World,
+    project: &Path,
+    action: ClaudeDefaultAction,
+    case: &str,
+) -> Output {
+    use kendex_core::lock::{ClaudeProjectDefault, load};
+    let settings = project.join(".claude/settings.json");
+    let retained = matches!(
+        action,
+        ClaudeDefaultAction::Unreachable | ClaudeDefaultAction::AddSkill
+    );
+    let before = retained.then(|| fs::read(&settings).unwrap());
+    if retained {
+        assert_eq!(
+            load(&project.join(RECORD)).unwrap().claude_project_default,
+            Some(ClaudeProjectDefault::Owned),
+            "{case}"
+        );
+    }
+    let output = match action {
+        ClaudeDefaultAction::Apply => kendex(&world.home, project, &["apply", "-y", "--leave"]),
+        ClaudeDefaultAction::Disable => kendex(
+            &world.home,
+            project,
+            &["disable", "guard", "--scope", "project", "-y", "--leave"],
+        ),
+        ClaudeDefaultAction::Unreachable => {
+            let missing = world.catalog.with_file_name("unreachable-catalog");
+            fs::rename(&world.catalog, &missing).unwrap();
+            assert!(!world.catalog.exists());
+            let output = kendex(&world.home, project, &["apply", "-y", "--leave"]);
+            fs::rename(missing, &world.catalog).unwrap();
+            output
+        }
+        ClaudeDefaultAction::AddSkill => kendex(
+            &world.home,
+            project,
+            &["add", "--skill", "cat::second", "-y", "--leave"],
+        ),
+    };
+    assert!(output.status.success(), "{case}: {}", said(&output));
+    if let Some(before) = before {
+        let record = load(&project.join(RECORD)).unwrap();
+        assert_eq!(
+            record.claude_project_default,
+            Some(ClaudeProjectDefault::Owned),
+            "{case}"
+        );
+        assert!(
+            record
+                .entries
+                .values()
+                .any(|entry| entry.kind == kendex_core::model::ItemKind::Hook
+                    && entry.harness == HarnessId::Claude
+                    && entry.name == "guard"
+                    && entry.enabled),
+            "{case}"
+        );
+        assert!(project.join(".claude/hooks/guard.sh").is_file(), "{case}");
+        assert_eq!(fs::read(&settings).unwrap(), before, "{case}");
+        if matches!(action, ClaudeDefaultAction::AddSkill) {
+            assert!(
+                record.entries.values().any(|entry| entry.kind
+                    == kendex_core::model::ItemKind::Skill
+                    && entry.harness == HarnessId::Claude
+                    && entry.name == "second"
+                    && entry.enabled),
+                "{case}"
+            );
+        }
+    }
+    output
+}
+
+#[derive(Clone, Copy)]
+enum ClaudeDefaultReplayBase {
+    Installed,
+    Legacy,
+    OwnedDeletion,
+    BeforeInstall,
+}
+
+#[allow(clippy::unwrap_used)]
+fn claude_default_replay_base(
+    world: &World,
+    name: &str,
+    declared: &str,
+    initial: Option<bool>,
+    change: Option<Option<bool>>,
+    base: ClaudeDefaultReplayBase,
+) -> PathBuf {
+    let project = second_project(world, name, declared);
+    let settings = project.join(".claude/settings.json");
+    let mut user = serde_json::json!({"permissions": {"allow": ["Read"]}});
+    if let Some(value) = initial {
+        user["switchModelsOnFlag"] = value.into();
+    }
+    if !matches!(base, ClaudeDefaultReplayBase::BeforeInstall) {
+        write(&settings, &format!("{user}\n"));
+    }
+    if !matches!(base, ClaudeDefaultReplayBase::BeforeInstall) {
+        let install = kendex(&world.home, &project, &["apply", "-y", "--leave"]);
+        assert!(install.status.success(), "{name}: {}", said(&install));
+    }
+    if let Some(value) = change {
+        // Release ownership before the base commit, including a true
+        // choice reached by changing the owned default to false first.
+        edit_json(&settings, |settings| {
+            settings["switchModelsOnFlag"] = false.into();
+        });
+        let release = kendex(&world.home, &project, &["apply", "-y", "--leave"]);
+        assert!(release.status.success(), "{name}: {}", said(&release));
+        edit_json(&settings, |settings| match value {
+            Some(value) => settings["switchModelsOnFlag"] = value.into(),
+            None => {
+                settings
+                    .as_object_mut()
+                    .unwrap()
+                    .shift_remove("switchModelsOnFlag");
+            }
+        });
+    }
+    if matches!(
+        base,
+        ClaudeDefaultReplayBase::Legacy | ClaudeDefaultReplayBase::OwnedDeletion
+    ) {
+        edit_json(&settings, |settings| {
+            settings
+                .as_object_mut()
+                .unwrap()
+                .shift_remove("switchModelsOnFlag");
+        });
+    }
+    if matches!(base, ClaudeDefaultReplayBase::OwnedDeletion) {
+        let record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(project.join(RECORD)).unwrap()).unwrap();
+        assert_eq!(record["claudeProjectDefault"], "owned");
+    }
+    if matches!(base, ClaudeDefaultReplayBase::BeforeInstall) {
+        assert!(!settings.exists());
+        assert!(!project.join(RECORD).exists());
+    }
+    if matches!(base, ClaudeDefaultReplayBase::Legacy) {
+        edit_json(&project.join(RECORD), |record| {
+            record
+                .as_object_mut()
+                .unwrap()
+                .shift_remove("claudeProjectDefault");
+        });
+    }
+    if !matches!(base, ClaudeDefaultReplayBase::BeforeInstall) {
+        commit(&project, "base settings and ownership");
+    }
+    git(&project, &["tag", "default-base"]);
+    project
+}
+
 /// A hook the catalog or the manifest moved to another event is one
 /// entry in its new place, not two: the pass that moved it retired the
 /// entry the record named before it registered the current one. Judged

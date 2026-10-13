@@ -188,6 +188,147 @@ fn an_every_agent_hook_on_claude_lives_in_settings_not_agent_files() {
     assert!(clean.drift.is_empty(), "{:?}", clean.drift);
 }
 
+const CLAUDE_SETTINGS_ROWS: &[(&str, bool, &str, Option<bool>, Option<bool>, bool)] = {
+    const HOOK: &str = "[[custom-hooks]]\nname = \"guard\"\nevent = \"PreToolUse\"\nmatcher = \"Bash\"\ncommand = \"./guard.sh\"\nagents = \"all\"\n";
+    const PLUGIN: &str = "[plugins.\"fmt@marketplace\"]\nenabled = true\nharness = \"claude\"\n";
+    const SKILL: &str = "[skills.inspect]\nsource = \"cat\"\n";
+    const AGENT: &str = "[agents.scout]\nsource = \"cat\"\n";
+    const STYLE: &str = "[output-styles.STE]\nsource = \"cat\"\n";
+    const MCP: &str = "[mcp-servers.reader]\nsource = \"cat\"\n";
+    &[
+        ("claude", false, HOOK, None, Some(true), true),
+        ("claude", false, PLUGIN, None, Some(true), true),
+        ("claude", false, STYLE, None, Some(true), true),
+        (
+            "claude",
+            false,
+            "[plugins.\"fmt@marketplace\"]\nenabled = false\nharness = \"claude\"\n",
+            None,
+            None,
+            true,
+        ),
+        ("claude", false, HOOK, Some(false), Some(false), true),
+        ("claude", false, PLUGIN, Some(false), Some(false), true),
+        ("claude", true, PLUGIN, None, None, true),
+        ("codex", false, HOOK, None, None, true),
+        ("claude", false, SKILL, None, None, false),
+        ("claude", false, AGENT, None, None, false),
+        ("claude", false, SKILL, Some(true), Some(true), false),
+        ("claude", false, MCP, None, None, false),
+    ]
+};
+
+#[allow(clippy::unwrap_used)]
+fn claude_settings_catalog(w: &World) -> String {
+    let catalog = w.env.home.join("catalog");
+    for directory in ["skills/inspect", "agents", "output-styles", "mcp"] {
+        fs::create_dir_all(catalog.join(directory)).unwrap();
+    }
+    for (path, contents) in [
+        ("kendex.toml", "is_source_catalog = true\n"),
+        (
+            "skills/inspect/SKILL.md",
+            "---\nname: inspect\ndescription: Inspect files\n---\nInspect files.\n",
+        ),
+        (
+            "agents/scout.md",
+            "---\nname: scout\ndescription: Find files\n---\nFind files.\n",
+        ),
+        (
+            "output-styles/STE.md",
+            "---\nname: STE\ndescription: Short sentences\nkeep-coding-instructions: true\n---\nWrite short sentences.\n",
+        ),
+        ("mcp/reader.toml", "command = \"reader-mcp\"\n"),
+    ] {
+        fs::write(catalog.join(path), contents).unwrap();
+    }
+    format!(
+        "[sources.cat]\n{}\n",
+        crate::test_util::source_path(&catalog)
+    )
+}
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn claude_project_settings_default_reaches_current_settings_registrations_only_in_project_scope() {
+    for &(harness, global, declaration, existing, expected, settings_exist) in CLAUDE_SETTINGS_ROWS
+    {
+        let w = world();
+        let source = claude_settings_catalog(&w);
+        fs::create_dir_all(w.env.home.join(".claude")).unwrap();
+        fs::create_dir_all(w.project.join(".claude")).unwrap();
+        let scope = if global { Scope::Global } else { scope(&w) };
+        let manifest = kendex_core::manifest::manifest_path(&w.env, &scope);
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(
+            manifest,
+            format!("schema = 7\n{source}[install]\nharnesses = [\"{harness}\"]\n{declaration}"),
+        )
+        .unwrap();
+        let first = audit(&w.env, &scope).unwrap();
+        kendex_core::apply::execute(&w.env, &first.plan).unwrap();
+        let claude_settings = w.project.join(".claude/settings.json");
+        if harness == "codex" {
+            assert!(!claude_settings.exists());
+        }
+        let path = match (global, harness) {
+            (true, _) => w.env.home.join(".claude/settings.json"),
+            (false, "codex") => w.project.join(".codex/hooks.json"),
+            (false, _) => w.project.join(".claude/settings.json"),
+        };
+        assert_eq!(path.exists(), settings_exist, "{declaration}");
+        let mut before: serde_json::Value = if settings_exist {
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap()
+        } else {
+            serde_json::json!({})
+        };
+        before
+            .as_object_mut()
+            .unwrap()
+            .shift_remove("switchModelsOnFlag");
+        before["permissions"] = serde_json::json!({"allow": ["Read"]});
+        before["model"] = serde_json::json!("opus");
+        if let Some(value) = existing {
+            before["switchModelsOnFlag"] = serde_json::json!(value);
+        }
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&before).unwrap()),
+        )
+        .unwrap();
+        // A prior writer kept current registrations without this ownership field.
+        let lock_path = kendex_core::lock::lock_path(&w.env, &scope);
+        let mut legacy = kendex_core::lock::load(&lock_path).unwrap();
+        legacy.claude_project_default = None;
+        kendex_core::lock::save(&lock_path, &legacy).unwrap();
+        let report = audit(&w.env, &scope).unwrap();
+        assert!(report.drift.is_empty(), "{:?}", report.drift);
+        kendex_core::apply::execute(&w.env, &report.plan).unwrap();
+        let rendered: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            rendered["switchModelsOnFlag"].as_bool(),
+            expected,
+            "{declaration}"
+        );
+        let mut expected_keys = before;
+        if let Some(value) = expected {
+            expected_keys["switchModelsOnFlag"] = serde_json::json!(value);
+        }
+        assert_eq!(rendered, expected_keys);
+        let clean = audit(&w.env, &scope).unwrap();
+        assert!(clean.plan.ops.iter().all(|op| {
+            !matches!(&op.op, kendex_core::apply::Op::EditFile { path: edited, .. } if edited == &path)
+        }));
+        if harness == "codex" {
+            assert!(!claude_settings.exists());
+            assert!(clean.plan.ops.iter().all(|op| {
+                !matches!(&op.op, kendex_core::apply::Op::EditFile { path: edited, .. } if edited == &claude_settings)
+            }));
+        }
+    }
+}
+
 #[test]
 #[allow(clippy::unwrap_used)]
 fn a_dangerous_command_is_scored_like_a_dangerous_catalog_script() {
