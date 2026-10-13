@@ -39,6 +39,10 @@
 #      for RUN_ALL_SUITE_SECS and RUN_ALL_DEADLINE_EPOCH, each with the
 #      control that plants a defect in that rule alone; and a bound that is
 #      not a number refuses
+#  11. budget warnings: passing suite and job reports retain exit 0,
+#      caller thresholds and margin arithmetic determine warnings, invalid
+#      inputs refuse before launch, batteries emit no partial job reports,
+#      and the final job mode runs no suites; each rule has a must-fail control
 #
 # Bash 3.2 compatible.
 
@@ -185,12 +189,33 @@ while [ "$i" -lt "${#RED_NAMES[@]}" ]; do
   suite "$B" "$name" "${RED_STATUS[i]}" "${RED_BODIES[i]}" "${RED_ERR[i]}"
   want_body="${RED_BODIES[i]}"
   [[ -z "${RED_ERR[i]}" ]] || want_body+=$'\n'"${RED_ERR[i]}"
-  run_battery "$B" 3
-  assert_eq "rc=$RC failed=$(failed_of)" "rc=1 failed=$name " "$name: the run exits 1 and names only it"
-  assert_eq "$(line_of "$name")" "suite=$name seconds=N ${RED_WANT[i]}" "$name reports ${RED_WANT[i]}"
-  assert_eq "$(printf '%s\n' "$OUT" | awk -v h="──── $name ────" -v t="suite=$name " \
-    '$0 == h { on = 1; next } on && index($0, t) == 1 { exit } on')" "$want_body" \
-    "$name: its stdout and stderr are printed whole under its header"
+  # A controlled report duration crosses the enabled review trigger. The
+  # existing red fixtures still own their status and parsed failure count.
+  mutate_file "$B/run-all.sh" 'report "$base" "$status" "$((SECONDS - SLOT_START[k]))"' 'report "$base" "$status" 2'
+  variants=row
+  [ "$i" -ne 0 ] || variants='row control'
+  for variant in $variants; do
+    if [ "$variant" = control ]; then
+      mutate_file "$B/run-all.sh" 'if [[ "$2" == 0 && -z "${4:-}" && "$fail" == 0 ]]; then' \
+        'if [[ "$2" == 0 && -z "${4:-}" && "$fail" == 0 ]] || true; then'
+    fi
+    run_battery "$B" 3 RUN_ALL_REVIEW_SECS=1 RUN_ALL_MARGIN_PERCENT=125 \
+      RUN_ALL_JOB_SECS=900 "RUN_ALL_JOB_STARTED_EPOCH=$(date +%s)" \
+      GITHUB_RUN_ID=202 GITHUB_RUN_ATTEMPT=2 RUNNER_OS=macOS RUN_ALL_SHARD=orch-state
+    warnings="$(awk -v s="suite=$name" '/^::warning::run-all-budget / {for (i=1; i<=NF; i++) if ($i==s) n++} END {print n+0}' <<<"$OUT")"
+    if [ "$variant" = row ]; then
+      assert_eq "rc=$RC failed=$(failed_of)" "rc=1 failed=$name " "$name: the run exits 1 and names only it"
+      assert_eq "$(line_of "$name")" "suite=$name seconds=N ${RED_WANT[i]}" "$name reports ${RED_WANT[i]}"
+      assert_eq "$(printf '%s\n' "$OUT" | awk -v h="──── $name ────" -v t="suite=$name " \
+        '$0 == h { on = 1; next } on && index($0, t) == 1 { exit } on')" "$want_body" \
+        "$name: its stdout and stderr are printed whole under its header"
+      assert_eq "$warnings" 0 "$name emits no passing-suite budget annotation"
+    else
+      CONTROL_RC=0
+      ( assert_eq "$warnings" 0 "$name passing-only annotation oracle"; [ "$FAIL" -eq 0 ] ) >"$B/control.out" || CONTROL_RC=$?
+      assert_eq "rc=$RC warnings=$warnings oracle=$CONTROL_RC" 'rc=1 warnings=1 oracle=1' "$name control rejects a budget annotation on failure"
+    fi
+  done
   i=$((i + 1))
 done
 
@@ -580,11 +605,13 @@ the stop names the row the suite printed last|trapped|RUN_ALL_SUITE_SECS=2|rc=1 
 n=0
 shared=""
 shared_outcome=""
+shared_warnings=""
 while IFS='|' read -r rule kind settings want edit control_want; do
   n=$((n + 1))
   for variant in row control; do
     if [ "$variant" = row ] && [ -n "$shared" ] && [ "$kind $settings" = "$shared" ]; then
       got="$shared_outcome"
+      red_warnings="$shared_warnings"
     else
       B="$TMP_ROOT/bound-$n-$variant"
       bound_battery "$B" "$kind"
@@ -601,17 +628,27 @@ while IFS='|' read -r rule kind settings want edit control_want; do
         case "$setting" in *=+*) setting="${setting%%=*}=$(($(date +%s) + ${setting#*=+}))" ;; esac
         args+=("$setting")
       done
-      run_bounded "$B" "${args[@]}"
+      run_bounded "$B" "${args[@]}" RUN_ALL_REVIEW_SECS=1 RUN_ALL_MARGIN_PERCENT=125 \
+        RUN_ALL_JOB_SECS=900 "RUN_ALL_JOB_STARTED_EPOCH=$(date +%s)" \
+        GITHUB_RUN_ID=202 GITHUB_RUN_ATTEMPT=2 RUNNER_OS=macOS RUN_ALL_SHARD=orch-state
       got="$(bound_outcome "$B")"
+      red_warnings="$(awk '
+        $1 ~ /^suite=/ && $4 != "fail=0" { red[$1] = 1 }
+        /^::warning::run-all-budget / {
+          for (i = 1; i <= NF; i++) if ($i ~ /^suite=/) warnings[$i]++
+        }
+        END { for (suite in red) n += warnings[suite]; print n + 0 }
+      ' <<<"$OUT")"
       if [ "$variant" = row ]; then
         case "$settings" in
           *=+*) shared="" ;;
-          *) shared="$kind $settings"; shared_outcome="$got" ;;
+          *) shared="$kind $settings"; shared_outcome="$got"; shared_warnings="$red_warnings" ;;
         esac
       fi
     fi
     if [ "$variant" = row ]; then
       expect="$want" name="$rule"
+      assert_eq "$red_warnings" 0 "$rule: failed or stopped suites emit no passing-suite budget annotation"
     else
       expect="$control_want" name="control, $edit: $rule fails"
     fi
@@ -635,6 +672,124 @@ while IFS='|' read -r setting want; do
   assert_eq "rc=$RC $(printf '%s\n' "$OUT" | sed -n '1s/ is.*//p') started=$(started_of | tr '\n' ' ')" \
     "rc=1 $want started=" "${setting%%=*} that is not a number refuses before any suite runs"
 done <<<"$JUNK_ROWS"
+
+# The private production function judges synthetic durations at each boundary.
+# The full runner below proves its suite and job reports call that function.
+budget_of() { # RUNNER SECONDS CAP REVIEW PERCENT
+  (
+    REVIEW_SECS="$4" RUN_ALL_MARGIN_PERCENT="$5"
+    GITHUB_RUN_ID=202 GITHUB_RUN_ATTEMPT=2 RUNNER_OS=macOS RUN_ALL_SHARD=orch-state
+    eval "$(sed -n '/^budget_warning() {/,/^}/p' "$1")"
+    budget_warning slow "$2" "$3"
+  )
+}
+B="$TMP_ROOT/budget"
+battery "$B"
+for row in \
+  'linux-at-review|300|900|300|125|quiet' \
+  'linux-over-review|301|900|300|125|warning' \
+  'mac-at-review|600|1800|600|125|quiet' \
+  'mac-over-review|601|1800|600|125|warning' \
+  'at-margin|720|900|1000|125|quiet' \
+  'over-margin|721|900|1000|125|warning' \
+  'local-policy-absent|883|900||125|quiet'; do
+  IFS='|' read -r name seconds cap review percent expected <<<"$row"
+  got="$(budget_of "$B/run-all.sh" "$seconds" "$cap" "$review" "$percent")"
+  want=""
+  if [ "$expected" = warning ]; then
+    want="::warning::run-all-budget run=202 attempt=2 os=macOS shard=orch-state suite=slow seconds=$seconds bound=$cap review=$review margin-percent=$percent"
+  fi
+  assert_eq "$got" "$want" "$name annotation consumed by oversee-watch"
+done
+
+# Drop each independent comparison without removing its matched code.
+for row in 'review|301|900|300|125' 'margin|721|900|1000|125' 'annotation|301|900|300|125'; do
+  IFS='|' read -r rule seconds cap review percent <<<"$row"
+  cp "$B/run-all.sh" "$B/control"
+  case "$rule" in
+    review) mutate_file "$B/control" '[ "$2" -gt "$REVIEW_SECS" ]' '[ "$2" -gt "$REVIEW_SECS" ] && false' ;;
+    margin) mutate_file "$B/control" '[ "$(( $2 * RUN_ALL_MARGIN_PERCENT ))" -gt "$(( $3 * 100 ))" ]' '[ "$(( $2 * RUN_ALL_MARGIN_PERCENT ))" -gt "$(( $3 * 100 ))" ] && false' ;;
+    annotation) mutate_file "$B/control" "printf '::warning::run-all-budget" "printf '::notice::run-all-budget" ;;
+  esac
+  got="$(budget_of "$B/control" "$seconds" "$cap" "$review" "$percent")"
+  CONTROL_RC=0
+  ( assert_eq "$got" "::warning::run-all-budget run=202 attempt=2 os=macOS shard=orch-state suite=slow seconds=$seconds bound=$cap review=$review margin-percent=$percent" "$rule budget oracle"; [ "$FAIL" -eq 0 ] ) >"$B/control.out" || CONTROL_RC=$?
+  assert_eq "$CONTROL_RC" 1 "$rule control turns budget oracle red"
+done
+
+printf '#!/usr/bin/env bash\nsleep 2\n' >"$B/slow.sh"
+run_battery "$B" 1 RUN_ALL_REVIEW_SECS=1 RUN_ALL_MARGIN_PERCENT=125 \
+  RUN_ALL_JOB_SECS=900 "RUN_ALL_JOB_STARTED_EPOCH=$(date +%s)" \
+  GITHUB_RUN_ID=202 GITHUB_RUN_ATTEMPT=2 RUNNER_OS=macOS RUN_ALL_SHARD=orch-state
+assert_eq "rc=$RC $(awk '/^::warning::run-all-budget / { for (i=1; i<=NF; i++) if ($i ~ /^suite=/) print $i }' <<<"$OUT" | sort | tr '\n' ' ')" \
+  'rc=0 suite=slow ' 'green battery warns only for its completed suite'
+mutate_file "$B/run-all.sh" 'budget_warning "$1" "$3" "$SUITE_SECS"' ': "$1" "$3" "$SUITE_SECS"'
+run_battery "$B" 1 RUN_ALL_REVIEW_SECS=1 RUN_ALL_MARGIN_PERCENT=125 \
+  RUN_ALL_JOB_SECS=900 "RUN_ALL_JOB_STARTED_EPOCH=$(date +%s)"
+CONTROL_RC=0
+( assert_eq "$(awk '/^::warning::run-all-budget .*suite=slow / { n++ } END { print n+0 }' <<<"$OUT")" 1 'runner annotation oracle'; [ "$FAIL" -eq 0 ] ) >"$B/control.out" || CONTROL_RC=$?
+assert_eq "rc=$RC oracle=$CONTROL_RC" 'rc=0 oracle=1' 'control drops suite annotation and keeps runner green'
+
+# GitHub's shared step anchor can run several batteries in one job. These
+# completion epochs are controlled lifecycle inputs, not performance data.
+B="$TMP_ROOT/final-job"
+battery "$B"
+mkdir -p "$B.bin"
+printf '#!/usr/bin/env bash\n[ "$JOB_TEST_EPOCH" != unread ] || exit 1\nprintf "%%s\\n" "$JOB_TEST_EPOCH"\n' >"$B.bin/date"
+chmod +x "$B.bin/date"
+printf '#!/usr/bin/env bash\nprintf "ran\\n" >>"${REPORT_SUITE_TRACE:?}"\n' >"$B/green.sh"
+TRACE="$B/trace"
+: >"$TRACE"
+for epoch in 1310 1321 1333; do
+  run_battery "$B" 1 JOB_TEST_EPOCH="$epoch" REPORT_SUITE_TRACE="$TRACE" \
+    RUN_ALL_REVIEW_SECS=300 RUN_ALL_MARGIN_PERCENT=125 RUN_ALL_JOB_SECS=900 \
+    RUN_ALL_JOB_STARTED_EPOCH=1000 RUN_ALL_SHARD=linear RUNNER_OS=Linux \
+    GITHUB_RUN_ID=202 GITHUB_RUN_ATTEMPT=2
+  assert_eq "rc=$RC starts=$(started_of) jobs=$(awk '/^::warning::run-all-budget .*suite=job / {n++} END {print n+0}' <<<"$OUT")" \
+    'rc=0 starts=green jobs=0' "battery completion $epoch reports no partial job time"
+done
+JOB_WARNING='::warning::run-all-budget run=202 attempt=2 os=Linux shard=linear suite=job seconds=333 bound=900 review=300 margin-percent=125'
+for row in 'review-boundary|1300|300|0|' "final-warning|1333|300|0|$JOB_WARNING" 'local-policy-absent|unread||0|' 'clock-unread|unread|300|1|'; do
+  IFS='|' read -r name epoch review want_rc want <<<"$row"
+  run_battery "$B" 1 JOB_TEST_EPOCH="$epoch" REPORT_SUITE_TRACE="$TRACE" \
+    RUN_ALL_REVIEW_SECS="$review" RUN_ALL_MARGIN_PERCENT=125 RUN_ALL_JOB_SECS=900 \
+    RUN_ALL_JOB_STARTED_EPOCH=1000 RUN_ALL_SHARD=linear RUNNER_OS=Linux \
+    GITHUB_RUN_ID=202 GITHUB_RUN_ATTEMPT=2 -- --report-job
+  got="$(awk '/^::warning::run-all-budget /' <<<"$OUT")"
+  assert_eq "rc=$RC starts=$(started_of) trace=$(awk 'END {print NR}' "$TRACE") evidence=$got" \
+    "rc=$want_rc starts= trace=3 evidence=$want" "$name final job mode runs no suites"
+done
+for rule in job-warning no-launch arguments partial; do
+  cp "$TEST_DIR/run-all.sh" "$B/run-all.sh"
+  args=(--report-job) expected="rc=0 starts= evidence=$JOB_WARNING"
+  case "$rule" in
+    job-warning) mutate_file "$B/run-all.sh" 'budget_warning job "$((now - RUN_ALL_JOB_STARTED_EPOCH))" "$RUN_ALL_JOB_SECS"' ': job "$((now - RUN_ALL_JOB_STARTED_EPOCH))" "$RUN_ALL_JOB_SECS"' ;;
+    no-launch) mutate_file "$B/run-all.sh" $'  exit 0\nfi\n\nSELECT=()' $'  shift\nfi\n\nSELECT=()' ;;
+    arguments) mutate_file "$B/run-all.sh" '[ "$#" -eq 1 ] || { echo' '[ "$#" -ge 1 ] || { echo'; args+=(=green); expected='rc=1 starts= evidence=' ;;
+    partial) mutate_file "$B/run-all.sh" $'if [[ ${#FAIL_FILES[@]} -eq 0 ]]; then\n' $'if [[ ${#FAIL_FILES[@]} -eq 0 ]]; then\n  now="$(date +%s)"\n  budget_warning job "$((now - RUN_ALL_JOB_STARTED_EPOCH))" "$RUN_ALL_JOB_SECS"\n'; args=(); expected='rc=0 starts=green evidence=' ;;
+  esac
+  run_battery "$B" 1 JOB_TEST_EPOCH=1333 REPORT_SUITE_TRACE="$TRACE" \
+    RUN_ALL_REVIEW_SECS=300 RUN_ALL_MARGIN_PERCENT=125 RUN_ALL_JOB_SECS=900 \
+    RUN_ALL_JOB_STARTED_EPOCH=1000 RUN_ALL_SHARD=linear RUNNER_OS=Linux \
+    GITHUB_RUN_ID=202 GITHUB_RUN_ATTEMPT=2 -- ${args[@]+"${args[@]}"}
+  CONTROL_RC=0
+  ( assert_eq "rc=$RC starts=$(started_of) evidence=$(awk '/^::warning::run-all-budget /' <<<"$OUT")" "$expected" "$rule final-job oracle"; [ "$FAIL" -eq 0 ] ) >"$B/control.out" || CONTROL_RC=$?
+  assert_eq "$CONTROL_RC" 1 "$rule control turns final-job oracle red"
+done
+
+B="$TMP_ROOT/budget-input"
+green_battery "$B"
+for setting in RUN_ALL_REVIEW_SECS=0 RUN_ALL_MARGIN_PERCENT=x RUN_ALL_JOB_SECS=0 RUN_ALL_JOB_STARTED_EPOCH=; do
+  run_battery "$B" 1 RUN_ALL_REVIEW_SECS=1 RUN_ALL_MARGIN_PERCENT=125 \
+    RUN_ALL_JOB_SECS=900 "RUN_ALL_JOB_STARTED_EPOCH=$(date +%s)" "$setting"
+  assert_eq "rc=$RC started=$(started_of | tr '\n' ' ')" 'rc=1 started=' "$setting refuses before suites start"
+done
+mutate_file "$B/run-all.sh" "'' | *[!0-9]* | 0*) echo \"run-all.sh: budget-input value=\$value\"" "__unreachable__) echo \"run-all.sh: budget-input value=\$value\""
+run_battery "$B" 1 RUN_ALL_REVIEW_SECS=0 RUN_ALL_MARGIN_PERCENT=125 \
+  RUN_ALL_JOB_SECS=900 "RUN_ALL_JOB_STARTED_EPOCH=$(date +%s)"
+CONTROL_RC=0
+( assert_eq "rc=$RC started=$(started_of | tr '\n' ' ')" 'rc=1 started=' 'budget-input oracle'; [ "$FAIL" -eq 0 ] ) >"$B/control.out" || CONTROL_RC=$?
+assert_eq "rc=$RC oracle=$CONTROL_RC" 'rc=0 oracle=1' 'control permits invalid timing policy and turns refusal oracle red'
 
 echo
 printf 'pass: %d   fail: %d\n' "$PASS" "$FAIL"

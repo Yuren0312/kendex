@@ -189,5 +189,27 @@ CONTROL_RC=0
 ( assert_eq "rc=$MAIN_RC events=$MAIN_EVENTS" 'rc=0 events=' 'unchanged-suite event oracle'; [[ "$FAIL" -eq 0 ]] ) > "$STUB_DIR/control.out" || CONTROL_RC=$?
 assert_eq "watch=$MAIN_RC oracle=$CONTROL_RC" 'watch=0 oracle=1' 'control rejects raw diagnostics in failure identity' "$STUB_DIR/err"
 
+# The removed budget reader must make no workflow-history or full-log read.
+# A private current-watch mutation makes the forbidden history request.
+for code in current mutant; do
+  TARGET="$(mutant_scripts "main-push-cut-$code/orch" oversee-watch)/oversee-watch" || exit 1
+  ln -s "$REPO_ROOT/skills/github" "$TMP_ROOT/main-push-cut-$code/github"
+  if [[ "$code" == mutant ]]; then
+    mutate_file "$TARGET" $'    IFS=\'|\' read -r run conclusion <<<"$runs"\n' \
+      $'    gh api --paginate "repos/$repo/actions/workflows/skill-tests.yml/runs?per_page=100" --slurp > /dev/null 2>"$errf" || :\n    IFS=\'|\' read -r run conclusion <<<"$runs"\n'
+  fi
+  new_case "main_push_cut_$code"
+  printf '[{"databaseId":202,"headBranch":"main","event":"push","status":"completed","conclusion":"success"}]\n' >"$STUB_DIR/main-push.owner_repo.json"
+  WATCH_BIN="$TARGET" main_watch
+  READS="$(awk '/^api .*actions\/workflows\/skill-tests.yml\/runs/ || /^run view .* --log$/ {n++} END {print n+0}' "$STUB_DIR/gh.calls")"
+  if [[ "$code" == current ]]; then
+    assert_eq "rc=$MAIN_RC reads=$READS events=$MAIN_EVENTS" 'rc=0 reads=0 events=' 'green main judgment makes no budget reads' "$STUB_DIR/err"
+  else
+    CONTROL_RC=0
+    ( assert_eq "rc=$MAIN_RC reads=$READS events=$MAIN_EVENTS" 'rc=0 reads=0 events=' 'cut budget-read oracle'; [[ "$FAIL" -eq 0 ]] ) >"$STUB_DIR/control.out" || CONTROL_RC=$?
+    assert_eq "watch=$MAIN_RC reads=$READS oracle=$CONTROL_RC" 'watch=0 reads=1 oracle=1' 'restored history read fails the budget-read oracle' "$STUB_DIR/err"
+  fi
+done
+
 printf '\npass: %d   fail: %d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

@@ -16,6 +16,7 @@
 #   bash skills/orch/tests/run-all.sh --shard orch-oversee # CI's platform partition
 #   bash skills/orch/tests/run-all.sh --battery tools/tests   # another tree's
 #   bash skills/orch/tests/run-all.sh --battery DIR --alone NAME   # NAME alone
+#   bash skills/orch/tests/run-all.sh --report-job   # final passing job report
 #
 # `--battery DIR`, given first, runs the suites in DIR in place of this
 # directory's, under the same filters, pool and report; tools/tests/run-all.sh
@@ -39,11 +40,27 @@
 # below runs by itself after the others. run-all.sh prints a start line as
 # it launches each suite, so a run cut off by a signal or a job timeout still
 # names every suite that was running; after each suite's output it prints
-# one line, and after the last suite one total line:
+# one report line, and after the last suite one total line:
 #
 #   start suite=<name>
 #   suite=<name> seconds=<n> pass=<n> fail=<n>
 #   total suites=<n> seconds=<n> pass=<n> fail=<n>
+#
+# A passing suite can print a warning after its report line. --report-job
+# prints final job evidence without running suites. The workflow calls it
+# once in its last successful shared suite step, after all batteries finish.
+# A battery total emits no job warning. Warnings keep the passing exit status:
+#
+#   ::warning::run-all-budget run=<id> attempt=<n> os=<name> shard=<name> suite=<name|job> seconds=<n> bound=<n> review=<n> margin-percent=<n>
+#
+# A warning means seconds exceed the review threshold, or seconds times
+# margin-percent exceed 100 times the bound. Job seconds count from the
+# caller's job-start epoch. Nonempty RUN_ALL_REVIEW_SECS enables warnings.
+# That input, RUN_ALL_MARGIN_PERCENT, RUN_ALL_JOB_SECS and
+# RUN_ALL_JOB_STARTED_EPOCH must all be positive whole numbers. A missing
+# or invalid required input refuses before any suite starts. RUN_ALL_SHARD
+# is optional and defaults to the selected battery. skill-tests.yml supplies
+# its review and margin inputs; this package sets no defaults for those inputs.
 #
 # Two bounds hold a suite. RUN_ALL_SUITE_SECS (default 900) counts from the
 # suite's own start. RUN_ALL_DEADLINE_EPOCH, where set, is the Unix time in
@@ -117,6 +134,36 @@ if [ "${1-}" = --battery ]; then
 fi
 # The verdict line names the tree whose tests/ the battery is.
 BATTERY="$(basename "$(dirname "$TEST_DIR")")"
+
+# CI supplies its review policy. Local batteries have no timing policy.
+REVIEW_SECS="${RUN_ALL_REVIEW_SECS:-}"
+if [ -n "$REVIEW_SECS" ]; then
+  for value in "$REVIEW_SECS" "${RUN_ALL_MARGIN_PERCENT:-}" "${RUN_ALL_JOB_SECS:-}" "${RUN_ALL_JOB_STARTED_EPOCH:-}"; do
+    case "$value" in
+      '' | *[!0-9]* | 0*) echo "run-all.sh: budget-input value=$value" >&2; exit 1 ;;
+    esac
+  done
+fi
+
+budget_warning() { # SUITE SECONDS CAP
+  [ -n "$REVIEW_SECS" ] || return 0
+  if [ "$2" -gt "$REVIEW_SECS" ] || [ "$(( $2 * RUN_ALL_MARGIN_PERCENT ))" -gt "$(( $3 * 100 ))" ]; then
+    printf '::warning::run-all-budget run=%s attempt=%s os=%s shard=%s suite=%s seconds=%s bound=%s review=%s margin-percent=%s\n' \
+      "${GITHUB_RUN_ID:-unknown}" "${GITHUB_RUN_ATTEMPT:-unknown}" "${RUNNER_OS:-unknown}" \
+      "${RUN_ALL_SHARD:-$BATTERY}" "$1" "$2" "$3" "$REVIEW_SECS" "$RUN_ALL_MARGIN_PERCENT"
+  fi
+}
+
+# The workflow calls this once after every selected battery succeeds.
+# A battery completion is only a partial measurement of that job.
+if [ "${1-}" = --report-job ]; then
+  [ "$#" -eq 1 ] || { echo 'run-all.sh: job-report-arguments' >&2; exit 1; }
+  if [ -n "$REVIEW_SECS" ]; then
+    now="$(date +%s)" || { echo 'run-all.sh: budget-clock=unread' >&2; exit 1; }
+    budget_warning job "$((now - RUN_ALL_JOB_STARTED_EPOCH))" "$RUN_ALL_JOB_SECS"
+  fi
+  exit 0
+fi
 
 SELECT=()
 REJECT=()
@@ -301,6 +348,9 @@ report() { # BASE STATUS SECONDS [STOP LAST]
   TOTAL_PASS=$((TOTAL_PASS + pass))
   TOTAL_FAIL=$((TOTAL_FAIL + fail))
   printf 'suite=%s seconds=%s pass=%s fail=%s\n' "$1" "$3" "$pass" "$fail"
+  if [[ "$2" == 0 && -z "${4:-}" && "$fail" == 0 ]]; then
+    budget_warning "$1" "$3" "$SUITE_SECS"
+  fi
 }
 
 # A live process's start time, which with its pid names that one process: a
