@@ -51,3 +51,13 @@ control_expect "get with --bundle: bundle command uses the supported option"
 control_replace scripts/commands/issues.sh 1 \
     '            echo "Hint: Read the bundle: linear.sh issues get ${issue_id} --with-bundle" >&2' \
     '            echo "Hint: Read the bundle: linear.sh issues get ${issue_id} --bundle" >&2'
+
+control_expect "bulk-get compact returns its format"
+control_replace scripts/commands/issues.sh 2 \
+    '        format_issues_list_compact "$result"' \
+    '        format_issues_list "$result"'
+
+control_expect "bulk-get comapct requests"
+control_replace scripts/commands/issues.sh 1 \
+    '    linear_require_format "$FORMAT" safe compact ids raw || return 1' \
+    '    :'

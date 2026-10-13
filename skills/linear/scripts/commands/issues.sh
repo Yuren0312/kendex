@@ -93,6 +93,7 @@ Get:
 Bulk Get:
   issues.sh bulk-get <id1> <id2> ...   Get multiple issues with relations
   issues.sh bulk-get --stdin           Read identifiers from stdin (one per line)
+  --format <fmt>                      safe (default) | compact | ids | raw
 
 Bulk Update:
   issues.sh bulk-update <id1> <id2> ... [update-options]
@@ -601,6 +602,8 @@ bulk_get_issues() {
         done
     fi
 
+    linear_require_format "$FORMAT" safe compact ids raw || return 1
+
     local refs
     refs=$(linear_issue_refs refs ${identifiers[@]+"${identifiers[@]}"}) || return 1
 
@@ -634,6 +637,9 @@ bulk_get_issues() {
 
     # Apply output format
     case "$FORMAT" in
+    compact)
+        format_issues_list_compact "$result"
+        ;;
     raw)
         linear_public_result "$result"
         ;;
