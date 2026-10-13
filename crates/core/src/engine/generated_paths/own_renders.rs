@@ -22,8 +22,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use crate::engine::{EngineReport, PlanOptions, plan_scope};
-use crate::env::Env;
+use crate::engine::{
+    DeclarationStatus, DriftState, EngineReport, PlanOptions, plan_apply, plan_scope,
+};
+use crate::env::{Env, FakeOs};
 use crate::lock::{LOCK_FILE, Lock, LockFile, lock_path};
 use crate::manifest::{self, Manifest, ManifestFile};
 use crate::model::Scope;
@@ -35,7 +37,10 @@ const NAME: &str = "render-bytes";
 #[derive(Debug, PartialEq, Eq)]
 enum Finding {
     /// The checkout could not be planned, so what it renders is unknown.
-    Unplanned { root: String, cause: String },
+    Unplanned {
+        root: String,
+        cause: String,
+    },
     /// Inventory paths the plan would not leave as they are committed:
     /// those it writes, and those it holds back as a conflict or a file
     /// kendex did not write, which a refresh with edits discarded leaves as
@@ -44,6 +49,10 @@ enum Finding {
         written: Vec<String>,
         held: Vec<String>,
     },
+    Unsettled {
+        entries: BTreeSet<String>,
+    },
+    Incomplete,
 }
 
 /// Whether every committed render is the bytes this checkout renders.
@@ -103,6 +112,17 @@ fn refusal(finding: &Finding) -> String {
                      it reports for each, then commit the bytes it writes there\n",
                 );
             }
+        }
+        Finding::Unsettled { entries } => {
+            text.push_str(&line("unsettled", &entries.len().to_string()));
+            text.push_str("these install records still fail verification after refresh:\n");
+            for entry in entries {
+                text.push_str(&format!("  {entry}\n"));
+            }
+        }
+        Finding::Incomplete => {
+            text.push_str(&line("incomplete", "declarations"));
+            text.push_str("the declared installation set is incomplete, so record agreement cannot be proved\n");
         }
     }
     text
@@ -310,6 +330,293 @@ fn the_committed_renders_are_the_bytes_this_checkout_renders() {
     if let Standing::Refused(finding) = check(&root) {
         panic!("{}", refusal(&finding));
     }
+}
+
+/// A refresh may hold an edited copy that its source no longer installs,
+/// so comparing desired render bytes alone cannot prove record agreement.
+fn refresh_and_verify(env: &Env, root: &Path) -> Result<Standing, String> {
+    let scope = Scope::Project {
+        root: root.to_path_buf(),
+    };
+    let refresh = plan_apply(
+        env,
+        &scope,
+        &PlanOptions {
+            sweep_unneeded: true,
+            ..PlanOptions::current()
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    if !complete_declarations(&refresh) {
+        return Ok(Standing::Refused(Finding::Incomplete));
+    }
+    crate::apply::execute(env, &refresh.plan).map_err(|error| error.to_string())?;
+    verify_records(env, root)
+}
+
+/// Read the completed refresh's record and compare it with ordinary
+/// verification. Both the repository proof and its controls use this phase.
+fn verify_records(env: &Env, root: &Path) -> Result<Standing, String> {
+    let scope = Scope::Project {
+        root: root.to_path_buf(),
+    };
+    let lock = record(env, root)?;
+    let verified = plan_apply(env, &scope, &crate::attest::Reading::Current.plan_options())
+        .map_err(|error| error.to_string())?;
+    if !complete_declarations(&verified) {
+        return Ok(Standing::Refused(Finding::Incomplete));
+    }
+    let mut entries: BTreeSet<String> = lock
+        .entries
+        .keys()
+        .chain(verified.record.entries.keys())
+        .filter(|key| lock.entries.get(*key) != verified.record.entries.get(*key))
+        .cloned()
+        .collect();
+    entries.extend(verified.drift.iter().filter_map(|row| match row.state {
+        DriftState::Missing | DriftState::Stale | DriftState::Orphaned | DriftState::Conflict => {
+            let key = crate::lock::entry_key(row.kind, &row.name, row.harness);
+            lock.entries.contains_key(&key).then_some(key)
+        }
+        DriftState::Unmanaged => None,
+    }));
+    if !entries.is_empty() {
+        return Ok(Standing::Refused(Finding::Unsettled { entries }));
+    }
+    Ok(Standing::Current)
+}
+
+/// Equal retained records prove nothing when a declared source could not
+/// be read. Both phases consume the engine's completeness decision.
+fn complete_declarations(report: &EngineReport) -> bool {
+    match report.declaration_status {
+        DeclarationStatus::Complete => true,
+        DeclarationStatus::Incomplete => false,
+    }
+}
+
+#[test]
+fn refresh_then_verify_agrees_on_every_committed_install_record() {
+    let (tmp, copy) =
+        committed_copy(&crate::test_util::checkout_root()).expect("the committed checkout copies");
+    let env = Env::fake(crate::test_util::rooted(&tmp).join("home"), FakeOs::Linux);
+    assert!(
+        !record(&env, &copy)
+            .expect("the committed record reads")
+            .entries
+            .is_empty()
+    );
+    match refresh_and_verify(&env, &copy) {
+        Ok(Standing::Current) => {}
+        Ok(Standing::Refused(finding)) => panic!("{}", refusal(&finding)),
+        Err(error) => panic!(
+            "{}",
+            refusal(&Finding::Unplanned {
+                root: crate::paths::slashed(&copy),
+                cause: error,
+            })
+        ),
+    }
+}
+
+const PROBE: &str = "#!/bin/sh\n# ---\n# name: probe\n# event: PreToolUse\n# matcher: Bash\n# harnesses: [claude, codex]\n# ---\nexit 0\n";
+
+struct RefreshFixture {
+    _tmp: tempfile::TempDir,
+    home: PathBuf,
+    project: PathBuf,
+    catalog: PathBuf,
+    env: Env,
+}
+
+#[allow(clippy::expect_used, reason = "fixture setup failures stop the test")]
+impl RefreshFixture {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().expect("the fixture directory creates");
+        let home = crate::test_util::rooted(&tmp);
+        let project = home.join("project");
+        let catalog = home.join("catalog");
+        std::fs::create_dir_all(catalog.join("hooks")).expect("the catalog directory creates");
+        std::fs::write(catalog.join("kendex.toml"), "is_source_catalog = true\n")
+            .expect("the executable catalog declares its layout");
+        std::fs::create_dir_all(&project).expect("the project directory creates");
+        std::fs::write(catalog.join("hooks/probe.sh"), PROBE).expect("the source writes");
+        let env = Env::fake(&home, FakeOs::Linux);
+        let fixture = Self {
+            _tmp: tmp,
+            home,
+            project,
+            catalog,
+            env,
+        };
+        fixture.declare(&crate::test_util::source_path(&fixture.catalog));
+        fixture
+    }
+
+    fn declare(&self, source: &str) {
+        std::fs::write(self.project.join("kendex.toml"), format!(
+        "schema = 7\n[sources.cat]\n{}\n[install]\nharnesses = [\"claude\", \"codex\"]\n[hooks.probe]\nsource = \"cat\"\n",
+        source,
+    )).expect("the declaration writes");
+    }
+}
+
+/// The lock writer records why an installation exists. A lost reason can
+/// leave every installed byte current, so drift alone cannot prove agreement.
+#[test]
+fn changed_record_metadata_is_unsettled_without_disk_drift() {
+    let f = RefreshFixture::new();
+    assert_eq!(
+        refresh_and_verify(&f.env, &f.project),
+        Ok(Standing::Current)
+    );
+    let scope = Scope::Project {
+        root: f.project.clone(),
+    };
+    let key = "hook:probe:codex";
+    let mut lock = record(&f.env, &f.project).expect("the refreshed record reads");
+    let entry = lock.entries.get_mut(key).expect("the hook is recorded");
+    assert!(!entry.reasons.is_empty());
+    entry.reasons.clear();
+    crate::lock::save(&lock_path(&f.env, &scope), &lock).expect("the changed record writes");
+
+    let verified = plan_apply(
+        &f.env,
+        &scope,
+        &crate::attest::Reading::Current.plan_options(),
+    )
+    .expect("the clean installed copies verify");
+    assert_eq!(verified.declaration_status, DeclarationStatus::Complete);
+    assert!(verified.drift.is_empty(), "{:?}", verified.drift);
+    assert_eq!(
+        verify_records(&f.env, &f.project),
+        Ok(Standing::Refused(Finding::Unsettled {
+            entries: BTreeSet::from([key.to_owned()]),
+        }))
+    );
+    assert_eq!(
+        refresh_and_verify(&f.env, &f.project),
+        Ok(Standing::Current)
+    );
+}
+
+/// A catalog change can exclude a tool while a repository sync updates its
+/// old copy without updating the install record. Those bytes remain an
+/// edit; the repository check must reject them before the merge.
+#[test]
+fn an_edited_copy_on_an_excluded_tool_is_unsettled() {
+    let f = RefreshFixture::new();
+    assert_eq!(
+        refresh_and_verify(&f.env, &f.project),
+        Ok(Standing::Current)
+    );
+    let after = PROBE.replace("[claude, codex]", "[claude]");
+    std::fs::write(f.catalog.join("hooks/probe.sh"), &after).expect("the source changes");
+    let excluded = f.project.join(".codex/hooks/probe.sh");
+    std::fs::write(&excluded, &after).expect("the committed copy changes");
+    assert_eq!(
+        refresh_and_verify(&f.env, &f.project),
+        Ok(Standing::Refused(Finding::Unsettled {
+            entries: BTreeSet::from(["hook:probe:codex".to_owned()]),
+        }))
+    );
+    assert_eq!(
+        std::fs::read_to_string(&excluded).expect("the held copy reads"),
+        after
+    );
+    std::fs::remove_file(excluded).expect("the excluded committed copy removes");
+    assert_eq!(
+        refresh_and_verify(&f.env, &f.project),
+        Ok(Standing::Current)
+    );
+}
+
+/// Catalog edits and unavailable checkouts can retain byte-identical
+/// records without completing expansion. The proof needs a complete
+/// declaration set even when an inactive source is legitimate CLI state.
+#[test]
+fn an_incomplete_declaration_set_cannot_prove_record_agreement() {
+    #[derive(Debug)]
+    enum SourceChange {
+        Deleted,
+        Renamed,
+        MissingRoot,
+        InvalidHeader,
+        EscapedItem,
+        Disabled,
+        Unfetched,
+    }
+    let mut missed = Vec::new();
+    for change in [
+        SourceChange::Deleted,
+        SourceChange::Renamed,
+        SourceChange::MissingRoot,
+        SourceChange::InvalidHeader,
+        SourceChange::EscapedItem,
+        SourceChange::Disabled,
+        SourceChange::Unfetched,
+    ] {
+        let f = RefreshFixture::new();
+        assert_eq!(
+            refresh_and_verify(&f.env, &f.project),
+            Ok(Standing::Current)
+        );
+        let installed = f.project.join(".codex/hooks/probe.sh");
+        let bytes = std::fs::read(&installed).expect("the installed copy reads");
+        let recorded =
+            std::fs::read(f.project.join(LOCK_FILE)).expect("the installed record reads");
+        let source = f.catalog.join("hooks/probe.sh");
+        let saved = f.home.join("saved-catalog");
+        match change {
+            SourceChange::Deleted => std::fs::remove_file(&source).expect("the source deletes"),
+            SourceChange::Renamed => std::fs::rename(&source, f.catalog.join("hooks/renamed.sh"))
+                .expect("the source renames"),
+            SourceChange::MissingRoot => {
+                std::fs::rename(&f.catalog, &saved).expect("the catalog moves")
+            }
+            SourceChange::InvalidHeader => std::fs::write(&source, "#!/bin/sh\nexit 0\n")
+                .expect("the unreadable header writes"),
+            SourceChange::EscapedItem => {
+                let outside = f.home.join("outside.sh");
+                std::fs::write(&outside, PROBE).expect("the outside item writes");
+                std::fs::remove_file(&source).expect("the source removes");
+                std::os::unix::fs::symlink(outside, &source).expect("the escaping link creates");
+            }
+            SourceChange::Disabled => f.declare(&format!(
+                "{}\nenabled = false",
+                crate::test_util::source_path(&f.catalog)
+            )),
+            SourceChange::Unfetched => f.declare("repo = \"vanillagreencom/kendex\""),
+        }
+        let result = refresh_and_verify(&f.env, &f.project);
+        if result != Ok(Standing::Refused(Finding::Incomplete)) {
+            missed.push(format!("{change:?}: {result:?}"));
+        }
+        assert_eq!(
+            std::fs::read(&installed).expect("the held copy reads"),
+            bytes
+        );
+        assert_eq!(
+            std::fs::read(f.project.join(LOCK_FILE)).expect("the held record reads"),
+            recorded
+        );
+        if saved.exists() {
+            std::fs::rename(&saved, &f.catalog).expect("the catalog restores");
+        }
+        if source.is_symlink() {
+            std::fs::remove_file(&source).expect("the escaping link removes");
+        }
+        std::fs::write(&source, PROBE).expect("the source restores");
+        f.declare(&crate::test_util::source_path(&f.catalog));
+        assert_eq!(
+            refresh_and_verify(&f.env, &f.project),
+            Ok(Standing::Current)
+        );
+    }
+    assert!(
+        missed.is_empty(),
+        "incomplete declarations accepted: {missed:?}"
+    );
 }
 
 /// One skill this checkout's declaration configures instructions for,
