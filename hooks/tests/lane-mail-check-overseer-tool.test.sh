@@ -189,13 +189,18 @@ assert_eq "RC=$RC context=$(context_line) start=$(recorded_field server_start) h
 # and is not told again while that gap stands; a clean reading clears it.
 told_rows() { # NAME [JUDGE]
   tool_overseer "$1" "${2:-$HOOK}"
+  bind_overseer claude "$OVERSEER_HOME_DIR" s2
   write_transcript "$TRANSCRIPT" 100000
   local first second third
   overseer_tool "$TRANSCRIPT" s2
   first="$(context_line) $(tool_record)"
   overseer_tool "$TRANSCRIPT" s2
   second="$(context_line)"
+  # Each native session is registered before its call. A child with another
+  # id now fails the identity gate before it can reach the gap rules.
+  bind_overseer claude "$OVERSEER_HOME_DIR" s1
   overseer_tool "$TRANSCRIPT"
+  bind_overseer claude "$OVERSEER_HOME_DIR" s2
   overseer_tool "$TRANSCRIPT" s2
   third="$(context_line)"
   TOLD="first=$first second=$second third=$third"
@@ -235,6 +240,7 @@ tool_context() {
 # not handed a standing gap again for it.
 other_pane_rows() { # NAME [JUDGE]
   tool_overseer "$1" "${2:-$HOOK}"
+  bind_overseer claude "$OVERSEER_HOME_DIR" s2
   write_transcript "$TRANSCRIPT" 100000
   local first other
   overseer_tool "$TRANSCRIPT" s2
@@ -257,6 +263,7 @@ assert_eq "${OTHER#* second=}" "PostToolUse lane-mail-check: transcript-unowned=
 # in one context: a gap told once, and a reached mark, each above the note.
 mail_rides_rows() { # NAME [JUDGE]
   tool_overseer "$1" "${2:-$HOOK}"
+  bind_overseer claude "$OVERSEER_HOME_DIR" s2
   write_transcript "$TRANSCRIPT" 100000
   peer_send 'Gap and note.'
   overseer_tool "$TRANSCRIPT" s2
@@ -264,6 +271,7 @@ mail_rides_rows() { # NAME [JUDGE]
   gap="$(context_line) note=$(tool_context | grep -cF 'Gap and note.') unread=$(tool_context | grep -c '^lane-mail-check: unread=1$')"
   append_transcript "$TRANSCRIPT" 600000
   peer_send 'Mark and note.'
+  bind_overseer claude "$OVERSEER_HOME_DIR" s1
   overseer_tool "$TRANSCRIPT"
   RIDES="gap=$gap mark=$(context_line) note=$(tool_context | grep -cF 'Mark and note.') unread=$(tool_context | grep -c '^lane-mail-check: unread=1$')"
 }
@@ -282,6 +290,7 @@ assert_eq "$RIDES" \
 # and the gap is then told, so the next call hands nothing.
 told_refused_rows() { # NAME [JUDGE]
   tool_overseer "$1" "${2:-$HOOK}"
+  bind_overseer claude "$OVERSEER_HOME_DIR" s2
   write_transcript "$TRANSCRIPT" 100000
   peer_send 'Held by a refusal.'
   watch_stub
@@ -356,13 +365,14 @@ pi_tool_rows control_overseer_tool_pi_windowless '{}' "$VARIANT_PATH"
 assert_eq "$PI_TOOL" "context=PostToolUse lane-mail-check: window-unread=pi-claude/m window=null" \
   "control: a hook that reads a windowless Pi tool call records it with no window and tells it unread"
 
-# The overseer the fleet record lost, its pane named by the context record and
-# not by the fleet record, is told so once at its tool call, as a gap.
+# The overseer whose known native binding still matches but whose pane only
+# the context record names is told so once at its tool call, as a gap.
 lost_tool_rows() { # NAME [JUDGE]
   tool_overseer "$1" "${2:-$HOOK}"
   write_transcript "$TRANSCRIPT" 100000
   overseer_tool "$TRANSCRIPT"
   record_overseer %4 "$OVERSEER_SERVER"
+  bind_overseer claude "$OVERSEER_HOME_DIR" s1
   overseer_tool "$TRANSCRIPT"
   LOST_TOOL="$(context_line) $(tool_record)"
 }
@@ -383,10 +393,10 @@ once_rows() { # NAME [JUDGE]
   state_stub update-fails
   peer_send 'Asked once.'
   overseer_tool "$TRANSCRIPT"
-  ONCE="unhealed=$(grep -c '^lane-mail-check: record-unhealed=' "$ERR_FILE") context=$(context_line) note=$(tool_context | grep -cF 'Asked once.')"
+  ONCE="unhealed=$(grep -c '^lane-mail-check: record-unhealed=' "$ERR_FILE") context=$(context_line) note=$(tool_context | grep -cF 'Asked once.' || :)"
 }
 once_rows overseer_tool_once
-assert_eq "$ONCE" "unhealed=1 context=PostToolUse lane-mail-check: record-unhealed=$OVERSEER_SERVER $OVERSEER_PANE note=1" \
+assert_eq "$ONCE" "unhealed=1 context=- note=0" \
   "a call that reads the overseer mailbox identifies the overseer once, and a failed heal is reported once" "$ERR_FILE"
 variant identify-each-ask -e 's/^  if \[ -z "\$IDENTIFIED" \]; then$/  if true; then/'
 once_rows control_overseer_tool_once "$VARIANT_PATH"

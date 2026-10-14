@@ -322,21 +322,26 @@ plant_install() { # [SKIP]
 # The orch install the lane renders under .agents, which the hook finds from
 # any hook directory in the lane, made a copy with SKIP left out: a script, or
 # a library under lib/.
-hole_install() { # SKIP
-  local dir="$LANE/.agents/skills/orch/scripts" entry
-  rm -f -- "${LANE:?}/.agents/skills/orch/scripts"
+hole_install() { # SKIP [SCRIPTS_DIR]
+  local dir="${2:-$LANE/.agents/skills/orch/scripts}" entry
+  if [ -L "$dir" ]; then
+    rm -f -- "$dir"
+    mkdir -p "$dir"
+    case "$1" in lib/*) plant_siblings "$dir" lib ;; *) plant_siblings "$dir" "$1" ;; esac
+  fi
   mkdir -p "$dir"
   case "$1" in
     lib/*)
-      plant_siblings "$dir" lib
+      [ ! -L "$dir/lib" ] || rm -f -- "$dir/lib"
       mkdir -p "$dir/lib"
       for entry in "$REPO_ROOT/skills/orch/scripts/lib"/*; do
         [ "lib/${entry##*/}" != "$1" ] || continue
         ln -s -f -n "$entry" "$dir/lib/${entry##*/}"
       done
       ;;
-    *) plant_siblings "$dir" "$1" ;;
+    *) ;;
   esac
+  rm -f -- "$dir/$1"
 }
 
 # The repository's own reader: it touches MARKER, so a run of it is visible.
@@ -367,13 +372,17 @@ send() { # ITEM TEXT [--re MSGID]
 }
 
 # --- the overseer's identity -----------------------------------------------
-# What establishes an overseer is the pane: `oversee-watch` records the
-# overseer's tmux server and pane in the fleet state, and a session whose own
-# pane key is that pair is that overseer. The tmux stub below is the one read
+# These neutral records name an already-bound native session s1. Initial
+# binding cases clear it before the matching native caller runs.
+# The tmux stub below reads the overseer's server and pane, one part of its
+# identity. It is the one read
 # that asks — the server a pane belongs to, which the orch library pairs with
 # $TMUX_PANE.
 TMUX_BIN="$TMP_ROOT/tmux-bin"
 mkdir -p "$TMUX_BIN"
+# This suite owns the shell until its fixtures and hook calls finish.
+TMUX_PANE_PID=$$
+export TMUX_PANE_PID
 cat > "$TMUX_BIN/tmux" <<'TMUXSTUB'
 #!/bin/sh
 # `display-message -p -t <pane> '#{pid}'`, and `'#{pid} #{start_time}'` for
@@ -386,6 +395,10 @@ case "$*" in
   *'#{start_time}'*)
     [ -n "${TMUX_SERVER_START:-}" ] || { echo "can't find pane" >&2; exit 1; }
     printf '%s %s\n' "$TMUX_SERVER_ID" "$TMUX_SERVER_START" ;;
+  *'#{window_id}'*) printf '%s\n' '@7' ;;
+  *'#{pane_current_path}'*) pwd -P ;;
+  *'#{pane_current_command}'*) printf '%s\n' claude ;;
+  *'#{pane_pid}'*) printf '%s\n' "$TMUX_PANE_PID" ;;
   *) printf '%s\n' "$TMUX_SERVER_ID" ;;
 esac
 TMUXSTUB
@@ -405,7 +418,7 @@ OVERSEER_HOME_DIR="$TMP_ROOT/overseer-home"
 record_overseer() { # PANE SERVER [HOME] [START]
   local record home="${3:-$OVERSEER_HOME_DIR}"
   record="$(jq -nc --arg s "$2" --arg p "$1" --arg h "$home" --arg start "${4:-$OVERSEER_SERVER_START}" \
-    '{server: $s, pane: $p, window: "@7", home: $h, launch_line: "claude -n overseer"}
+    '{server: $s, pane: $p, window: "@7", home: $h, session_id:"s1", launch_line: "claude -n overseer"}
      + (if $start == "none" then {} else {server_start: ($start | tonumber)} end)')"
   (cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" \
     set oversee overseer "$record" >/dev/null)
@@ -414,7 +427,23 @@ record_overseer() { # PANE SERVER [HOME] [START]
 # The environment a session inside the overseer's own pane carries.
 overseer_env() { # [PANE]
   printf '%s\n' "PATH=$TMUX_BIN:$PATH" "TMUX=fake" "TMUX_PANE=${1:-$OVERSEER_PANE}" \
-    "TMUX_SERVER_ID=$OVERSEER_SERVER" "TMUX_SERVER_START=$OVERSEER_SERVER_START"
+    "TMUX_SERVER_ID=$OVERSEER_SERVER" "TMUX_SERVER_START=$OVERSEER_SERVER_START" "CLAUDE_CONFIG_DIR=$OVERSEER_HOME_DIR"
+}
+
+# Every persisted mailbox file, including its cursor, context and told gap.
+overseer_snapshot() {
+  local file
+  for file in "$LANE/tmp/lane-mail/overseer"/* "$LANE/tmp/lane-mail/overseer"/.[!.]*; do
+    [ -f "$file" ] || continue
+    printf '%s ' "${file##*/}"
+    cksum < "$file"
+  done
+}
+
+bind_overseer() { # HARNESS HOME SESSION
+  (cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" update oversee \
+    --arg harness "$1" --arg home "$2" --arg session "$3" \
+    '.overseer += {harness:$harness, home:$home, session_id:$session}' >/dev/null)
 }
 
 # `lane-mail peer send --repo` from another repository's checkout into the
@@ -464,9 +493,11 @@ variant() { # NAME SED-ARGUMENT...
 # hook's ceiling. Its own behaviour is oversee_succeed.sh's subject.
 JUDGE_DIR="$TMP_ROOT/judge"
 mkdir -p "$JUDGE_DIR"
-plant_judge() {
-  plant_install oversee-succeed
-  cat > "$LANE/.claude/skills/orch/scripts/oversee-succeed" <<JUDGE
+plant_judge() { # [SCRIPTS_DIR]
+  local scripts="${1:-$LANE/.claude/skills/orch/scripts}"
+  [ -n "${1:-}" ] || plant_install oversee-succeed
+  rm -f -- "$scripts/oversee-succeed"
+  cat > "$scripts/oversee-succeed" <<JUDGE
 #!/bin/sh
 printf '%s\n' "\$*" >> "$JUDGE_DIR/args"
 # stdout is handed away before the wait: the hook reads this in a command
@@ -477,7 +508,7 @@ printf '%s\n' "\$*" >> "$JUDGE_DIR/args"
 [ ! -f "$JUDGE_DIR/out" ] || cat "$JUDGE_DIR/out"
 exit "\$(cat "$JUDGE_DIR/rc" 2>/dev/null || echo 0)"
 JUDGE
-  chmod +x "$LANE/.claude/skills/orch/scripts/oversee-succeed"
+  chmod +x "$scripts/oversee-succeed"
   rm -f -- "${JUDGE_DIR:?}/args" "${JUDGE_DIR:?}/out" "${JUDGE_DIR:?}/err" \
     "${JUDGE_DIR:?}/rc" "${JUDGE_DIR:?}/hang"
 }
@@ -547,18 +578,17 @@ start_wake_watch() { # repeat|single [CWD]
     > "${WAKE_STATE%/*}/oversee-watch.pid"
 }
 
-# A literal one-line substitution for wake controls. It retains the message
-# and changes the action, so a control cannot pass by deleting its subject.
-wake_mutant() { # NAME OLD NEW
-  local count line
-  [ ! -L "$HOOK" ] || { echo "wake-mutant: source=symlink" >&2; exit 1; }
-  count=$(grep -Fxc -- "$2" "$HOOK") || { echo "wake-mutant: match=missing" >&2; exit 1; }
+# Matching a whole source line keeps a control from changing another rule.
+wake_mutant() { # NAME OLD NEW [SOURCE]
+  local count line source="${4:-$HOOK}"
+  [ ! -L "$source" ] || { echo "wake-mutant: source=symlink" >&2; exit 1; }
+  count=$(grep -Fxc -- "$2" "$source") || { echo "wake-mutant: match=missing" >&2; exit 1; }
   [ "$count" -eq 1 ] || { echo "wake-mutant: match=$count" >&2; exit 1; }
   MUTANT_PATH="$TMP_ROOT/$1.sh"
   while IFS= read -r line; do
     if [ "$line" = "$2" ]; then printf '%s\n' "$3"; else printf '%s\n' "$line"; fi
-  done < "$HOOK" > "$MUTANT_PATH"
-  cmp -s -- "$HOOK" "$MUTANT_PATH" && { echo "wake-mutant: changed=no" >&2; exit 1; }
+  done < "$source" > "$MUTANT_PATH"
+  cmp -s -- "$source" "$MUTANT_PATH" && { echo "wake-mutant: changed=no" >&2; exit 1; }
   return 0
 }
 
@@ -589,7 +619,8 @@ wake_overseer() { # NAME HARNESS [HOOK]
   if [ "$2" = pi ]; then dir="$dir/kendex"; fi
   install_hook "${3:-$HOOK}" "$LANE/$dir/hooks/lane-mail-check.sh"
   CALL_ENV=("PATH=$TMUX_BIN:$PATH" TMUX=fake "TMUX_PANE=$OVERSEER_PANE"
-    "TMUX_SERVER_ID=$OVERSEER_SERVER" "TMUX_SERVER_START=$OVERSEER_SERVER_START" "HOME=$COP_HOME")
+    "TMUX_SERVER_ID=$OVERSEER_SERVER" "TMUX_SERVER_START=$OVERSEER_SERVER_START" "HOME=$COP_HOME"
+    "CLAUDE_CONFIG_DIR=$OVERSEER_HOME_DIR" "CODEX_HOME=$OVERSEER_HOME_DIR" "COPILOT_HOME=$COP_HOME")
 }
 
 # A refusal or passed wake warning has its key first on stderr.

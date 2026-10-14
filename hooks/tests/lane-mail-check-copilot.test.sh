@@ -609,11 +609,101 @@ new_copilot_named() { # NAME [JUDGE]
   unmark_lanes
   (cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" init oversee >/dev/null)
   record_overseer "$OVERSEER_PANE" "$OVERSEER_SERVER"
+  (cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" update oversee '.overseer.home = null' >/dev/null)
 }
 # shellcheck disable=SC2207
 COP_OTHER_ENV=("HOME=$COP_HOME" $(overseer_env %3))
 # shellcheck disable=SC2207
 COP_NAMED_ENV=("HOME=$COP_HOME" $(overseer_env))
+# The prompt-mode child inherits the pane, both harness homes and its own
+# native payload id. It must leave every persisted overseer mailbox file alone.
+copilot_child() { # NAME ARM [HOOK] [RECORD_KIND] [NATIVE_LIB]
+  new_copilot_named "$1" "${3:-$HOOK}"
+  plant_copilot_install oversee-succeed
+  plant_judge "$LANE/.github/skills/orch/scripts"
+  judge_says "$BELOW_MARK_LINE"
+  if [ "${4:-full}" = harness-only ]; then
+    (cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" update oversee '.overseer.harness = "pi" | .overseer.home = null | del(.overseer.session_id)' >/dev/null)
+  else
+    bind_overseer claude "$OVERSEER_HOME_DIR" parent
+  fi
+  if [ -n "${5:-}" ]; then
+    hole_install lib/overseer-launch.sh "$LANE/.github/skills/orch/scripts"
+    cp -- "$5" "$LANE/.github/skills/orch/scripts/lib/overseer-launch.sh"
+  fi
+  mkdir -p "$LANE/tmp/lane-mail/overseer"
+  printf '%s\n' '{"session_id":"parent","tokens":366308}' > "$LANE/tmp/lane-mail/overseer/context.json"
+  printf '%s\n' 'parent previous-gap' > "$LANE/tmp/lane-mail/overseer/context-told"
+  peer_send 'Parent only.'
+  local before state_before
+  before=$(overseer_snapshot)
+  state_before=$(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" get oversee .overseer)
+  CALL_ENV=("${COP_NAMED_ENV[@]}" "COPILOT_HOME=$COP_HOME/.copilot")
+  case "$2" in
+    start) copilot_context start ;;
+    deliver) copilot_tool deliver ;;
+    stop) copilot_stop "$COP_TRANSCRIPT" ;;
+    usage)
+      ARM_ARGS=(usage)
+      run_payload '{"session_id":"s1","current_tokens":123442,"token_limit":1000000}'
+      ARM_ARGS=() ;;
+  esac
+  CALL_ENV=("HOME=$COP_HOME")
+  CHILD_RESULT="RC=$RC stdout=$(cat "$TMP_ROOT/stdout") unchanged=$([ "$before" = "$(overseer_snapshot)" ] && echo yes || echo no) state=$([ "$state_before" = "$(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" get oversee .overseer)" ] && echo same || echo changed) judged=$(judge_calls)"
+}
+for child_arm in deliver stop usage start; do
+  copilot_child "native_copilot_$child_arm" "$child_arm"
+  assert_eq "$CHILD_RESULT" 'RC=0 stdout= unchanged=yes state=same judged=0' \
+    "$child_arm: a Copilot child in the Claude pane receives no mail and writes no context or gap"
+  assert_eq "$(first_line)|$(wc -l < "$ERR_FILE" | tr -d ' ')" \
+    "lane-mail-check: session-unbound=s1 harness=claude home=$OVERSEER_HOME_DIR remedy=oversee register|1" \
+    "the child receives one session diagnostic and no missing-reader notice for the Claude home"
+done
+# The previous hook admitted the inherited pane. These rows use that complete hook,
+# preserving both defects rather than replacing the identity owner with a stub.
+mutant native-old-hook \
+  -e 's/^  if \[ "\$NATIVE_MATCH" != true \]; then$/  if false; then/' \
+  -e 's@_ "\$SCRIPTS" "\$CALLER_HOME" 2>@_ "$SCRIPTS" "$OVERSEER_HOME" 2>@'
+OLD_HOOK=$MUTANT_PATH
+for child_arm in deliver usage start; do
+  copilot_child "native_old_$child_arm" "$child_arm" "$OLD_HOOK"
+  case "$child_arm" in
+    start)
+      assert_eq "$(stdout_field '.additionalContext' | grep -c '^lane-mail-check: context-reader=missing' || :)" 1 \
+        'control: the old start arm reports a missing reader under the Claude home' ;;
+    *)
+      assert_eq "$([ "$CHILD_RESULT" = 'RC=0 stdout= unchanged=yes state=same judged=0' ] && echo accepted || echo rejected)" rejected \
+        "control: the old $child_arm arm fails the unchanged-mail assertion" ;;
+  esac
+done
+for child_arm in deliver stop usage start; do
+  copilot_child "native_harness_$child_arm" "$child_arm" "$HOOK" harness-only
+  assert_eq "$CHILD_RESULT" 'RC=0 stdout= unchanged=yes state=same judged=0' \
+    "$child_arm: the recorded harness alone refuses a child before the first session binding"
+  assert_eq "$(first_line)|$(wc -l < "$ERR_FILE" | tr -d ' ')" \
+    'lane-mail-check: session-unbound=s1 harness=pi home=none remedy=oversee register|1' \
+    'the harness-only refusal gives one stderr diagnostic'
+done
+wake_mutant native-harness-control '    and ((.harness // "") == "" or .harness == $harness)' '    and true' "$REPO_ROOT/skills/orch/scripts/lib/overseer-launch.sh"
+for child_arm in deliver stop usage start; do
+  copilot_child "native_harness_control_$child_arm" "$child_arm" "$HOOK" harness-only "$MUTANT_PATH"
+  assert_eq "$([ "$CHILD_RESULT" = 'RC=0 stdout= unchanged=yes state=same judged=0' ] && echo accepted || echo rejected)" rejected \
+    "control: dropping only the harness rule fails the same $child_arm refusal assertion"
+done
+
+new_copilot_named native_copilot_reader
+CALL_ENV=("${COP_NAMED_ENV[@]}" "COPILOT_HOME=$COP_HOME/.copilot")
+copilot_context start
+assert_eq "RC=$RC stdout=$(cat "$TMP_ROOT/stdout") stderr=$(first_line)" 'RC=0 stdout= stderr=-' \
+  'the native Copilot start reads its installed reader from its own home'
+mutant native-reader-control -e 's@_ "\$SCRIPTS" "\$CALLER_HOME" 2>@_ "$SCRIPTS" "$CALLER_HOME/missing" 2>@'
+new_copilot_named native_copilot_reader_control "$MUTANT_PATH"
+CALL_ENV=("${COP_NAMED_ENV[@]}" "COPILOT_HOME=$COP_HOME/.copilot")
+copilot_context start
+assert_eq "$(stdout_field '.additionalContext' | grep -c '^lane-mail-check: context-reader=missing' || :)" 1 \
+  'control: checking another home reports its missing reader'
+CALL_ENV=("HOME=$COP_HOME")
+
 new_copilot_named copilot_overseer
 peer_send 'For the named session.'
 CALL_ENV=("${COP_OTHER_ENV[@]}")
@@ -638,12 +728,13 @@ CALL_ENV=("HOME=$COP_HOME")
 assert_eq "RC=$RC stdout=$(cat "$TMP_ROOT/stdout") unread=$(overseer_unread 'For the named session.')" "RC=0 stdout= unread=0" \
   "and marks it read, so its next prompt is handed nothing"
 
-# The overseer's tool-call judgement is the lead's alone. A Copilot call in
-# the named pane whose session no sessionStart recorded, a custom subagent's
-# as Copilot CLI 1.0.88 was measured sending it, is judged on nothing: it is
-# handed nothing and writes no context record for the overseer.
+# The overseer's tool-call judgement requires the Copilot lead cache even
+# when the native ID matches. A missing cache leaves that caller unknown,
+# judged on nothing and writing no overseer context record.
 unknown_tool_rows() { # NAME [JUDGE]
   new_copilot_named "$1" "${2:-$HOOK}"
+  # Isolate the missing lead-cache rule from a native-ID mismatch.
+  (cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" update oversee '.overseer.session_id = "c1"' >/dev/null)
   mkdir -p "$LANE/tmp/lane-mail/overseer"
   CALL_ENV=("${COP_NAMED_ENV[@]}")
   COP_SESSION=c1
