@@ -113,7 +113,7 @@ Use this cycle for a `conflicting` queue-wait verdict, and for a `worktree-push-
    [MAIN_REPO_ROOT]/.agents/skills/orch/scripts/worktree-push --record-restack-validation [RUN_DIR] --worktree [WT_PATH] --issue [ISSUE]
    ```
 
-   This command publishes nothing. Its timing write is advisory (`worktree-push --help`). A pass or a skip goes to step 4 with no second push, and a base that moves again returns through the next queue-wait verdict. `--no-rebase` cannot hold the head still here: that push carries none of the restack's force-with-lease authorization, and git refuses the rewritten branch as a non-fast-forward push.
+   This command publishes nothing. Its timing write is advisory (`worktree-push --help`). A pass or a skip goes to step 4 with no second push, and a base that moves again returns through the next queue-wait verdict.
 
 4. The head changed. Re-confirm the gate mode, then return to `merge-pr.md` § 5 step 1 to read the new exact head, wait for its CI and take the merge route again.
 

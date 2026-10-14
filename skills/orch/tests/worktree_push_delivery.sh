@@ -51,7 +51,7 @@ chmod +x "$TMP_ROOT/bin/git" "$TMP_ROOT/bin/gh"
 
 # Read the executable publication command from its workflow fence. The fixture
 # drives that command rather than implementing another publisher.
-publication_command="$(awk '{ sub(/\r$/, ""); sub(/^[[:space:]]+/, "") } /^```bash$/ { fence=1; next } /^```$/ { fence=0 } fence && /worktree-push --worktree/ && /--set-upstream/ { print; found++ } END { if (found != 1) exit 1 }' "$REPO_ROOT/skills/orch/workflows/submit-pr.md")"
+publication_command="$(awk '{ sub(/\r$/, ""); sub(/^[[:space:]]+/, "") } /^```bash$/ { fence=1; next } /^```$/ { fence=0 } fence && /worktree-push --worktree/ { print; found++ } END { if (found != 1) exit 1 }' "$REPO_ROOT/skills/orch/workflows/submit-pr.md")"
 publication_command="${publication_command//\[WORKTREE_PATH\]/\$FIXTURE_LANE}"
 publication_command="${publication_command//\[ISSUE_ID\]/KEN-1}"
 
@@ -271,12 +271,6 @@ PY
     fi
   fi
 done
-
-new_world forbidden-no-rebase push-base
-RC=0
-(cd "$FIXTURE_LANE" && "$PUSH" --worktree "$FIXTURE_LANE" --issue KEN-1 --no-rebase) > "$FIXTURE_MAIN/tmp/refused.out" 2> "$FIXTURE_MAIN/tmp/push.err" || RC=$?
-assert_eq "$RC|$(sed -n '1p' "$FIXTURE_MAIN/tmp/push.err")" '1|worktree-push-base-no-rebase: --no-rebase' 'caller cannot disable the base rebase'
-assert_eq "$("$REAL_GIT" --git-dir "$TMP_ROOT/forbidden-no-rebase/remote.git" rev-parse trunk)" "$BASE_HEAD" 'no-rebase refusal publishes nothing'
 
 echo '=== the optional publication checker is required only for direct transport ==='
 for delivery in push-base pr; do

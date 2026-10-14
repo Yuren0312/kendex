@@ -84,7 +84,7 @@
 # the chain until no key matches.
 #
 # Usage:
-#   worktree-push --worktree PATH --issue ID [--state-dir DIR] [push flags...]
+#   worktree-push --worktree PATH --issue ID [--state-dir DIR]
 #   worktree-push --check-live-round --worktree PATH --issue ID [--state-dir DIR]
 #   worktree-push --resolve-delivery --worktree PATH
 #   worktree-push --record-restack-validation RUN_DIR --worktree PATH --issue ID [--state-dir DIR]
@@ -100,14 +100,7 @@
 # another transport. Direct pushes pass the recorded tier to worktree's
 # conditional orch check before transport, including automatic rebases.
 #
-# Every argument outside this wrapper's own namespace (--worktree, --issue,
-# --state-dir, --check-live-round, --resolve-delivery,
-# --record-restack-validation, --help) is forwarded verbatim to
-# `worktree push`, which rejects
-# a flag it does not know. The push flag vocabulary lives there alone; see
-# `worktree push --help`, which is where a mistyped flag is caught. The state
-# resolution above the push is what stands between a wrong argument and a wrong
-# write, refusing a state that records another issue or another worktree.
+# The wrapper accepts only the named options above.
 # State directory resolution is defined by `workflow-state --help`.
 # A successful push with a pending restack map records the newest finished
 # validation run for its pre-push head through dev-validate-run --record,
@@ -193,7 +186,7 @@ message() {
 	delivery-invalid) printf 'ORCH_DELIVERY must be pr or push-base. No push ran.\n' ;;
 	delivery-unrecorded) printf 'The base push landed but its publication record is missing. Read the base history before retrying.\n' ;;
 	invalid-issue) printf 'The issue ID must be safe for a state file path.\n' ;;
-	check-argument) printf 'The read-only mode cannot forward push arguments or select another mode.\n' ;;
+	check-argument) printf 'The wrapper cannot accept this argument or option combination.\n' ;;
 	not-executable) printf 'The worktree script is not executable.\n' ;;
 	missing-command) printf 'Install the command to reconcile rebased SHAs.\n' ;;
 	not-directory) printf 'The worktree directory does not resolve.\n' ;;
@@ -287,12 +280,8 @@ while [[ $# -gt 0 ]]; do
 		usage
 		exit 0
 		;;
-	# Everything outside this wrapper's own namespace is `worktree push`'s to
-	# accept or reject; push fails closed on a flag it does not know, so
-	# pass-through here keeps one copy of that vocabulary.
 	*)
-		push_args+=("$1")
-		shift
+		fail check-argument "argument=$1"
 		;;
 	esac
 done
@@ -301,14 +290,6 @@ done
 if [[ "$resolve_delivery" != true ]]; then
 	[[ -n "$issue" ]] || fail required option=--issue
 	[[ "$issue" =~ $ISSUE_GRAMMAR && "$issue" != *..* ]] || fail invalid-issue "issue=$issue"
-fi
-# Check mode never reaches the push, so nothing forwards push_args and a
-# mistyped flag would simply vanish: --sate-dir=... would leave the check
-# reading a different workflow state and answering about the wrong one. An
-# argument the check cannot honour leaves its answer unfounded, and an
-# unfounded answer is not permission to rebase.
-if [[ "$check_live_round" == true || "$resolve_delivery" == true || -n "$record_run_dir" ]] && (( ${#push_args[@]} > 0 )); then
-	fail check-argument "argument=${push_args[0]}"
 fi
 [[ "$check_live_round" != true || -z "$record_run_dir" ]] || fail check-argument argument=--record-restack-validation
 if [[ "$resolve_delivery" == true && ( "$check_live_round" == true || -n "$record_run_dir" ) ]]; then

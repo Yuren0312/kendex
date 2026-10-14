@@ -53,7 +53,7 @@ round_write() {
 }
 
 # Stub worktree script: prints STUB_PUSH_STDOUT, exits STUB_PUSH_EXIT, and
-# logs its argv so pass-through flags can be asserted. It also does what the
+# logs its argv so the selected worktree can be asserted. It also does what the
 # real push does with a map it derives: appends it to the worktree's map file
 # as its own hop, which is the channel worktree-push reconciles from. A stub
 # that only printed would exercise a transcript nothing reads.
@@ -132,7 +132,7 @@ echo "=== push without a rebase map leaves state alone ==="
 work="$TMP_ROOT/work-nomap"
 reset_state "$work"
 before="$(state_json "$work")"
-STUB_PUSH_STDOUT="→ pushed" run_push "$work" --worktree "$wt" --issue KEN-1 --set-upstream
+STUB_PUSH_STDOUT="→ pushed" run_push "$work" --worktree "$wt" --issue KEN-1
 assert_eq "$RUN_RC" "0" "map-less push exits 0"
 assert_eq "$(cat "$run_out")" "→ pushed" "push stdout is replayed"
 assert_eq "$(grep -c 'sha-reconcile:' "$run_out" || true)" "0" "no reconcile line without a map"
@@ -140,47 +140,16 @@ assert_eq "$(grep -c 'restack-reconcile:' "$run_out" || true)" "0" "no restack-h
 assert_eq "$(state_json "$work")" "$before" "state is untouched without a map"
 
 echo
-echo "=== flag parsing and pass-through ==="
+echo "=== wrapper option parsing ==="
 
 args_log="$TMP_ROOT/args.log"
 : >"$args_log"
-STUB_ARGS_LOG="$args_log" STUB_PUSH_STDOUT="" run_push "$work" --worktree "$wt" --issue KEN-1 --set-upstream
-assert_contains "$(cat "$args_log")" "push $wt --set-upstream" "worktree push receives the worktree and pass-through flags"
+STUB_ARGS_LOG="$args_log" STUB_PUSH_STDOUT="" run_push "$work" --worktree "$wt" --issue KEN-1
+assert_contains "$(cat "$args_log")" "push $wt" "worktree push receives the selected worktree"
 
 STUB_PUSH_STDOUT="" run_push "$work" "--worktree=$wt" --issue=KEN-1
 assert_eq "$RUN_RC" "0" "equals-form flags parse"
 
-# the wrapper keeps no copy of push's flag vocabulary. A flag it does
-# not own is forwarded verbatim, and `worktree push` — which fails closed on an
-# unknown flag — is the one that rejects it.
-: >"$args_log"
-STUB_ARGS_LOG="$args_log" STUB_PUSH_STDOUT="" run_push "$work" --worktree "$wt" --issue KEN-1 --no-rebase --future-flag
-assert_contains "$(cat "$args_log")" "push $wt --no-rebase --future-flag" "flags the wrapper does not own are forwarded verbatim, in order"
-
-: >"$args_log"
-STUB_ARGS_LOG="$args_log" STUB_PUSH_EXIT=1 run_push "$work" --worktree "$wt" --issue KEN-1 --force
-assert_eq "$RUN_RC" "1" "a flag push rejects fails the wrapper with push's own exit code"
-assert_contains "$(cat "$args_log")" "push $wt --force" "the rejected flag reached push rather than being screened here"
-
-# a mangled --state-dir (--sate-dir here, a transposition no prefix
-# guess catches) is push's to reject, not this wrapper's — the flag vocabulary
-# lives in one place. This case runs the REAL worktree script, so the two
-# scripts' wiring is held: the argument order the wrapper sends, and push's
-# own diagnostic reaching the caller. It runs FROM the worktree because the
-# worktree script resolves its project at startup and refuses before parsing
-# anything when its working directory is not a repository.
-work="$TMP_ROOT/work-owned-typo"
-reset_state "$work"
-typo_before="$(state_json "$work")"
-RUN_RC=0
-(cd "$wt" && ORCH_WORKTREE_BIN="$REPO_ROOT/skills/worktree/scripts/worktree" \
-  "$PUSH" --worktree "$wt" --issue KEN-1 --state-dir "$work/tmp" "--sate-dir=$TMP_ROOT/elsewhere") \
-  >"$run_out" 2>"$run_err" || RUN_RC=$?
-assert_eq "$RUN_RC" "1" "the real push refuses a transposed owned flag through this wrapper"
-assert_contains "$(cat "$run_err")" "--sate-dir=$TMP_ROOT/elsewhere" "push's own diagnostic reaches the caller"
-assert_eq "$(state_json "$work")" "$typo_before" "a push that printed no map rewrites nothing"
-
-echo
 echo "=== a rebase map is recorded and recorded fix SHAs rewritten ==="
 
 mapped_push_case() {
@@ -875,19 +844,15 @@ run_old="$(validate_run_dir "$wt/tmp/dev-validate-old" range 0 "$timing_head" 1)
 run_new="$(validate_run_dir "$wt/tmp/dev-validate-new" range 0 "$timing_head" 2)"
 run_other="$(validate_run_dir "$wt/tmp/dev-validate-other" range 0 "$OLD_A" 3)"
 echo '=== recording-only arguments cannot select a push or another read-only mode ==='
-for row in 'push-argument^--no-rebase^argument=--no-rebase' 'conflicting-mode^--check-live-round^argument=--record-restack-validation'; do
+for row in 'conflicting-mode^--check-live-round^argument=--record-restack-validation'; do
   IFS='^' read -r label argument expected <<<"$row"
   run_push "$work" --record-restack-validation "$run_new" --worktree "$wt" --issue KEN-1 "$argument"
   assert_eq "$RUN_RC|$(sed -n '1p' "$run_err")" "1|worktree-push: check-argument $expected" "$label refuses before a push or timing write"
 done
 PUSH_SAVED="$PUSH"
-for rule in push-argument conflicting-mode; do
+for rule in conflicting-mode; do
   PUSH="$(mutant_scripts "record-$rule" worktree-push)/worktree-push"
   case "$rule" in
-    push-argument)
-      mutate_file "$PUSH" '[[ "$check_live_round" == true || "$resolve_delivery" == true || -n "$record_run_dir" ]]' '[[ "$check_live_round" == true || "$resolve_delivery" == true ]]'
-      argument=--no-rebase
-      ;;
     conflicting-mode)
       mutate_file "$PUSH" '[[ "$check_live_round" != true || -z "$record_run_dir" ]]' 'true'
       argument=--check-live-round
