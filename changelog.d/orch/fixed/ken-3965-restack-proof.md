@@ -1,0 +1,1 @@
+- Require a passing local validation or required CI for the published tree before a reused restack can merge or enter the queue. Accept a complete validation battery from a fix round.
