@@ -150,7 +150,7 @@ for row in 'direct|push-base|trunk' 'advanced|push-base|trunk' 'queue|push-base|
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'guard\n' >> "$FOLD_CALLS"
-[[ "$GUARD_REFUSE" != true ]]
+[[ "$GUARD_REFUSE" != true ]] || exit 1
 if [[ "$GUARD_CHANGE" == true ]]; then
   printf 'hook change\n' >> feature
   git add feature
