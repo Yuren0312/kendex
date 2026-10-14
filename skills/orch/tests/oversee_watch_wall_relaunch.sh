@@ -5,6 +5,9 @@
 # under ORCH_WALL_RELAUNCH=ask. What the watch reads off the banner is
 # oversee_watch_usage_limit.sh's; this suite builds the same sandbox from
 # lib/oversee-watch-harness.sh.
+# Surface: wall_route admission through lane_recovery_args.
+# Inputs: scripts/oversee-watch, scripts/lib, tests/fixtures/lane-host,
+# tests/lib/oversee-watch-harness.sh.
 #
 # One table. A row names the screen gh-2 shows, what `lanes pick` answers and
 # the setting, and the facts the run must show; `facts` reads exactly those.
@@ -22,6 +25,7 @@ COMPOSER='\xe2\x9d\xaf\xc2\xa0'
 SPENT=/home/me/.eclaude
 FRESH=/home/me/.fclaude
 MODEL=claude-opus-5-5
+CAPS=$'kind=ssh\tlaunch=ssh\tchannel=mailbox\tfiles=verb\tstatus=verb\tstop=verb\trelaunch=resume\tpark=none\taccounts=none\tpool=plan\tland=lane'
 
 # The relaunch the watch starts detached: its argv, one word a line, lands in
 # open-terminal.args, and it then stays running while open-terminal-hold
@@ -38,6 +42,14 @@ exit "${STUB_RELAUNCH_EXIT:-0}"
 EOF
 chmod +x "$TMP_ROOT/bin/open-terminal-stub.sh"
 
+# A provider update after account selection invalidates its cached declaration.
+mutate_file "$TMP_ROOT/bin/lanes-stub.sh" 'if [[ "${1:-}" == pick ]]; then' \
+  'if [[ "${1:-}" == pick ]]; then
+  if [[ -f "$STUB_DIR/fail-capabilities-after-pick" ]]; then
+    touch "$STUB_DIR/fail-capabilities"
+    printf "\n" >> "$ORCH_LANE_HOST"
+  fi'
+
 # stage SCREEN PICK — gh-2 claimed on SPENT by pane %3 and recorded running
 # KEN-2 on claude MODEL; SCREEN `walled` is the account's banner under the
 # composer and `working` a turn in flight printing the same words; PICK is
@@ -52,10 +64,29 @@ stage() {
   printf '900\t%%3\t%s\tgh-2\t2026-08-16T00:00:00Z\n' "$SPENT" > "$STATE_DIR/claims/a.claim"
   case "$profile" in
     github) item=issue-2; tracker=github ;;
-    hosted|hosted-legacy|stop-failed|stop-unconfirmed) host="$REPO_ROOT/skills/orch/tests/fixtures/lane-host"
+    hosted|hosted-local|hosted-verb|cap-unavailable|relative|hosted-legacy|stop-failed|stop-unconfirmed) host="$REPO_ROOT/skills/orch/tests/fixtures/lane-host"
+      [[ "$profile" != hosted-verb ]] || { item=issue-2; tracker=github; }
       mkdir -p "$STUB_DIR/host/srv/lane/tmp/lane-mail/$item" "$STUB_DIR/host/srv/clone/tmp"
       printf 'gitdir: /srv/clone/.git/worktrees/%s\n' "$item" > "$STUB_DIR/host/srv/lane/.git"
       PROFILE_ENV=(LANE_HOST_STUB_LOG="$STUB_DIR/host.calls" LANE_HOST_STUB_DIR="$STUB_DIR/host")
+      case "$profile" in
+        hosted-local) PROFILE_ENV+=(LANE_HOST_STUB_CAPABILITIES="$CAPS"$'\tpane=local') ;;
+        hosted-verb) PROFILE_ENV+=(LANE_HOST_STUB_CAPABILITIES="$CAPS"$'\tpane=verb' LANE_HOST_STUB_CAPTURE_FILE="$STUB_DIR/provider-screen") ;;
+        cap-unavailable)
+          host="$STUB_DIR/recovery-provider"
+          cp "$REPO_ROOT/skills/orch/tests/fixtures/lane-host" "$host"
+          mutate_file "$host" 'if [ -n "${LANE_HOST_STUB_NO_CAPABILITIES:-}" ]; then' \
+            'if [[ -f "$STUB_DIR/fail-capabilities" ]]; then
+    LANE_HOST_STUB_NO_CAPABILITIES=7
+    LANE_HOST_STUB_CAPABILITIES_WORDS="lane-host-fixture: capabilities-failed exit=7"
+  fi
+  if [ -n "${LANE_HOST_STUB_NO_CAPABILITIES:-}" ]; then'
+          touch "$STUB_DIR/fail-capabilities-after-pick" ;;
+        relative)
+          host=./recovery-provider
+          ln -sf "$REPO_ROOT/skills/orch/tests/fixtures/lane-host" "$TMP_ROOT/repo/recovery-provider"
+          ;;
+      esac
       [[ "$profile" != stop-failed ]] || PROFILE_ENV+=(LANE_HOST_STUB_STOP_STATUS=1)
       [[ "$profile" != stop-unconfirmed ]] || PROFILE_ENV+=(LANE_HOST_STUB_STOP_OUT=unconfirmed) ;;
     peer) cwd="$STUB_DIR/peer"; mkdir -p "$cwd" ;;
@@ -89,6 +120,12 @@ stage() {
     working) printf '%b\n' '⏺ Reading the suite.' "  printf \"$BANNER\"" 'esc to interrupt' > "$STUB_DIR/pane-gh-2.txt" ;;
     *) echo "stage: unknown screen $1" >&2; exit 1 ;;
   esac
+  if [[ "$profile" == hosted-verb ]]; then
+    cp "$STUB_DIR/pane-gh-2.txt" "$STUB_DIR/provider-screen"
+    printf 'esc to interrupt\n' > "$STUB_DIR/pane-gh-2.txt"
+  fi
+  cp "$STUB_DIR/oversee-state.json" "$STUB_DIR/saved-state.json"
+  cp "$STUB_DIR/windows.txt" "$STUB_DIR/saved-windows.txt"
   local pick_file="$STUB_DIR/pick-$harness-$model"
   mkdir -p "${pick_file%/*}"
   case "$2" in
@@ -134,6 +171,9 @@ facts() {
               "$STUB_DIR/lanes.args" 2>/dev/null)"; value="${value:-none}" ;;
       killed) value=none; [[ ! -f "$STUB_DIR/kill-window.calls" ]] || value="$(paste -sd, - < "$STUB_DIR/kill-window.calls")" ;;
       stopped) value=0; [[ ! -f "$STUB_DIR/host.calls" ]] || value="$(grep -c '^stop ' "$STUB_DIR/host.calls" || true)" ;;
+      marker) value=false; [[ ! -f "$STATE_DIR/wall-relaunch.gh-2" && ! -f "$STATE_DIR/wall-relaunch.gh-2.exit" ]] || value=true ;;
+      record) value=changed; cmp -s "$STUB_DIR/saved-state.json" "$STUB_DIR/oversee-state.json" && value=retained ;;
+      windows) value=changed; cmp -s "$STUB_DIR/saved-windows.txt" "$STUB_DIR/windows.txt" && value=retained ;;
       cwd) relaunch_args >/dev/null; value="$(cat "$STUB_DIR/open-terminal.cwd")"; [[ "$value" != "$STUB_DIR/peer" ]] || value=peer ;;
       session) relaunch_args >/dev/null; value="$(cat "$STUB_DIR/open-terminal.session")" ;;
       relaunch~*) value="$(relaunch_args)"; [[ "$value" == none ]] && value=false \
@@ -151,7 +191,7 @@ facts() {
 CASE_SEQ=0
 RUN_SEQ=0
 wall_table() {
-  local row label screen pick setting expect env
+  local row label screen pick setting expect env control_red
   for row in "$@"; do
     IFS='|' read -r label screen pick setting expect <<<"$row"
     [[ -n "$expect" ]] || { printf 'wall_table: a row with no expect asserts nothing: %s\n' "$row" >&2; exit 1; }
@@ -160,7 +200,14 @@ wall_table() {
     [[ "$setting" == - ]] || env+=(ORCH_WALL_RELAUNCH="$setting")
     ERR="$TMP_ROOT/run-$((++RUN_SEQ)).err"
     OUT="$(run_watch "${env[@]}" -- --max-loops 1 --state "$STUB_DIR/oversee-state.json" gh-1 gh-2 2>"$ERR")" && RC=0 || RC=$?
-    assert_eq "$(facts "$expect")" "$expect" "$label" "$ERR"
+    if [[ "$label" == refusal-control:* ]]; then
+      control_red="$(FAIL=0; assert_eq "$(facts "$expect")" "$expect" "$label" > /dev/null; printf '%s' "$FAIL")"
+      assert_eq "$control_red" 1 "$label rejects the same retained-lane contract" "$ERR"
+      assert_eq "$(facts 'stopped=1 marker=true relaunch~--relaunch=true')" \
+        'stopped=1 marker=true relaunch~--relaunch=true' "$label reaches stop and dispatch" "$ERR"
+    else
+      assert_eq "$(facts "$expect")" "$expect" "$label" "$ERR"
+    fi
   done
 }
 
@@ -168,9 +215,13 @@ RELAUNCHED="EVENT+lane-relaunched+KEN-2+lane=$FRESH+from=$SPENT"
 USAGE_LIMIT="EVENT+usage-limit+gh-2+$SPENT+resets=2026-09-02T16:50:00Z"
 ROW_RELAUNCH="a walled lane with a qualifying pick preserves its permission choice, host and session|walled|fresh|-|rc=0 first=$RELAUNCHED out~EVENT+usage-limit=false pick=$SPENT killed=none relaunch~--relaunch=true relaunch~--lane+$FRESH=true relaunch~--model+$MODEL+--effort+high+--permission-mode+dontAsk=true relaunch~--host+local=true relaunch~--continue-resume=true session=main relaunch~KEN-2=true"
 ROW_SPENT="the spent account handed back is refused, and the wall goes to the overseer|walled|spent|auto|rc=0 first=$USAGE_LIMIT second=pick+lane=$SPENT err~reason%espent-account=true killed=none relaunch~--relaunch=false"
+ROW_VERB="provider-owned recovery leaves the prior lane intact|walled:hosted-verb|fresh|auto|rc=0 first=$USAGE_LIMIT err~cause%erelaunch-deferred:KEN-3996=true stopped=0 marker=false killed=none record=retained windows=retained out~lane-relaunched=false relaunch~--relaunch=false"
+ROW_CAP_FAILED="unavailable absolute host capabilities leave the prior lane intact|walled:cap-unavailable|fresh|auto|rc=0 first=$USAGE_LIMIT err~cause%ehost-capabilities-unavailable+exit%e7=true err~lane-host-fixture:+capabilities-failed+exit%e7=true stopped=0 marker=false killed=none record=retained windows=retained out~lane-relaunched=false relaunch~--relaunch=false"
+ROW_RELATIVE="relative provider recovery leaves the prior lane intact|walled:relative|fresh|auto|rc=0 first=$USAGE_LIMIT err~cause%erelative-provider-deferred:KEN-3996=true stopped=0 marker=false killed=none record=retained windows=retained out~lane-relaunched=false relaunch~--relaunch=false"
 
 echo "=== the watch owns the usage-limit route ==="
 wall_table "$ROW_RELAUNCH" \
+  "$ROW_VERB" "$ROW_CAP_FAILED" "$ROW_RELATIVE" \
   "a walled lane no account qualifies for is usage-limit with its reset, the pick's answer under it|walled|none|auto|rc=0 first=$USAGE_LIMIT second=pick+none pick=$SPENT killed=none relaunch~--relaunch=false" \
   "a working lane printing limit text is left alone: no event, no pick, no kill|working|fresh|auto|rc=0 out~EVENT+usage-limit=false out~lane-relaunched=false pick=none killed=none relaunch~--relaunch=false" \
   "under ask the wall is usage-limit alone, with the pick's answer on the following line|walled|fresh|ask|rc=0 first=$USAGE_LIMIT second=pick+lane=$FRESH out~lane-relaunched=false killed=none relaunch~--relaunch=false" \
@@ -185,6 +236,7 @@ wall_table "$ROW_RELAUNCH" \
   "Copilot recovery keeps tools-only permission|walled:copilot|fresh|auto|rc=0 relaunch~--allow-all-tools=true relaunch~--yolo=false" \
   "Pi recovery keeps its provider model and session options|walled:pi|fresh|auto|rc=0 relaunch~--model+pi-claude/claude-opus-5-5+--thinking+high=true" \
   "a hosted recovery stops the old harness before launching|walled:hosted|fresh|auto|rc=0 stopped=1 relaunch~--relaunch=true killed=none" \
+  "explicit local-pane recovery keeps the existing route|walled:hosted-local|fresh|auto|rc=0 stopped=1 relaunch~--relaunch=true killed=none" \
   "unknown original hosted choices refuse before stop|walled:hosted-legacy|fresh|auto|rc=0 stopped=0 out~EVENT+usage-limit=true relaunch~--relaunch=false" \
   "a hosted stop failure keeps the window and refuses replacement|walled:stop-failed|fresh|auto|rc=0 stopped=1 err~reason%estop-failed=true killed=none relaunch~--relaunch=false" \
   "a stop without confirmation cannot start a replacement|walled:stop-unconfirmed|fresh|auto|rc=0 stopped=1 err~reason%estop-failed=true killed=none relaunch~--relaunch=false"
@@ -304,6 +356,24 @@ wall_control context-unrefused '    ow_message wall-relaunch-refused "lane=$lane
     return 1' '    ow_message wall-relaunch-refused "lane=$lane" reason=context-unavailable "cause=$LANE_RECOVERY_CAUSE" >&2
     return 0' \
   'an unknown original permission choice|walled:legacy|fresh|auto|rc=0 out~EVENT+usage-limit=false'
+
+scripts="$(mutant_scripts provider-recovery-unrefused/orch lib/lane-relaunch.sh)" || exit 1
+ln -s "$REPO_ROOT/skills/github" "$TMP_ROOT/provider-recovery-unrefused/github"
+mutate_file "$scripts/lib/lane-relaunch.sh" 'if [[ "$pane" == verb ]]; then' 'if false; then'
+WATCH_BIN="$scripts/oversee-watch" wall_table "refusal-control: $ROW_VERB"
+
+scripts="$(mutant_scripts capabilities-unrefused/orch lib/lane-relaunch.sh)" || exit 1
+ln -s "$REPO_ROOT/skills/github" "$TMP_ROOT/capabilities-unrefused/github"
+mutate_file "$scripts/lib/lane-relaunch.sh" \
+  '"$LANE_RECOVERY_CWD" || rc=$?' '"$LANE_RECOVERY_CWD" || rc=0'
+WATCH_BIN="$scripts/oversee-watch" wall_table "refusal-control: $ROW_CAP_FAILED"
+
+scripts="$(mutant_scripts relative-recovery-unrefused/orch lib/lane-relaunch.sh)" || exit 1
+ln -s "$REPO_ROOT/skills/github" "$TMP_ROOT/relative-recovery-unrefused/github"
+mutate_file "$scripts/lib/lane-relaunch.sh" \
+  '*) LANE_RECOVERY_CAUSE=relative-provider-deferred:KEN-3996; return 1 ;;' \
+  '*) LANE_RECOVERY_CAUSE=relative-provider-deferred:KEN-3996; : ;;'
+WATCH_BIN="$scripts/oversee-watch" wall_table "refusal-control: $ROW_RELATIVE"
 
 # Removing the launcher's context read makes the removed checkout look usable.
 scripts="$(mutant_scripts checkout-unrefused/orch lib/lane-relaunch.sh)" || exit 1
