@@ -41,7 +41,7 @@
 #      shard the matrix declares runs some suite. The must-fail arm sends one
 #      package to another shard.
 #   4d. the per-OS partition: every suite stays selected exactly once on each
-#      original runner, including linear's shell-version-dependent roster.
+#      original runner, including linear's reviewed native eligibility.
 #      The omission and duplication controls run on each runner's claims.
 #   4c. the macOS exclusions — tools/ci-job-set's Linux-only shard list
 #      matches the main-push macOS matrix's exclusions, and the merge
@@ -177,11 +177,12 @@ partition_cargo_steps() { # <workflow> ; mode, compile order and condition of di
 if [[ "$mode" != cargo ]]; then
 
 # --- The sandbox: the real roster, none of the real work --------------------
-SANDBOX="$TMP/orch/tests"
-mkdir -p "$SANDBOX/lib" "$TMP/orch/scripts/lib" "$TMP/github/scripts/lib"
+SANDBOX="$TMP/routing/skills/orch/tests"
+mkdir -p "$SANDBOX/lib" "$TMP/routing/skills/orch/scripts/lib" "$TMP/routing/skills/github/scripts/lib" "$TMP/routing/tools"
+cp "$ROOT/tools/macos-test-contracts" "$ROOT/tools/macos-test-contracts.json" "$TMP/routing/tools/"
 cp "$TEST_DIR/run-all.sh" "$SANDBOX/run-all.sh"
-cp "$TEST_DIR/../scripts/lib/lane-state.sh" "$TMP/orch/scripts/lib/lane-state.sh"
-cp "$ROOT/skills/github/scripts/lib/group-leader.sh" "$TMP/github/scripts/lib/group-leader.sh"
+cp "$TEST_DIR/../scripts/lib/lane-state.sh" "$TMP/routing/skills/orch/scripts/lib/lane-state.sh"
+cp "$ROOT/skills/github/scripts/lib/group-leader.sh" "$TMP/routing/skills/github/scripts/lib/group-leader.sh"
 printf '#!/usr/bin/env bash\n: # the sandbox clears nothing; its suites are empty\n' \
   > "$SANDBOX/lib/git-env.sh"
 roster=""
@@ -195,7 +196,9 @@ done
 roster="$(printf '%s' "$roster" | sort)"
 
 selected() { # selected <filter>... ; the suite names that ran, sorted
-  RUNNER_OS="${PARTITION_RUNNER_OS:-Linux}" bash "$SANDBOX/run-all.sh" "$@" 2>/dev/null |
+  local native=""
+  [[ "${PARTITION_NATIVE:-false}" != true ]] || native="$TMP/routing/tools/macos-test-contracts"
+  RUN_ALL_NATIVE_CONTRACTS="$native" RUNNER_OS="${PARTITION_RUNNER_OS:-Linux}" bash "$SANDBOX/run-all.sh" "$@" 2>/dev/null |
     sed -n 's/^──── \(.*\) ────$/\1/p' | sort
 }
 status_of() { # status_of <filter>... ; the exit status, output discarded
@@ -224,7 +227,7 @@ check "an empty argument refuses instead of running everything" \
 check "a filter matching no suite exits non-zero" \
   "1" "$(status_of no-suite-carries-this-name)"
 
-# --- 2. The partition the workflow ships ------------------------------------
+# --- 2. The routing partition before native eligibility --------------------
 # Each shard's arguments are read from the workflow, so a shard whose filter
 # is edited there is judged here by what that filter now selects.
 #
@@ -252,7 +255,10 @@ excluded_shards() { # WORKFLOW OS ; shards excluded from that runner's roster
 shard_filters() { # WORKFLOW ; `|<argument string>` per shard on this platform
   local wf="$1" os=ubuntu-latest excluded job cond wd run shard
   [[ "${PARTITION_RUNNER_OS:-Linux}" != macOS ]] || os=macos-latest
-  excluded="$(excluded_shards "$wf" "$os")"
+  # Routing covers every name before native eligibility; section 4d tests
+  # the executed native subset and the matrix exclusions together.
+  excluded=""
+  [[ "${PARTITION_NATIVE:-false}" != true ]] || excluded="$(excluded_shards "$wf" "$os")"
   one_line_steps "$wf" | while IFS=$'\037' read -r job cond wd run; do
     [[ "$run" == 'bash skills/orch/tests/run-all.sh'* ]] || continue
     [[ "$run" != 'bash skills/orch/tests/run-all.sh --battery '* ]] || continue
@@ -271,7 +277,7 @@ mkdir -p "$UNION_RUNS"
 union_of() { # union_of <argument string>... ; names selected, duplicates kept
   local args kept
   for args in "$@"; do
-    kept="$UNION_RUNS/${PARTITION_RUNNER_OS:-Linux}-$(printf '%s' "$args" | cksum | tr ' ' '-')"
+    kept="$UNION_RUNS/${PARTITION_RUNNER_OS:-Linux}-${PARTITION_NATIVE:-false}-$(printf '%s' "$args" | cksum | tr ' ' '-')"
     if [[ ! -f "$kept" || "$(head -n 1 "$kept")" != "|$args" ]]; then
       (
         set -f
@@ -320,7 +326,7 @@ if [[ "${#shard_args[@]}" -lt 2 ]]; then
   printf 'pass: %d   fail: %d\n' "$PASS" "$((FAIL + 1))"
   exit 1
 fi
-ok "the workflow runs the $PARTITION_RUNNER_OS battery as ${#shard_args[@]} shards"
+ok "the workflow declares ${#shard_args[@]} $PARTITION_RUNNER_OS routing calls"
 check "every suite is claimed by one of the workflow's orch shards on $PARTITION_RUNNER_OS" \
   "" "$(missing_from "${shard_args[@]}")"
 check "no suite is claimed by two of them on $PARTITION_RUNNER_OS" "" "$(shared_by "${shard_args[@]}")"
@@ -427,7 +433,10 @@ for profile in orch-oversee orch-oversee-watch; do
     grep -qx oversee_watch_terminal_future <<< "$kept" && ok "new oversee suite enters the $PARTITION_RUNNER_OS complement" || bad "new oversee suite lost from $PARTITION_RUNNER_OS complement"
     ! grep -qx oversee_watch_lifecycle <<< "$kept" && ok "lifecycle leaves the $PARTITION_RUNNER_OS complement" || bad "lifecycle remains in $PARTITION_RUNNER_OS complement"
   else
-    grep -qx oversee_watch_lifecycle <<< "$kept" && ok "lifecycle runs in the $PARTITION_RUNNER_OS watch leg" || bad "lifecycle lost from $PARTITION_RUNNER_OS watch leg"
+    lifecycle_owner=orch-oversee-watch
+    [[ "$PARTITION_RUNNER_OS" != macOS ]] || lifecycle_owner=orch-rest
+    lifecycle="$(selected --shard "$lifecycle_owner")"
+    grep -qx oversee_watch_lifecycle <<< "$lifecycle" && ok "lifecycle runs in the $PARTITION_RUNNER_OS $lifecycle_owner leg" || bad "lifecycle lost from $PARTITION_RUNNER_OS $lifecycle_owner leg"
     ! grep -qx oversee_watch_terminal_future <<< "$kept" && ok "$PARTITION_RUNNER_OS watch leg owns only the moved whole names" || bad "$PARTITION_RUNNER_OS watch leg claims a new name extension"
   fi
 done
@@ -436,10 +445,12 @@ rm -- "$SANDBOX/oversee_watch_terminal_future.sh"
 # The lifecycle suite must reach the moved leg. Remove its selector from a
 # disposable runner copy while retaining its suite and the rest of the rule.
 cp "$SANDBOX/run-all.sh" "$TMP/runner-original"
-sed 's/ =oversee_watch_lifecycle / /' "$TMP/runner-original" > "$SANDBOX/run-all.sh"
+sed 's/|oversee_watch_lifecycle|/|/; s/oversee_watch_lifecycle|oversee_watch_overseer_marks/oversee_watch_overseer_marks/' "$TMP/runner-original" > "$SANDBOX/run-all.sh"
 cmp -s "$TMP/runner-original" "$SANDBOX/run-all.sh" && bad "lifecycle control changed no selector"
 for PARTITION_RUNNER_OS in Linux macOS; do
-  kept="$(selected --shard orch-oversee-watch)"
+  lifecycle_owner=orch-oversee-watch
+  [[ "$PARTITION_RUNNER_OS" != macOS ]] || lifecycle_owner=orch-rest
+  kept="$(selected --shard "$lifecycle_owner")"
   ! grep -qx oversee_watch_lifecycle <<< "$kept" && ok "must-fail: missing lifecycle selector fails its $PARTITION_RUNNER_OS moved-leg contract" || bad "$PARTITION_RUNNER_OS lifecycle omission control retained the suite"
 done
 cp "$TMP/runner-original" "$SANDBOX/run-all.sh"
@@ -513,6 +524,7 @@ cp "$TEST_DIR/lib/git-env.sh" "$POOL/skills/orch/tests/lib/git-env.sh"
 cp "$TEST_DIR/../scripts/lib/lane-state.sh" "$POOL/skills/orch/scripts/lib/lane-state.sh"
 cp "$ROOT/skills/github/scripts/lib/group-leader.sh" "$POOL/skills/github/scripts/lib/group-leader.sh"
 cp "$ROOT/tools/tests/run-all.sh" "$POOL/tools/tests/run-all.sh"
+cp "$ROOT/tools/macos-test-contracts" "$ROOT/tools/macos-test-contracts.json" "$POOL/tools/"
 for f in "$ROOT"/skills/*/tests/*.sh "$ROOT"/tools/tests/*.test.sh "$ROOT"/hooks/tests/*.sh "$ROOT"/refresh/tests/*.test.sh; do
   [[ "${f##*/}" != run-all.sh ]] || continue
   path="${f#"$ROOT"/}"
@@ -534,13 +546,33 @@ case "$1:${2-}" in
   *) battery='' ;;
 esac
 if [[ -n "$battery" ]]; then
-  key="$(printf '%s\n' "$@" | cksum | tr ' ' '-')"
+  batteries=()
+  prior=''
+  for word in "$@"; do
+    [[ "$prior" != --battery ]] || batteries+=("$word")
+    prior="$word"
+  done
+  key="${RUN_ALL_NATIVE_CONTRACTS:+native}-$(printf '%s\n' "$@" | cksum | tr ' ' '-')"
   cache="$PARTITION_POOL_CLAIMS/$key"
   if [[ ! -f "$cache" ]]; then
     # No job deadline or inherited pool bound applies to empty fixture suites.
     (cd "$PARTITION_POOL" && env -u RUN_ALL_DEADLINE_EPOCH -u RUN_ALL_SUITE_SECS \
       PATH="$PARTITION_HOST_PATH" "$BASH" "$@") >"$cache.out" || exit 1
-    sed -n "s%^──── \(.*\) ────\$%suite-invoked: $battery/\1.sh%p" "$cache.out" > "$cache"
+    if [[ "${#batteries[@]}" -le 1 ]]; then
+      sed -n "s%^──── \(.*\) ────\$%suite-invoked: $battery/\1.sh%p" "$cache.out" > "$cache"
+    else
+      : > "$cache"
+      while IFS= read -r name; do
+        found=0
+        for root in "${batteries[@]}"; do
+          tree="${root%/tests}"; tree="${tree##*/}"
+          case "$name" in
+            "$tree"--*) printf 'suite-invoked: %s/%s.sh\n' "$root" "${name#"$tree"--}" >> "$cache"; found=1 ;;
+          esac
+        done
+        [[ "$found" = 1 ]] || exit 2
+      done < <(sed -n 's/^──── \(.*\) ────$/\1/p' "$cache.out")
+    fi
   fi
   cat "$cache"
   exit 0
@@ -600,8 +632,8 @@ done
 # Orch's name-filter calls remain accounted for by section 2.
 ROSTER_MARK='=== $t'
 roster_block() { # FILE ; a serial roster or a pooled battery invocation
-  grep -qF -e "$ROSTER_MARK" -e 'bash tools/tests/run-all.sh' \
-    -e 'bash skills/orch/tests/run-all.sh --battery' "$1"
+  grep -qF -e "$ROSTER_MARK" -e 'bash tools/tests/run-all.sh' "$1" ||
+    { grep -qF 'bash skills/orch/tests/run-all.sh' "$1" && grep -qF -- '--battery' "$1"; }
 }
 
 # A job outside the shell matrix may run a suite by path. Each job claims
@@ -1106,7 +1138,7 @@ fi
 # --- 4e. The linear control halves cover every discovered stem once -------
 # GitHub invokes both selectors. These fixtures replace the suites and their
 # mutations, but keep the production runner's discovery and selection intact.
-# Bash 3 cannot run linear's battery; the workflow excludes it on macOS.
+# The control driver needs Bash 4; its two jobs remain Linux-only.
 if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
   LINEAR_RUNNER=skills/linear/tests/must-fail-controls.sh
   LINEAR_FIXTURE="$TMP/linear"
@@ -1207,8 +1239,8 @@ JOB_SET="$ROOT/tools/ci-job-set"
 
 suite_owners() { # <workflow> [files [bash-major]] ; `shard<tab>path`, by directory or every file
   local wf="$1" mode="${2-directories}" major="${3-}" dir="$TMP/owner-blocks" f shard cond wd run word
-  local PARTITION_RUNNER_OS=Linux os=ubuntu-latest excluded
-  [[ "$major" != 3 ]] || { PARTITION_RUNNER_OS=macOS; os=macos-latest; }
+  local PARTITION_RUNNER_OS=Linux PARTITION_NATIVE=false os=ubuntu-latest excluded native=""
+  [[ "$major" != 3 ]] || { PARTITION_RUNNER_OS=macOS; PARTITION_NATIVE=true; os=macos-latest; native="$POOL/tools/macos-test-contracts"; }
   excluded="$(excluded_shards "$wf" "$os")"
   cp "$wf" "$PART/.github/workflows/skill-tests.yml"
   split_run_blocks "$wf" "$dir"
@@ -1217,10 +1249,7 @@ suite_owners() { # <workflow> [files [bash-major]] ; `shard<tab>path`, by direct
       roster_block "$f" || continue
       shard="$(one_shard "$(cat "${f%.sh}.cond")")"
       [[ -n "$shard" ]] || continue
-      # Bash's version array is readonly. This disposable runner copy injects
-      # the major version to exercise linear's actual roster branch on Linux.
-      sed 's/${BASH_VERSINFO\[0\]}/${PARTITION_BASH_MAJOR}/g' "$f" > "$dir/runner"
-      ( cd "$PART" && PARTITION_BASH_MAJOR="${major:-${BASH_VERSINFO[0]}}" PATH="$SHIM:$PATH" "$BASH" "$dir/runner" ) 2>/dev/null |
+      ( cd "$PART" && RUN_ALL_NATIVE_CONTRACTS="$native" PATH="$SHIM:$PATH" "$BASH" "$f" ) 2>/dev/null |
         sed -n "s%^suite-invoked: %$shard	%p"
     done
     # One-line steps: the package a node step works in, or the first word of
@@ -1259,17 +1288,24 @@ while IFS='|' read -r shard step battery stem; do
     awk -v step="$step" -v battery="$battery" -v stem="$stem" -v fault="$fault" '
       index($0, "- name: " step) { active = 1 }
       active && substr($0, 1, 8) == "      - " && !index($0, "- name: " step) { active = 0 }
-      active && index($0, "bash skills/orch/tests/run-all.sh --battery " battery) {
+      active && index($0, "bash skills/orch/tests/run-all.sh") { call = 1 }
+      call && /\\$/ { print; next }
+      call {
         if (fault == "omitted") {
-          # Runner options precede filters in a one-line invocation.
-          if ($0 ~ /^ *run: /) $0 = $0 " !=" stem
-          else sub("--battery " battery, "--battery " battery " !=" stem)
+          # Every root and --alone option precedes these shared filters.
+          if ($0 ~ / \|\| /) sub(/ \|\| /, " !=" stem " || ")
+          else $0 = $0 " !=" stem
         }
         else if ($0 ~ /^ *run: /) {
           sub(/run: /, "run: |\n          ")
           $0 = $0 "\n          bash skills/orch/tests/run-all.sh --battery " battery " =" stem
-        } else print "          bash skills/orch/tests/run-all.sh --battery " battery " =" stem
+        } else {
+          print
+          print "          bash skills/orch/tests/run-all.sh --battery " battery " =" stem
+          hits++; call = 0; next
+        }
         hits++
+        call = 0
       }
       { print }
       END { exit hits != 1 }
@@ -1304,11 +1340,12 @@ while IFS='|' read -r shard step battery stem; do
   result=not-run
   for block in "$TMP/assertion-blocks"/*.sh; do
     [[ "$(one_shard "$(cat "${block%.sh}.cond")")" == "$shard" ]] || continue
-    grep -qE -- "--battery $battery( |$)" "$block" || continue
+    grep -qE -- "--battery $battery([[:space:]]|\)|$)" "$block" || continue
     rc=0
     (cd "$PART" && PARTITION_POOL="$bad_pool" PARTITION_POOL_CLAIMS="$bad_cache" \
       PATH="$SHIM:$PATH" "$BASH" "$block") > "$TMP/assertion-step.log" 2>&1 || rc=$?
-    if [[ "$rc" -ne 0 ]] && grep -qxF -- "  - $stem" "$bad_cache"/*.out; then
+    tree="${battery%/tests}"; tree="${tree##*/}"
+    if [[ "$rc" -ne 0 ]] && grep -qxF -e "  - $stem" -e "  - $tree--$stem" -- "$bad_cache"/*.out; then
       result=failed
       break
     fi
@@ -1332,14 +1369,16 @@ worktree|worktree suites|skills/worktree/tests|worktree_output_prune
 worktree-restack|worktree restack suites|skills/worktree/tests|worktree_create_restack
 POOLED
 
-unselected_owners() { # <ci-job-set> <owners file> [repository] ; `shard<tab>path` the selection misses
-  local job_set="$1" repository="${3:-$ROOT}" shard path out="$TMP/owner-selection"
+unselected_owners() { # <ci-job-set> <owners file> [repository] [field] ; missed `shard<tab>path`
+  local job_set="$1" repository="${3:-$ROOT}" field="${4:-}" shard path selected out="$TMP/owner-selection"
   while IFS=$'\t' read -r shard path; do
     : > "$out"
     ( cd "$repository" && CHANGE_CLASS=micro DOCS_ONLY=false CHANGED_PATHS="$path" EVENT=pull_request \
       GITHUB_OUTPUT="$out" "$job_set" --event-parity ) 2>/dev/null ||
       { printf '%s\t%s\tci-job-set-failed\n' "$shard" "$path"; continue; }
-    grep -qF "\"$shard\"" "$out" || printf '%s\t%s\n' "$shard" "$path"
+    selected="$(cat "$out")"
+    [[ -z "$field" ]] || selected="$(sed -n "s/^$field=//p" "$out")"
+    grep -qF "\"$shard\"" <<< "$selected" || printf '%s\t%s\n' "$shard" "$path"
   done < "$2"
 }
 
@@ -1358,8 +1397,13 @@ check "ci-job-set selects the shard running each suite for a diff to that suite"
 # direct package mapping in the selector control.
 for major in 4 3; do
   suite_owners "$WORKFLOW" files "$major" > "$TMP/github-platform-owners"
+  grep '^skills/github/tests/' "$UNIV" > "$TMP/github-expected"
+  if [[ "$major" == 3 ]]; then
+    "$ROOT/tools/macos-test-contracts" --filter <"$TMP/github-expected" >"$TMP/github-native-expected" || exit 1
+    mv "$TMP/github-native-expected" "$TMP/github-expected"
+  fi
   check "GitHub suites belong only to orch-rest under Bash $major" \
-    "$(sed -n 's%^skills/github/tests/%orch-rest\tskills/github/tests/%p' "$UNIV")" \
+    "$(sed 's%^%orch-rest\t%' "$TMP/github-expected")" \
     "$(awk -F '\t' '$2 ~ /^skills\/github\/tests\// {print}' "$TMP/github-platform-owners" | sort)"
 done
 GITHUB_SELECT="$(mktemp -d)" || { bad "GitHub selector scratch allocation failed"; exit 1; }
@@ -1370,6 +1414,7 @@ mkdir -p "$GITHUB_SELECT/tools/lib" "$GITHUB_SELECT/skills/github/tests"
 cp "$PART/tools/rust-reads" "$GITHUB_SELECT/tools/rust-reads"
 cp "$ROOT/tools/lib/skill-requirements.awk" "$GITHUB_SELECT/tools/lib/skill-requirements.awk"
 cp "$JOB_SET" "$GITHUB_SELECT/tools/ci-job-set"
+cp "$ROOT/tools/macos-test-contracts" "$ROOT/tools/macos-test-contracts.json" "$GITHUB_SELECT/tools/"
 printf '#!/usr/bin/env bash\n' > "$GITHUB_SELECT/skills/github/tests/pr-view.test.sh"
 git -C "$GITHUB_SELECT" init -q
 git -C "$GITHUB_SELECT" add skills/github/tests/pr-view.test.sh
@@ -1394,6 +1439,7 @@ check "must-fail: routing GitHub back to rest names its unselected orch-rest sui
 # the Slack rows alone, and every other row's selection is the check's above,
 # so the control hands the mutant those rows and wants each of them back.
 mkdir -p "$TMP/owner-tools"
+cp "$ROOT/tools/macos-test-contracts" "$ROOT/tools/macos-test-contracts.json" "$TMP/owner-tools/"
 cp "$ROOT/tools/rust-reads" "$TMP/owner-tools/rust-reads"
 cp -R "$ROOT/tools/lib" "$TMP/owner-tools/lib"
 awk '$0 ~ /^    skills\/slack\) want_shard slack ;;$/ { n++; next } { print } END { exit n != 1 }' \
@@ -1430,7 +1476,7 @@ macos_excluded_shards() { # macos_excluded_shards <workflow>
   excluded_shards "$1" macos-latest
 }
 linux_only_shards() { # linux_only_shards <ci-job-set>
-  sed -n 's/^LINUX_ONLY_SHARDS="\(.*\)"$/\1/p' "$1" | tr ' ' '\n' | grep . | sort -u
+  "$ROOT/tools/macos-test-contracts" --linux-only-shards | tr ' ' '\n' | grep . | sort -u
 }
 excluded="$(macos_excluded_shards "$WORKFLOW")"
 grep -qx node <<< "$excluded" ||
@@ -1469,9 +1515,8 @@ check "must-fail: a queue fallback naming a Linux-only shard is named" "linear-c
   "$(comm -12 <(queue_fallback_shards "$TMP/queue-linux.yml") <(linux_only_shards "$JOB_SET"))"
 
 # --- 4d. Exactly-once suite coverage on each original shell runner --------
-# Linux runs every shell suite. macOS runs the same files except linear's
-# Bash-4-only suites, whose existing runtime-contract suite runs under Bash 3.
-# The matrix's exclusions must not remove a shell roster on either runner.
+# Linux runs every shell suite. The native eligibility owner defines the
+# macOS subset. Actual workflow discovery must cover each eligible file once.
 # The roster jobs are the Linux job and the main-push macOS job; the merge
 # queue's macOS legs run a subset of shards and are no roster.
 roster_os() { # WORKFLOW — the os of each roster job's matrix, one per line
@@ -1535,8 +1580,6 @@ sed 's/steps: \*skill-suite-steps/steps: []/' "$WORKFLOW" > "$TMP/mac-empty.yml"
 check "must-fail: a macOS job with no shared steps loses its suite alias" \
   $'skill-suites-shard: &skill-suite-steps\nskill-suites-macos: []\nskill-suites-macos-queue: []' \
   "$(shared_steps "$TMP/mac-empty.yml")"
-check "the linear roster has one injectable shell-version branch" "1" \
-  "$(grep -cF 'if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then' "$WORKFLOW")"
 
 os_claims() { # <workflow> <os> <major> ; suite files the expanded matrix runs
   local wf="$1" os="$2" major="$3" excluded="" owners="$TMP/os-owners"
@@ -1565,13 +1608,16 @@ for os in ubuntu-latest macos-latest; do
   [[ "$os" != macos-latest ]] || major=3
   cp "$UNIV" "$TMP/os-universe"
   for f in "$ROOT"/skills/linear/tests/*.sh; do
-    [[ "$major" != 3 || "$f" == */bash4-runtime-contract.test.sh ]] || continue
     printf '%s\n' "${f#"$ROOT/"}" >> "$TMP/os-universe"
   done
   sort -o "$TMP/os-universe" "$TMP/os-universe"
+  if [[ "$os" == macos-latest ]]; then
+    "$ROOT/tools/macos-test-contracts" --filter <"$TMP/os-universe" >"$TMP/native-universe" || exit 1
+    mv "$TMP/native-universe" "$TMP/os-universe"
+  fi
   [[ -s "$TMP/os-universe" ]] || { bad "the suite discovery is empty for $os"; continue; }
   os_claims "$WORKFLOW" "$os" "$major" > "$TMP/os-claims"
-  check "every original suite runs exactly once on $os" \
+  check "every eligible suite runs exactly once on $os" \
     "$(cat "$TMP/os-universe")" "$(cat "$TMP/os-claims")"
   printf 'coverage: os=%s suites=%s\n' "$os" "$(wc -l < "$TMP/os-universe" | tr -d ' ')"
   os_claims "$wf_drop" "$os" "$major" > "$TMP/os-drop"
@@ -1590,6 +1636,108 @@ for os in ubuntu-latest macos-latest; do
     fi
   fi
 done
+
+# Unknown additions use actual workflow discovery and per-path selection.
+# The input families include the removed empty-shard seams.
+rm -- "$PART/skills"
+cp -R "$POOL/skills" "$PART/skills"
+rm -- "$PART/tools/tests"
+cp -R "$POOL/tools/tests" "$PART/tools/tests"
+rm -- "$PART/hooks" "$PART/refresh"
+cp -R "$POOL/hooks" "$PART/hooks"
+cp -R "$POOL/refresh" "$PART/refresh"
+UNION_RUNS="$TMP/unknown-union-runs"
+PARTITION_POOL_CLAIMS="$TMP/unknown-pool-claims"
+mkdir -p "$UNION_RUNS" "$PARTITION_POOL_CLAIMS"
+: > "$TMP/unknown-paths"
+: > "$TMP/unknown-linux-owners"
+: > "$TMP/unknown-macos-owners"
+while IFS='|' read -r path linux_owner macos_owner; do
+  for tree in "$PART" "$POOL" "$GITHUB_SELECT"; do
+    mkdir -p "$tree/${path%/*}"
+    printf '#!/usr/bin/env bash\n' > "$tree/$path"
+  done
+  case "$path" in
+    skills/orch/tests/*) printf '#!/usr/bin/env bash\n' > "$SANDBOX/${path##*/}" ;;
+  esac
+  printf '%s\n' "$path" >> "$TMP/unknown-paths"
+  printf '%s\t%s\n' "$linux_owner" "$path" >> "$TMP/unknown-linux-owners"
+  printf '%s\t%s\n' "$macos_owner" "$path" >> "$TMP/unknown-macos-owners"
+done <<'UNKNOWN'
+skills/orch/tests/oversee_watch_overseer_future.sh|orch-oversee-watch|orch-oversee
+skills/worktree/tests/worktree_future_restack.sh|worktree-restack|worktree
+tools/tests/native-future.test.sh|guards-tools|guards-tools
+skills/commit-guards/tests/pre-push-future.test.sh|guards-commit|guards-commit
+skills/linear/tests/native-future.test.sh|linear|linear
+skills/deep-research/tests/native-future.sh|rest|rest
+skills/slack/tests/worker-stall.test.sh|slack|slack
+UNKNOWN
+sort -o "$TMP/unknown-paths" "$TMP/unknown-paths"
+git -C "$GITHUB_SELECT" add .
+cp "$JOB_SET" "$GITHUB_SELECT/tools/ci-job-set"
+for os in ubuntu-latest macos-latest; do
+  major=4; platform=linux
+  [[ "$os" != macos-latest ]] || { major=3; platform=macos; }
+  cp "$TMP/unknown-paths" "$TMP/os-universe"
+  os_claims "$WORKFLOW" "$os" "$major" > "$TMP/unknown-claims"
+  check "unknown families execute exactly once on $os" \
+    "$(cat "$TMP/unknown-paths")" "$(cat "$TMP/unknown-claims")"
+  while IFS=$'\t' read -r owner path; do
+    check "unknown $path reaches $owner on $os" "$owner"$'\t'"$path" \
+      "$(grep -xF "$owner"$'\t'"$path" "$TMP/os-owners")"
+  done < "$TMP/unknown-$platform-owners"
+done
+check "unknown Mac families select their retained jobs with event parity" "" \
+  "$(unselected_owners "$GITHUB_SELECT/tools/ci-job-set" "$TMP/unknown-macos-owners" "$GITHUB_SELECT" queue_macos_shards)"
+
+needle='            case "$base" in *restack*) [ -n "${RUN_ALL_NATIVE_CONTRACTS:-}" ] || continue ;; esac'
+NEEDLE="$needle" REPLACEMENT='            case "$base" in *restack*) continue ;; esac' \
+  awk '$0 == ENVIRON["NEEDLE"] { $0 = ENVIRON["REPLACEMENT"]; n++ } {print} END {exit n != 1}' \
+  "$WORKFLOW" > "$TMP/unknown-restack.yml" || bad "restack retention control changed no workflow owner"
+os_claims "$TMP/unknown-restack.yml" macos-latest 3 > "$TMP/unknown-restack-claims"
+check "must-fail: the old restack filter loses its unresolved suite" \
+  skills/worktree/tests/worktree_future_restack.sh \
+  "$(comm -23 "$TMP/unknown-paths" "$TMP/unknown-restack-claims")"
+
+NEEDLE='          set -- skills/linear/tests/*.sh' REPLACEMENT='          set -- skills/linear/tests/*.sh; set -- skills/linear/tests/bash4-runtime-contract.test.sh' \
+  awk '$0 == ENVIRON["NEEDLE"] { $0 = ENVIRON["REPLACEMENT"]; n++ } {print} END {exit n != 1}' \
+  "$WORKFLOW" > "$TMP/unknown-linear.yml" || bad "linear retention control changed no workflow owner"
+os_claims "$TMP/unknown-linear.yml" macos-latest 3 > "$TMP/unknown-linear-claims"
+check "must-fail: the old linear roster loses its unresolved suite" \
+  skills/linear/tests/native-future.test.sh \
+  "$(comm -23 "$TMP/unknown-paths" "$TMP/unknown-linear-claims")"
+
+needle='        if [ -n "${RUN_ALL_NATIVE_CONTRACTS:-}" ]; then OWNING_SHARD=orch-oversee; return; fi ;;'
+NEEDLE="$needle" REPLACEMENT='        if false; then OWNING_SHARD=orch-oversee; return; fi ;;' \
+  awk '$0 == ENVIRON["NEEDLE"] { $0 = ENVIRON["REPLACEMENT"]; n++ } {print} END {exit n != 1}' \
+  "$TEST_DIR/run-all.sh" > "$SANDBOX/run-all.sh" || bad "orch retention control changed no runner owner"
+UNION_RUNS="$TMP/unknown-orch-control"
+mkdir -p "$UNION_RUNS"
+os_claims "$WORKFLOW" macos-latest 3 > "$TMP/unknown-orch-claims"
+check "must-fail: the old watch route loses its unresolved suite" \
+  skills/orch/tests/oversee_watch_overseer_future.sh \
+  "$(comm -23 "$TMP/unknown-paths" "$TMP/unknown-orch-claims")"
+cp "$TEST_DIR/run-all.sh" "$SANDBOX/run-all.sh"
+
+sed 's/want_shard rest; break;/:; break;/' "$JOB_SET" > "$GITHUB_SELECT/tools/ci-job-set"
+edited "$JOB_SET" "$GITHUB_SELECT/tools/ci-job-set" unknown-package-selector
+check "must-fail: node-only package selection misses its unresolved shell suite" \
+  $'rest\tskills/deep-research/tests/native-future.sh' \
+  "$(unselected_owners "$GITHUB_SELECT/tools/ci-job-set" "$TMP/unknown-macos-owners" "$GITHUB_SELECT" queue_macos_shards)"
+
+for owner in "$POOL/tools/macos-test-contracts" "$TMP/routing/tools/macos-test-contracts"; do
+  sed 's/contracts.get(relative, "unresolved")/contracts.get(relative, "linux-duplicate")/' \
+    "$ROOT/tools/macos-test-contracts" > "$owner"
+  edited "$ROOT/tools/macos-test-contracts" "$owner" unknown-retention
+done
+UNION_RUNS="$TMP/unknown-drop-union"
+PARTITION_POOL_CLAIMS="$TMP/unknown-drop-pool"
+mkdir -p "$UNION_RUNS" "$PARTITION_POOL_CLAIMS"
+os_claims "$WORKFLOW" macos-latest 3 > "$TMP/unknown-drop-claims"
+check "must-fail: dropping unknown eligibility loses every unresolved family" \
+  "$(cat "$TMP/unknown-paths")" "$(comm -23 "$TMP/unknown-paths" "$TMP/unknown-drop-claims")"
+cp "$ROOT/tools/macos-test-contracts" "$POOL/tools/macos-test-contracts"
+cp "$ROOT/tools/macos-test-contracts" "$TMP/routing/tools/macos-test-contracts"
 
 fi
 
@@ -1795,6 +1943,7 @@ else
 fi
 if [[ "$integration" == true ]]; then
   "$INTEGRATION_EXE" --list "$@"
+
 fi
 SH
 chmod +x "$CARGO_SHIM/cargo"
@@ -1910,6 +2059,7 @@ while IFS='|' read -r family leg; do
 done <<'FAMILIES'
 toggle_locked::|verify-lock
 apply_locked::|apply-locked
+refresh_fresh_clone::|apply-locked
 FAMILIES
 while IFS= read -r leg; do
   check "the $leg test command runs every declared target and unit selection" \
@@ -2001,7 +2151,7 @@ check "must-fail: that merge retains every target and only the integration overl
 # Omission and overlap controls remove one side of the same name seam.
 # A third control drops forwarding in the actual test command: declarations
 # alone must not claim protection for arguments the harness never receives.
-for defect in selector skip toggle-selector toggle-skip apply-leg-drop apply-skip forwarding export unit-filter; do
+for defect in selector skip toggle-selector toggle-skip apply-leg-drop apply-skip refresh-selector refresh-skip forwarding export unit-filter; do
   mutant="$TMP/wf-cargo-filter-$defect.yml"
   case "$defect" in
     selector) sed "s/filters='verify_ lock_record:: toggle_locked::'/filters='lock_record:: toggle_locked::'/" "$WORKFLOW" > "$mutant" ;;
@@ -2010,6 +2160,8 @@ for defect in selector skip toggle-selector toggle-skip apply-leg-drop apply-ski
     toggle-skip) sed 's/ --skip toggle_locked:://' "$WORKFLOW" > "$mutant" ;;
     apply-leg-drop) sed 's/, apply-locked\]/]/' "$WORKFLOW" > "$mutant" ;;
     apply-skip) sed 's/ --skip apply_locked:://' "$WORKFLOW" > "$mutant" ;;
+    refresh-selector) sed 's/apply_locked:: refresh_ --skip verify_/apply_locked:: --skip verify_/' "$WORKFLOW" > "$mutant" ;;
+    refresh-skip) sed 's/ --skip refresh_//' "$WORKFLOW" > "$mutant" ;;
     forwarding) sed 's/ -- \$CARGO_FILTERS//' "$WORKFLOW" > "$mutant" ;;
     export) sed 's/echo "CARGO_FILTERS=\$filters"/echo "CARGO_FILTERS="/' "$WORKFLOW" > "$mutant" ;;
     unit-filter) sed 's/\$CARGO_TARGETS ||/\$CARGO_TARGETS -- \$CARGO_FILTERS ||/' "$WORKFLOW" > "$mutant" ;;
@@ -2029,13 +2181,18 @@ for defect in selector skip toggle-selector toggle-skip apply-leg-drop apply-ski
     continue
   fi
   integration_claims "$mutant" | cut -d' ' -f1 | sort > "$TMP/integration-$defect"
-  if [[ "$defect" == selector || "$defect" == toggle-selector || "$defect" == apply-leg-drop ]]; then
+  if [[ "$defect" == selector || "$defect" == toggle-selector || "$defect" == apply-leg-drop || "$defect" == refresh-selector ]]; then
     lost="$(comm -23 "$INTEGRATION_TESTS" <(sort -u "$TMP/integration-$defect"))"
     if [[ "$defect" == toggle-selector || "$defect" == apply-leg-drop ]]; then
       family=toggle_locked::
       [[ "$defect" != apply-leg-drop ]] || family=apply_locked::
       check "must-fail: dropped $defect leaves every $family test unclaimed" \
-        "$(sed -n "/^$family/p" "$INTEGRATION_TESTS")" "$lost"
+        "$(sed -n "/^$family/p" "$INTEGRATION_TESTS")" "$(sed -n "/^$family/p" <<<"$lost")"
+      if [[ "$defect" == apply-leg-drop ]]; then
+        check 'must-fail: dropped apply leg also loses the non-verification refresh names' \
+          "$(grep -F refresh_ "$INTEGRATION_TESTS" | grep -vF verify_ || true)" \
+          "$(grep -F refresh_ <<<"$lost" || true)"
+      fi
     else
       [[ -n "$lost" ]] && ok "must-fail: a dropped selector names unclaimed integration tests" ||
         bad "must-fail: a dropped selector leaves no unclaimed integration test"
@@ -2045,8 +2202,13 @@ for defect in selector skip toggle-selector toggle-skip apply-leg-drop apply-ski
     if [[ "$defect" == toggle-skip || "$defect" == apply-skip ]]; then
       family=toggle_locked::
       [[ "$defect" != apply-skip ]] || family=apply_locked::
-      check "must-fail: dropped $defect repeats every $family test" \
-        "$(sed -n "/^$family/p" "$INTEGRATION_TESTS")" "$repeated"
+      expected="$(sed -n "/^$family/p" "$INTEGRATION_TESTS")"
+      if [[ "$defect" == apply-skip ]]; then
+        # Names also excluded by refresh_ cannot reach the removed skip.
+        expected="$(grep -vF refresh_ <<<"$expected" || true)"
+      fi
+      check "must-fail: dropped $defect repeats each name held only by that skip" \
+        "$expected" "$repeated"
     else
       [[ -n "$repeated" ]] && ok "must-fail: dropped $defect names repeated integration tests" ||
         bad "must-fail: dropped $defect leaves no repeated integration test"
