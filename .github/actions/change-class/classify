@@ -5,9 +5,9 @@
 # passing run of this workflow already proved the tree this run tests.
 #
 # Nothing here decides a class or a docs verdict. `change-class` prints one
-# and writes it to the step's output file itself, and `harness-only --mode
-# docs` does the same for docs_only; this script adds the path families beside
-# them, and the families are a grouping of the path list that docs-mode call
+# on stdout, and this script forwards it with its queue-only stderr record.
+# `harness-only --mode docs` writes docs_only; this script adds the path
+# families beside them, grouping the path list that docs-mode call
 # prints, never a second reading of the diff. Taking the list from that call
 # is what keeps the grouping on the shipped reader: `change-class` repeats the
 # same paths on its stderr in a shell-quoted form whose only decoder is `eval`,
@@ -45,9 +45,9 @@
 #   GITHUB_SHA and the rest `proof` lists
 #
 # Outputs appended to GITHUB_OUTPUT:
-#   change_class       render|trivial|micro|small|standard, written by the
-#                      shipped classifier itself
-#   queue_only         true|false, written by the shipped classifier itself:
+#   change_class       render|trivial|micro|small|standard, forwarded from the
+#                      shipped classifier's stdout
+#   queue_only         true|false, forwarded from the shipped classifier:
 #                      whether the change must run in a merge group before
 #                      it lands, the value of its `queue-only:` line, whose
 #                      statement is change-class's header. Absent where the
@@ -91,7 +91,9 @@
 #                      § Per-lane verdicts.
 #   lanes_cause        why: render, trivial, docs-only or proof-reused where
 #                      lanes=false; render-moved-claim for a claimed moved-file
-#                      candidate in a render; the class otherwise.
+#                      candidate in a render; lane-producer-unavailable when
+#                      the classifier checkout lacks the installed producer;
+#                      the class otherwise.
 #   lane_verdicts      one `lane_<name>=true|false` line per default-branch
 #                      lane, in base order, with head-only lanes appended in
 #                      head order on a valid declaration comparison. This is
@@ -206,7 +208,7 @@
 set -euo pipefail
 
 die() { # CAUSE MESSAGE
-  printf 'change-class-action: wiring-error: cause=%s\n' "$1" >&2
+  printf 'change-class-action: wiring-error: cause=%s\n' "${1#cause=}" >&2
   printf 'change-class-action: %s\n' "$2" >&2
   exit 2
 }
@@ -230,25 +232,14 @@ PROOF="$(dirname "$0")/proof"
 [ -n "${GITHUB_OUTPUT:-}" ] || die missing-output-file \
   "GITHUB_OUTPUT is unset, so no caller could read a verdict"
 
-declaration=""
+# shellcheck source=../../../skills/harness-ci/scripts/lib/change-class.sh
+if [ ! -r "$SCRIPTS/lib/change-class.sh" ] || ! . "$SCRIPTS/lib/change-class.sh"; then
+  die "lane-producer-unreadable root=$scripts_root" "the installed lane producer is unavailable"
+fi
 if [ -n "${LANES_FROM:-}" ]; then
-  lanes_root="$(cd "$LANES_FROM" 2>/dev/null && pwd -P)" ||
-    die "lanes-from-unreadable root=$LANES_FROM" \
-      "the lanes-from checkout is not a directory"
-  judged_root="$(cd "$REPO" 2>/dev/null && pwd -P)" ||
-    die "repo-unreadable repo=$REPO" "the repo checkout is not a directory"
-  [ "$lanes_root" != "$judged_root" ] ||
-    die "lanes-from-judged-tree root=$LANES_FROM" \
-      "lanes-from names the tree under judgement, whose author could stand a lane down"
-  declaration="$lanes_root/.github/ci-lanes.conf"
-  # The declaration's reader ships beside the classifier, so change-class's
-  # queue-only line and these verdicts read one grammar. The readability test
-  # comes first because Bash 3.2 under errexit exits 1 on a `.` that finds no
-  # file, before the `||` beside it runs.
   # shellcheck source=../../../skills/harness-ci/scripts/lib/ci-lanes.sh
   if [ ! -r "$SCRIPTS/lib/ci-lanes.sh" ] || ! . "$SCRIPTS/lib/ci-lanes.sh"; then
-    die "lanes-reader-unreadable root=$scripts_root" \
-      "no skills/harness-ci/scripts/lib/ci-lanes.sh under the classifier root"
+    die "lanes-reader-unreadable root=$scripts_root" "the lane declaration reader is unavailable"
   fi
 fi
 
@@ -264,10 +255,9 @@ export GITHUB_OUTPUT="${work:?}/outputs"
 args=(--event "$EVENT" --head "$HEAD" --repo "$REPO")
 [ -z "${BASE:-}" ] || args=("${args[@]}" --base "$BASE")
 
-# The verdict. `change-class` appends `change_class=` to GITHUB_OUTPUT on its
-# own and prints that same line, and nothing else, on stdout, which is where
-# it is read back. Any other exit is a wiring error that carries no verdict.
-verdict="$("$SCRIPTS/change-class" "${args[@]}" 2>"${work:?}/class-log")" || {
+# Only stdout and the queue record are needed here. The /dev/null output
+# contract avoids a local lane decision before the declaration-aware call.
+verdict="$("$SCRIPTS/change-class" "${args[@]}" --output /dev/null 2>"${work:?}/class-log")" || {
   status=$?
   cat -- "${work:?}/class-log" >&2
   die "classifier-failed status=$status" "change-class exited $status"
@@ -279,20 +269,21 @@ case "$verdict" in
   *) die "verdict-unreadable class-line=$verdict" \
     "the classifier printed no change_class line this action knows" ;;
 esac
-# The queue_only line change-class appended beside its class, the one answer
-# a `:queue` lane's deferral stands on; empty where the classifier root
-# predates it.
-queue_only="$(sed -n 's/^queue_only=//p' "$GITHUB_OUTPUT")" ||
-  die "queue-only-unreadable path=$GITHUB_OUTPUT" \
-    "could not read back the queue_only line change-class wrote"
+# The documented stderr record owns queue_only. A classifier predating it
+# leaves the output absent, as it did before the action forwarded the record.
+queue_only="$(sed -n 's/^queue-only: queue_only=\([^ ]*\).*/\1/p' "${work:?}/class-log")" ||
+  die "queue-only-unreadable path=${work:?}/class-log" \
+    "could not read the queue-only record change-class wrote"
+printf 'change_class=%s\n' "$class" >>"$GITHUB_OUTPUT"
+[ -z "$queue_only" ] || printf 'queue_only=%s\n' "$queue_only" >>"$GITHUB_OUTPUT"
 
 # The docs verdict and the paths, from the reader that owns the diff range for
-# every event. It appends `docs_only=` to GITHUB_OUTPUT on its own, as the
-# classifier does its class. The paths outside the docs set are asked for
+# every event. It appends `docs_only=` to GITHUB_OUTPUT on its own.
+# The paths outside the docs set are asked for
 # only where a lane is declared: a classifier checkout older than that flag
 # still serves every caller that declares none.
 docs_args=(--mode docs "${args[@]}" --paths-output "${work:?}/paths")
-[ -z "$declaration" ] ||
+[ -z "${LANES_FROM:-}" ] ||
   docs_args=("${docs_args[@]}" --outside-output "${work:?}/outside")
 docs="$("$SCRIPTS/harness-only" "${docs_args[@]}")" || {
   status=$?
@@ -303,15 +294,6 @@ case "$docs" in
   *) die "docs-verdict-unreadable docs-line=$docs" \
     "harness-only printed no docs_only line" ;;
 esac
-
-# Every class but `standard` is reached only after the classifier read a
-# changed path, so an empty list under one of them is a state neither script
-# can produce. Publishing the families empty there would select the lanes a
-# narrow class runs on nothing at all.
-if [ ! -s "${work:?}/paths" ] && [ "$class" != standard ]; then
-  die "class-without-paths class=$class" \
-    "a narrow class arrived with no changed path, which no classifier emits"
-fi
 
 # One family per directory level a caller gates on: the skill, the workspace
 # member and the workflow file. A path outside all three joins no family, and
@@ -354,244 +336,15 @@ fi
 # `trivial` one is inside its allowlist and line ceiling, and a docs-only one
 # changes no path outside the documentation set at any size. Every other diff
 # runs the lanes.
-if [ "$class" = render ] || [ "$class" = trivial ]; then
-  lanes=false lanes_cause="$class"
-elif [ "$docs" = docs_only=true ]; then
-  lanes=false lanes_cause=docs-only
+# A separately checked-out default branch can predate the installed producer
+# while the action already carries it. With no decision, run every lane.
+if declare -F change_class_lanes >/dev/null; then
+  change_class_lanes "$class" "$docs" "$EVENT" "$REPO" "$HEAD" \
+    "$queue_only" "$work" "${LANES_FROM:-}"
 else
-  lanes=true lanes_cause="$class"
+  lane_count=0 lane_state=unset lane_values=() lane_causes=()
+  lanes=true lanes_cause=lane-producer-unavailable
 fi
-
-outside_docs() { # PATH — 0 outside the docs set, 1 inside it
-  local status=0
-  grep -qxF -- "$1" "${work:?}/outside" 2>/dev/null || status=$?
-  case "$status" in
-    0) return 0 ;;
-    1) return 1 ;;
-    *) die "outside-list-unreadable status=$status" \
-      "could not read the paths harness-only placed outside the docs set" ;;
-  esac
-}
-
-lane_count=0
-lane_state="unset"
-if [ -n "$declaration" ]; then
-  if [ ! -e "$declaration" ]; then
-    lane_state="absent"
-  elif ci_lanes_read "$declaration"; then
-    lane_state="read"
-  else
-    lane_state="malformed" lane_count=0
-  fi
-  printf 'lane-declaration: state=%s path=%s%s\n' "$lane_state" \
-    "$declaration" "${declaration_note:+ $declaration_note}" >&2
-fi
-case "$lane_state" in
-  absent | malformed)
-    printf '::warning title=lane declaration %s::%s %s; no lane verdict is published\n' \
-      "$lane_state" "$declaration" "${declaration_note:-}" ;;
-esac
-
-# This local comparison needs no decision record: branch claims cannot
-# stand down checks for other paths, since the author controls those claims.
-declaration_delta() {
-  local names=("${lane_names[@]}") queues=("${lane_queue[@]}") claims=()
-  local count="$lane_count" index other claim found
-  index=0
-  while [ "$index" -lt "$count" ]; do
-    claims[$index]="$(printf '%s' "${lane_globs[$index]}" | LC_ALL=C sort -u)" || return 1
-    index=$((index + 1))
-  done
-  git -C "$REPO" cat-file blob "$HEAD:.github/ci-lanes.conf" >"${work:?}/head-ci-lanes.conf" 2>/dev/null || return 1
-  ci_lanes_read "${work:?}/head-ci-lanes.conf" || return 1
-  index=0
-  while [ "$index" -lt "$lane_count" ]; do
-    other=0
-    while [ "$other" -lt "$count" ] && [ "${names[$other]}" != "${lane_names[$index]}" ]; do
-      other=$((other + 1))
-    done
-    claim="$(printf '%s' "${lane_globs[$index]}" | LC_ALL=C sort -u)" || return 1
-    if [ "$other" -eq "$count" ] || [ "${claims[$other]}" != "$claim" ] || [ "${queues[$other]}" != "${lane_queue[$index]}" ]; then
-      printf '%s\n' "${lane_names[$index]}"
-    fi
-    index=$((index + 1))
-  done
-  other=0
-  while [ "$other" -lt "$count" ]; do
-    found=false index=0
-    while [ "$index" -lt "$lane_count" ]; do
-      [ "${names[$other]}" != "${lane_names[$index]}" ] || found=true
-      index=$((index + 1))
-    done
-    [ "$found" = true ] || printf '%s\n' "${names[$other]}"
-    other=$((other + 1))
-  done
-}
-
-# Each path records its own evidence. The verdict pass alone gives a failed
-# comparison precedence over queue deferral, and an ordinary claim precedence
-# over a valid declaration delta, without one path discarding another's fact.
-base_lane_count="$lane_count"
-lane_hits=()
-lane_changed=()
-render_hits=()
-if [ "$lane_state" = read ] && [ "$class" = render ]; then
-  # The classifier's reader owns the event range. Its resolved endpoints
-  # keep this status read on that range, including a moving PR base.
-  render_base="$(sed -n 's/^base-rev: //p' "${work:?}/class-log")" ||
-    die render-range-unreadable "could not read the render base revision"
-  render_head="$(sed -n 's/^head-rev: //p' "${work:?}/class-log")" ||
-    die render-range-unreadable "could not read the render head revision"
-  [ -n "$render_base" ] && [ -n "$render_head" ] ||
-    die render-range-unreadable "the render classifier supplied no resolved range"
-  git -C "$REPO" diff --no-ext-diff --no-textconv \
-    --name-status -z --no-renames --diff-filter=AD "$render_base" "$render_head" -- \
-    >"${work:?}/moved" || die render-moves-unreadable "could not read render additions and deletions"
-  moved_paths=() added_paths=() has_deletions=false
-  while IFS= read -r -d '' status <&3; do
-    IFS= read -r -d '' path <&3 || die render-moves-unreadable "a moved path is absent"
-    case "$status" in
-      A) added_paths+=("$path") ;;
-      D) has_deletions=true; moved_paths+=("$path") ;;
-    esac
-  done 3<"${work:?}/moved"
-  # WriteTree carries paths and bytes, not move identity. Similarity can pair
-  # an old file with a retained copy and hide its rewritten destination.
-  # Disabling rename pairing keeps every disappeared path visible. Each
-  # addition then needs its claiming lane. Additions alone grant no lane.
-  if [ "$has_deletions" = true ]; then
-    moved_paths=("${moved_paths[@]+"${moved_paths[@]}"}" "${added_paths[@]+"${added_paths[@]}"}")
-  fi
-  for path in ${moved_paths[@]+"${moved_paths[@]}"}; do
-    index=0
-    while [ "$index" -lt "$lane_count" ]; do
-      if ci_lanes_claims "$index" "$path" && [ -z "${render_hits[$index]:-}" ]; then
-        render_hits[$index]="path=$path glob=$LANE_GLOB_HIT"
-        lanes=true lanes_cause=render-moved-claim
-      fi
-      index=$((index + 1))
-    done
-  done
-fi
-declaration_comparison=not-needed
-no_changed_paths=false
-unclaimed_path=""
-if [ "$lane_state" = read ] && [ "$lanes" = true ] && [ "$class" != render ]; then
-  index=0
-  while [ "$index" -lt "$lane_count" ]; do
-    lane_hits[$index]="" lane_changed[$index]=false
-    index=$((index + 1))
-  done
-  if [ ! -s "${work:?}/paths" ]; then
-    no_changed_paths=true
-  fi
-  while IFS= read -r path; do
-    [ -n "$path" ] || continue
-    if [ "$path" = .github/ci-lanes.conf ]; then
-      if delta="$(declaration_delta)"; then
-        declaration_comparison=valid
-        while IFS= read -r name; do
-          [ -n "$name" ] || continue
-          index=0
-          while [ "$index" -lt "$lane_count" ] && [ "${lane_names[$index]}" != "$name" ]; do
-            index=$((index + 1))
-          done
-          if [ "$index" -eq "$lane_count" ]; then
-            lane_names[$index]="$name" lane_globs[$index]=""
-            lane_queue[$index]=false lane_uniform[$index]=false
-            lane_hits[$index]="" lane_changed[$index]=false
-            lane_count=$((lane_count + 1))
-          fi
-          lane_changed[$index]=true
-        done <<<"$delta"
-      else
-        declaration_comparison=unreadable
-      fi
-      continue
-    fi
-    claimed=false
-    index=0
-    while [ "$index" -lt "$base_lane_count" ]; do
-      if ci_lanes_claims "$index" "$path"; then
-        claimed=true
-        [ -n "${lane_hits[$index]}" ] ||
-          lane_hits[$index]="path=$path glob=$LANE_GLOB_HIT"
-      fi
-      index=$((index + 1))
-    done
-    if [ "$claimed" = false ] && [ -z "$unclaimed_path" ] && outside_docs "$path"; then
-      unclaimed_path="$path"
-    fi
-  done <"${work:?}/paths"
-fi
-
-# The trees, of the two a merge of this pull request may run pr-merge from,
-# whose harness-ci render lacks the reader of the `:queue` mark: `lanes-from`,
-# `judged`, both comma-joined, or empty where both carry it. The render path
-# is the one the harness-ci template's render-reach step runs from. The
-# judged tree is read at HEAD, not REPO's worktree, which on a pull request
-# is the merge GitHub built and holds the base's render where the head has
-# none; a HEAD REPO cannot read counts as absent, so the lane runs.
-queue_reader=.agents/skills/harness-ci/scripts/lib/ci-lanes.sh
-queue_reader_missing() {
-  local missing=""
-  [ -f "$lanes_root/$queue_reader" ] || missing="lanes-from"
-  [ "$(git -C "$REPO" cat-file -t "$HEAD:$queue_reader" 2>/dev/null)" = blob ] ||
-    missing="${missing:+$missing,}judged"
-  printf '%s' "$missing"
-}
-
-# Each lane's classified verdict and cause, at its index. On a pull request
-# a lane marked `:queue` that one of its own globs reached stands down only
-# where this run's change-class answered queue_only=true and both renders
-# read the mark, so pr-merge, asking the same question from either, keeps
-# the pull request off the admin merge. Otherwise it runs, its cause naming
-# what was missing. A queue lane only a fallback reached runs here, since no
-# glob of its own put the diff in the queue.
-# A failed declaration comparison permits no queue deferral.
-lane_values=()
-lane_causes=()
-reader_missing=unread
-index=0
-while [ "$index" -lt "$lane_count" ]; do
-  if [ "$lanes" = false ]; then
-    lane_values[$index]=false lane_causes[$index]="cause=lanes-false lanes_cause=$lanes_cause"
-  elif [ "$class" = render ]; then
-    if [ -n "${render_hits[$index]:-}" ]; then
-      lane_values[$index]=true lane_causes[$index]="cause=render-moved-claim ${render_hits[$index]}"
-    else
-      lane_values[$index]=false lane_causes[$index]="cause=render-unreached"
-    fi
-  elif [ "$declaration_comparison" = unreadable ]; then
-    lane_values[$index]=true lane_causes[$index]="cause=lane-declaration-unreadable path=.github/ci-lanes.conf"
-  elif [ "$EVENT" = pull_request ] && [ "${lane_queue[$index]}" = true ] && [ -n "${lane_hits[$index]}" ]; then
-    hit="${lane_hits[$index]}"
-    [ "$reader_missing" != unread ] || reader_missing="$(queue_reader_missing)"
-    if [ -n "$reader_missing" ]; then
-      lane_values[$index]=true lane_causes[$index]="cause=queue-reader-absent tree=$reader_missing $hit"
-    elif [ "$queue_only" != true ]; then
-      lane_values[$index]=true lane_causes[$index]="cause=queue-unconfirmed queue_only=${queue_only:-absent} $hit"
-    else
-      lane_values[$index]=false lane_causes[$index]="cause=queue-deferred $hit"
-    fi
-  elif [ "$no_changed_paths" = true ]; then
-    lane_values[$index]=true lane_causes[$index]="cause=no-changed-paths"
-  elif [ -n "$unclaimed_path" ]; then
-    lane_values[$index]=true lane_causes[$index]="cause=unclaimed-path path=$unclaimed_path"
-  elif [ -n "${lane_hits[$index]}" ]; then
-    lane_values[$index]=true lane_causes[$index]="cause=claimed ${lane_hits[$index]}"
-  elif [ "${lane_changed[$index]}" = true ]; then
-    lane_values[$index]=true lane_causes[$index]="cause=declaration-changed path=.github/ci-lanes.conf"
-  else
-    lane_values[$index]=false lane_causes[$index]="cause=unreached"
-  fi
-  index=$((index + 1))
-done
-case "$reader_missing" in
-  unread | "") ;;
-  *) printf '::warning title=queue lane not deferred::tree=%s holds no %s, so github.sh pr-merge run from it would read this pull request free to take the admin merge; run kendex refresh on the default branch and rebase the pull request onto it, and until then the lane runs\n' \
-    "$reader_missing" "$queue_reader" ;;
-esac
 
 # The proof: whether a passing run of this workflow tested this tree, and
 # its record. `proof` decides and never gates, so its lines are read as they

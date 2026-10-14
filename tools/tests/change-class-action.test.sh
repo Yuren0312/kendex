@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # `.github/actions/change-class/classify` is the one reader of a change class
-# every workflow gates on, and the one decision it makes is `lanes`, from the
+# every workflow gates on. It calls the installed lane producer with the
 # two verdicts it reads: the class is what the shipped `change-class` printed,
 # docs_only is what the shipped `harness-only --mode docs` printed, and the
 # path families are a grouping of the path list that same call wrote. Beside
@@ -72,6 +72,7 @@ unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE
 ROOT="$(git rev-parse --show-toplevel)"
 CLASSIFY="$ROOT/.github/actions/change-class/classify"
 LANES_LIB="$ROOT/skills/harness-ci/scripts/lib/ci-lanes.sh"
+DECISION_LIB="$ROOT/skills/harness-ci/scripts/lib/change-class.sh"
 ACTION="$ROOT/.github/actions/change-class/action.yml"
 
 mkdir -p "$ROOT/tmp"
@@ -115,9 +116,18 @@ set -euo pipefail
 printf 'change-class %s\n' "$*" >>"$STUB_LOG"
 printf 'base-rev: %s\nhead-rev: %s\n' "$STUB_BASE_REV" "$STUB_HEAD_REV" >&2
 [ "${STUB_CLASS_EXIT:-0}" -eq 0 ] || exit "$STUB_CLASS_EXIT"
-[ -z "${GITHUB_OUTPUT:-}" ] ||
-  printf 'change_class=%s\nqueue_only=%s\n' "$STUB_CLASS" "${STUB_QUEUE:-false}" >>"$GITHUB_OUTPUT"
-[ -z "${STUB_OUTPUT_UNREADABLE:-}" ] || chmod 200 "$GITHUB_OUTPUT"
+output="${GITHUB_OUTPUT:-}"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) output="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -z "$output" ] || printf 'change_class=%s\n' "$STUB_CLASS" >>"$output"
+if [ "${STUB_QUEUE_ABSENT:-false}" != true ]; then
+  printf 'queue-only: queue_only=%s cause=stub\n' "${STUB_QUEUE:-false}" >&2
+  [ -z "$output" ] || printf 'queue_only=%s\n' "${STUB_QUEUE:-false}" >>"$output"
+fi
 printf 'change_class=%s\n' "$STUB_CLASS"
 STUB
 cat >"$STUBS/skills/harness-ci/scripts/harness-only" <<'STUB'
@@ -152,6 +162,7 @@ chmod +x "$STUBS/skills/harness-ci/scripts/change-class" \
 # lanes-reader refusal's.
 mkdir -p "$STUBS/skills/harness-ci/scripts/lib"
 cp "$LANES_LIB" "$STUBS/skills/harness-ci/scripts/lib/ci-lanes.sh"
+cp "$DECISION_LIB" "$STUBS/skills/harness-ci/scripts/lib/change-class.sh"
 mkdir -p "$TMP/no-lanes-lib"
 cp -R "$STUBS/skills" "$TMP/no-lanes-lib/skills"
 rm -- "${TMP:?}/no-lanes-lib/skills/harness-ci/scripts/lib/ci-lanes.sh"
@@ -366,7 +377,7 @@ check "the step says why the lanes answered as they did" \
 # reader of the same diff.
 run "$CLASSIFY" STUB_CLASS=micro STUB_PATHS=skills/orch/SKILL.md >/dev/null
 check "each wrapped script is called once, with the step's inputs, and the proof with the work directory" \
-  "change-class --event pull_request --head h1 --repo $TMP/subject --base b0
+  "change-class --event pull_request --head h1 --repo $TMP/subject --base b0 --output /dev/null
 harness-only --mode docs --event pull_request --head h1 --repo $TMP/subject --base b0 --paths-output PATHS
 proof WORK" \
   "$(sed 's/--paths-output [^ ]*$/--paths-output PATHS/; s/^proof .*/proof WORK/' "$LOG")"
@@ -382,7 +393,7 @@ check "a declared lane asks harness-only for the paths outside the docs set" \
   "$(sed -n 's/--paths-output [^ ]* --outside-output [^ ]*$/--paths-output PATHS --outside-output OUTSIDE/; s/^harness-only /harness-only /p' "$LOG")"
 run "$CLASSIFY" STUB_CLASS=standard BASE= >/dev/null
 check "an empty base is not passed as a flag" \
-  "change-class --event pull_request --head h1 --repo $TMP/subject" \
+  "change-class --event pull_request --head h1 --repo $TMP/subject --output /dev/null" \
   "$(sed -n 's/^change-class /change-class /p' "$LOG")"
 
 # --- 2. Must-fail: a classify that decides the class itself ------------------
@@ -390,18 +401,31 @@ check "an empty base is not passed as a flag" \
 # prints `standard` there instead. The render row, whose stub says render,
 # must see the difference.
 mutant="$CONTROL_ROOT/classify"
-needle='"$SCRIPTS/change-class" "${args[@]}"'
+needle='"$SCRIPTS/change-class" "${args[@]}" --output /dev/null'
 [ "$(grep -cF -- "$needle" "$CLASSIFY")" -eq 1 ] ||
   { echo "the change-class call is no longer one line in $CLASSIFY" >&2; exit 1; }
 NEEDLE="$needle" awk '
   { i = index($0, ENVIRON["NEEDLE"]) }
   i > 0 {
-    $0 = substr($0, 1, i - 1) "printf '"'"'change_class=standard\\n'"'"' | tee -a \"$GITHUB_OUTPUT\"" substr($0, i + length(ENVIRON["NEEDLE"]))
+    $0 = substr($0, 1, i - 1) "printf '"'"'change_class=standard\\n'"'"'" substr($0, i + length(ENVIRON["NEEDLE"]))
   }
   { print }
 ' "$CLASSIFY" >"$mutant"
 ! cmp -s "$CLASSIFY" "$mutant" || { echo "the mutant changed nothing" >&2; exit 1; }
-check "must-fail: a classify that decides its own class fails the render row" \
+status="$(run "$mutant" STUB_CLASS=render STUB_PATHS=.agents/skills/orch/SKILL.md)"
+check "must-fail: a classify that decides its own class changes the render row" \
+  '0 change_class=standard' "$status $(sed -n '/^change_class=/p' "$OUT")"
+
+# The wrapped dependency writes outputs by default. Removing the explicit
+# sink restores that unused path and makes the existing output row fail.
+needle=' --output /dev/null '
+NEEDLE="$needle" awk '
+  { i = index($0, ENVIRON["NEEDLE"]) }
+  i > 0 { hits++; $0 = substr($0, 1, i - 1) " " substr($0, i + length(ENVIRON["NEEDLE"])) }
+  { print } END { if (hits != 1) exit 2 }
+' "$CLASSIFY" >"$mutant"
+! cmp -s "$CLASSIFY" "$mutant" || exit 1
+check 'must-fail: the wrapped command uses its output sink' \
   no "$(row_holds "$mutant" render)"
 
 # A rule planted wrong in a copy of TARGET, `classify` or `lib`, every other
@@ -409,12 +433,20 @@ check "must-fail: a classify that decides its own class fails the render row" \
 # of its own, which ROW_CLASSIFIER then names for the runs after it. Sets
 # PLANTED to the classify to run. Called outside a substitution, so the
 # root it names reaches the runs.
-MUTANT_STUBS="$TMP/mutant-stubs"
+MUTANT_STUBS="$CONTROL_ROOT/mutant-stubs"
 PLANTED=""
 plant() { # TARGET NEEDLE REPLACEMENT
   local file copy
   case "$1" in
-    classify) file="$CLASSIFY" copy="$mutant" ROW_CLASSIFIER="" ;;
+    classify)
+      if [ "$(grep -cF -- "$2" "$CLASSIFY")" -eq 0 ]; then
+        file="$DECISION_LIB" copy="$MUTANT_STUBS/skills/harness-ci/scripts/lib/change-class.sh"
+        rm -rf -- "${MUTANT_STUBS:?}"
+        cp -R "$STUBS" "$MUTANT_STUBS"
+        ROW_CLASSIFIER="$MUTANT_STUBS"
+      else
+        file="$CLASSIFY" copy="$mutant" ROW_CLASSIFIER=""
+      fi ;;
     lib)
       file="$LANES_LIB" copy="$MUTANT_STUBS/skills/harness-ci/scripts/lib/ci-lanes.sh"
       rm -rf -- "${MUTANT_STUBS:?}"
@@ -431,7 +463,7 @@ plant() { # TARGET NEEDLE REPLACEMENT
   ' "$file" >"$copy"
   ! cmp -s "$file" "$copy" || { echo "the mutant for '$2' changed nothing" >&2; exit 1; }
   PLANTED="$CLASSIFY"
-  [ "$1" = lib ] || PLANTED="$mutant"
+  [ "$file" != "$CLASSIFY" ] || PLANTED="$mutant"
 }
 
 # One copy per lanes rule, the rule planted wrong and every other line kept.
@@ -441,16 +473,9 @@ plant() { # TARGET NEEDLE REPLACEMENT
 mutants=0
 while IFS='@' read -r needle replacement row; do
   mutants=$((mutants + 1))
-  [ "$(grep -cF -- "$needle" "$CLASSIFY")" -eq 1 ] ||
-    { echo "the lanes rule '$needle' is no longer one line in $CLASSIFY" >&2; exit 1; }
-  NEEDLE="$needle" REPLACEMENT="$replacement" awk '
-    { i = index($0, ENVIRON["NEEDLE"]) }
-    i > 0 { $0 = substr($0, 1, i - 1) ENVIRON["REPLACEMENT"] substr($0, i + length(ENVIRON["NEEDLE"])) }
-    { print }
-  ' "$CLASSIFY" >"$mutant"
-  ! cmp -s "$CLASSIFY" "$mutant" || { echo "the mutant for '$needle' changed nothing" >&2; exit 1; }
+  plant classify "$needle" "$replacement"
   check "must-fail: '$needle' planted as '$replacement' fails the $row row" \
-    no "$(row_holds "$mutant" "$row")"
+    no "$(row_holds "$PLANTED" "$row")"
 done <<'ROWS'
 [ "$class" = render ] || @@render
  || [ "$class" = trivial ]; then@; then@trivial-allowlisted
@@ -458,6 +483,24 @@ elif [ "$docs" = docs_only=true ]; then@elif false; then@docs-only-standard
   lanes=true lanes_cause="$class"@  lanes=false lanes_cause="$class"@standard
 ROWS
 require_rows "lanes mutant" "$mutants"
+ROW_CLASSIFIER=""
+
+# The action can update before its separately checked-out default branch.
+# A classifier without the shared producer grants no lane skip.
+LEGACY_STUBS="$TMP/legacy-stubs"
+cp -R "$STUBS" "$LEGACY_STUBS"
+printf '#!/usr/bin/env bash\nset -euo pipefail\n' \
+  >"$LEGACY_STUBS/skills/harness-ci/scripts/lib/change-class.sh"
+status="$(run "$CLASSIFY" CLASSIFIER="$LEGACY_STUBS" STUB_CLASS=render STUB_PATHS=.agents/skills/orch/SKILL.md)"
+check 'an older classifier runs every lane' \
+  '0 lanes=true lanes_cause=lane-producer-unavailable lane_verdicts=' \
+  "$status $(outputs | tr ' ' '\n' | grep -E '^(lanes|lanes_cause|lane_verdicts)=' | tr '\n' ' ' | sed 's/ $//')"
+plant classify '  lanes=true lanes_cause=lane-producer-unavailable' \
+  '  lanes=false lanes_cause=lane-producer-unavailable'
+status="$(run "$PLANTED" CLASSIFIER="$LEGACY_STUBS" STUB_CLASS=render STUB_PATHS=.agents/skills/orch/SKILL.md)"
+check 'must-fail: missing producer cannot authorize a lane skip' '0 lanes=false' \
+  "$status $(outputs | tr ' ' '\n' | grep '^lanes=')"
+ROW_CLASSIFIER=""
 
 # --- 3. The refusals --------------------------------------------------------
 
@@ -468,7 +511,7 @@ refusal_rows=0
 while IFS='|' read -r cause assignments; do
   refusal_rows=$((refusal_rows + 1))
   case "$assignments" in
-    *STUB_PATHS_UNREADABLE=* | *STUB_OUTPUT_UNREADABLE=* | *STUB_RECORD_MODE=unreadable*)
+    *STUB_PATHS_UNREADABLE=* | *STUB_RECORD_MODE=unreadable*)
       if [ "$(id -u)" -eq 0 ]; then
         printf '  skip  refusal %s: root reads a mode-000 file\n' "$cause"
         continue
@@ -479,7 +522,7 @@ while IFS='|' read -r cause assignments; do
   check "refusal $cause: exit" "2" "$status"
   actual="$(refusal)"
   case "$cause" in
-    proof-unreadable | queue-only-unreadable) actual="${actual%% *}" ;;
+    proof-unreadable) actual="${actual%% *}" ;;
   esac
   check "refusal $cause: key" "$cause" "$actual"
   check "refusal $cause: no outputs" "" "$(cat "$OUT")"
@@ -491,7 +534,6 @@ missing-repo|REPO=
 missing-output-file|GITHUB_OUTPUT=
 classifier-failed status=2|STUB_CLASS_EXIT=2
 verdict-unreadable class-line=change_class=enormous|STUB_CLASS=enormous
-queue-only-unreadable|STUB_OUTPUT_UNREADABLE=1
 path-reader-failed status=2|STUB_PATHS_EXIT=2 STUB_PATHS=a
 docs-verdict-unreadable docs-line=harness_only=true|STUB_DOCS_LINE=harness_only=true STUB_PATHS=a
 class-without-paths class=micro|STUB_CLASS=micro STUB_PATHS=
@@ -814,20 +856,23 @@ ROW_CLASSIFIER=""
 require_rows "lane mutant" "$mutants"
 
 # The refusal of a lanes-from naming the judged tree, planted away.
-needle='[ "$lanes_root" != "$judged_root" ] ||'
-[ "$(grep -cF -- "$needle" "$CLASSIFY")" -eq 1 ] ||
-  { echo "the judged-tree refusal is no longer one line in $CLASSIFY" >&2; exit 1; }
-NEEDLE="$needle" awk '
-  { i = index($0, ENVIRON["NEEDLE"]) }
-  i > 0 { $0 = substr($0, 1, i - 1) "true ||" substr($0, i + length(ENVIRON["NEEDLE"])) }
-  { print }
-' "$CLASSIFY" >"$mutant"
-! cmp -s "$CLASSIFY" "$mutant" || { echo "the judged-tree mutant changed nothing" >&2; exit 1; }
-status="$(run "$mutant" LANES_FROM="$TMP/subject" STUB_PATHS=src/main.rs STUB_OUTSIDE=src/main.rs)"
+plant classify '[ "$lanes_root" != "$judged_root" ] ||' 'true ||'
+status="$(run "$PLANTED" LANES_FROM="$TMP/subject" STUB_PATHS=src/main.rs STUB_OUTSIDE=src/main.rs)"
 check "must-fail: a classify reading lanes from the judged tree is not refused" \
   "0 lane_verdicts=lane_evil=true" "$status $(outputs | tr ' ' '\n' | grep '^lane_verdicts=')"
+ROW_CLASSIFIER=""
 
 # --- 5b. Declaration changes ------------------------------------------------
+
+# Imported refusals already carry cause=. The action's formatter must emit
+# its existing machine field once, as the judged-tree refusal above reads it.
+plant classify \
+  'printf '\''change-class-action: wiring-error: cause=%s\n'\'' "${1#cause=}" >&2' \
+  'printf '\''change-class-action: wiring-error: cause=%s\n'\'' "$1" >&2'
+status="$(run "$PLANTED" LANES_FROM="$TMP/subject" STUB_PATHS=src/main.rs STUB_OUTSIDE=src/main.rs)"
+check 'must-fail: the action normalizes the imported cause field' \
+  "2 cause=lanes-from-judged-tree root=$TMP/subject" "$status $(refusal)"
+ROW_CLASSIFIER=""
 
 declare_lanes added-glob 'check:event-uniform src/* Cargo.toml tests/*
 tmux:event-uniform tmux/* fixtures/*
@@ -1052,8 +1097,19 @@ run "$CLASSIFY" HEAD="$JUDGED_NO_READER" LANES_FROM="$TMP/decl/queued-no-reader"
 check "both trees without the reader name both on a lane line and warn once" \
   "lane: name=bench verdict=true cause=queue-reader-absent tree=lanes-from,judged path=benches/b.rs glob=benches/* 1" \
   "$(grep '^lane: name=bench ' "$TMP/err") $(grep -c '^::warning title=queue lane not deferred::' "$TMP/stdout")"
-check "the step forwards the classifier's queue_only line as it wrote it" "queue_only=true" \
-  "$(run "$CLASSIFY" STUB_QUEUE=true STUB_PATHS=src/main.rs >/dev/null; grep '^queue_only=' "$OUT")"
+rows=0
+while IFS='|' read -r name queue absent expected; do
+  rows=$((rows + 1))
+  status="$(run "$CLASSIFY" STUB_QUEUE="$queue" STUB_QUEUE_ABSENT="$absent" STUB_PATHS=src/main.rs)"
+  check "$name: queue metadata handoff exits 0" 0 "$status"
+  check "$name: the step forwards the documented queue record" "$expected" \
+    "$(sed -n '/^queue_only=/p' "$OUT")"
+done <<'ROWS'
+queue required|true|false|queue_only=true
+queue not required|false|false|queue_only=false
+classifier predates queue metadata|false|true|
+ROWS
+require_rows queue-metadata "$rows"
 
 # The merge group after a pull request that deferred `nightly`: that run's
 # record says nightly did not run, so the proof stands down `check`, which
