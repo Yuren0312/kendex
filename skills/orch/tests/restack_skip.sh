@@ -154,9 +154,9 @@ make_row() {
   printf '%s\n' "$wt"
 }
 
-ask() { # SCRIPT WT — the answer line less its run directory, and the exit
+ask() { # SCRIPT WT [publication arguments] — answer less run directory, and exit
   local out rc=0
-  out="$(clean_env "$1" --worktree "$2" --base origin/main 2>&1)" || rc=$?
+  out="$(clean_env "$1" --worktree "$2" --base origin/main "${@:3}" 2>&1)" || rc=$?
   printf '%s rc=%s\n' "$(sed -E 's/ run-dir=[^ ]*//' <<<"$out")" "$rc"
 }
 skip_line() { # WT CONDITION PATHS
@@ -284,6 +284,9 @@ for row in 'clean|no-conflict|none' 'package|version-only|pkg/CHANGELOG.md,pkg/p
   want="$(skip_line "$wt" "$condition" "$paths")"
   [[ "$condition" != retest ]] || want="restack=retest cause=path-unconflicted path=$paths rc=1"
   assert_eq "$(ask "$SCRIPTS_DIR/restack-skip" "$wt")" "$want" "no-verdict tree: $name"
+  assert_eq "$(ask "$SCRIPTS_DIR/restack-skip" "$wt" --publication-tier standard)" \
+    "restack=retest cause=local-pass-required rc=1" \
+    "direct publication requires a local pass for the no-verdict tree: $name"
   assert_eq "$(ask "$nv_main_control/restack-skip" "$wt")" "restack=retest cause=no-passing-run rc=1" \
     "control: current main discards the only reusable run: $name"
   assert_eq "$(ask "$nv_red_control_dir/restack-skip" "$wt")" "restack=retest cause=newer-red rc=1" \

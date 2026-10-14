@@ -32,10 +32,12 @@ Use this cycle for a `conflicting` queue-wait verdict, and for a `worktree-push-
 
    ```bash
    RESTACK_MODE_ARGS=()
-   if ! PR_ORDER="$([MAIN_REPO_ROOT]/.agents/skills/orch/scripts/pr-order [WT_PATH])"; then
-     PR_ORDER=pr-order=review-first
+   if [[ "${DELIVERY:-pr}" != push-base ]]; then
+     if ! PR_ORDER="$([MAIN_REPO_ROOT]/.agents/skills/orch/scripts/pr-order [WT_PATH])"; then
+       PR_ORDER=pr-order=review-first
+     fi
+     [[ "$PR_ORDER" != pr-order=push-first ]] || RESTACK_MODE_ARGS=(--base origin/[BASE_BRANCH])
    fi
-   [[ "$PR_ORDER" != pr-order=push-first ]] || RESTACK_MODE_ARGS=(--base origin/[BASE_BRANCH])
    [MAIN_REPO_ROOT]/.agents/skills/orch/scripts/dev-validate-run --resolve-mode --worktree [WT_PATH] ${RESTACK_MODE_ARGS[@]+"${RESTACK_MODE_ARGS[@]}"}
    ```
 
@@ -47,7 +49,21 @@ Use this cycle for a `conflicting` queue-wait verdict, and for a `worktree-push-
    [MAIN_REPO_ROOT]/.agents/skills/orch/scripts/dev-validate-run --worktree [WT_PATH] --validate-mode ci --base origin/[BASE_BRANCH]
    ```
 
-   `validate-mode=ci` runs that command with `--validate-mode ci`, records its pending CI result through the existing `--record` owner, then goes to step 3 with no local range run or skip check. `validate-mode=full` means the project sets no `DEV_VALIDATE_RANGE_CMD`: go to step 3 with no run. `validate-mode=range` first asks whether the restacked head can skip its range re-test. `dev-validate-run --help` owns candidate selection under `--last-pass`:
+   `validate-mode=ci` runs that command with `--validate-mode ci`, records its pending CI result through the existing `--record` owner, then goes to step 3 with no local range run or skip check. For PR delivery, `validate-mode=full` means the project sets no `DEV_VALIDATE_RANGE_CMD`: go to step 3 with no run. `validate-mode=range` first asks whether the restacked head can skip its range re-test. `dev-validate-run --help` owns candidate selection under `--last-pass`.
+
+   **Direct delivery.** Retain `DELIVERY` from submit-pr's publication owner. Micro keeps its commit-chain checks and committed-path classification. Small and standard require a passing local result before transport, including when `--resolve-mode` returns `full` because no range command exists. Ask the same reuse owner with the caller's `[TIER]`:
+
+   ```bash
+   [MAIN_REPO_ROOT]/.agents/skills/orch/scripts/restack-skip --publication-tier [TIER] --worktree [WT_PATH] --base origin/[BASE_BRANCH]
+   ```
+
+   Exit 0 permits the existing skip. Record its condition and paths with the workflow-state command below. Any other exit runs local validation: `--validate-mode range --base origin/[BASE_BRANCH]` for range, or the full command below for full. Micro returns to its commit-chain step instead. A `ci` or `no-verdict` result cannot authorize direct transport. Only a passing local result returns to submit-pr's publication step, which repeats the proof after any further automatic rebase:
+
+   ```bash
+   [MAIN_REPO_ROOT]/.agents/skills/orch/scripts/dev-validate-run --worktree [WT_PATH]
+   ```
+
+   Direct delivery then returns to submit-pr's direct completion route through step 3 and skips step 4's PR gates. The remaining range skip and CI-backed routing below applies to PR delivery:
 
    ```bash
    [MAIN_REPO_ROOT]/.agents/skills/orch/scripts/restack-skip --worktree [WT_PATH] --base origin/[BASE_BRANCH]
@@ -85,7 +101,7 @@ Use this cycle for a `conflicting` queue-wait verdict, and for a `worktree-push-
 
    This step is not skippable and no other push replaces it: the restack in step 2 rewrote every branch commit, and this command is the only thing that reconciles the SHAs workflow state recorded before it. A non-zero exit hands back, because republishing `Fixed in <sha>` replies or a closing comment over unreconciled SHAs publishes commits the branch no longer has. What it reconciles from and what its summary lines mean are in `worktree-push --help`.
 
-   A `ci` record goes straight to step 4 after the push. Its proof is the exact published head, including any head the push rebased. After a local range run, compare the pushed head with the `head=` value of that run's record; after a skip, with the `head=` value of the skip line:
+   A successful direct push returns its publication record to submit-pr without step 4. Its transport already checked the final tree through the direct reuse owner. A `ci` record on PR delivery goes straight to step 4 after the push. Its proof is the exact published head, including any head the push rebased. After a local range run on PR delivery, compare the pushed head with the `head=` value of that run's record; after a skip, with the `head=` value of the skip line:
 
    ```bash
    git -C [WT_PATH] rev-parse HEAD

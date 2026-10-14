@@ -102,7 +102,7 @@ For `pr` with `pr_order` reading `push-first`, read the existing PR's draft flag
    .agents/skills/orch/scripts/worktree-push --worktree "[WORKTREE_PATH]" --issue [ISSUE_ID] --set-upstream
    ```
 
-   **Direct completion.** With `DELIVERY=push-base`, the push owner rebases, then folds multiple item commits into one through normal commit guards. It reconciles every item and fix SHA through the existing map before completion. The unchanged content keeps its passing local validation. A fold refused by commit guards pushes nothing and returns its keyed cause. Exit 0 and the `delivery: mode=push-base base=[BASE] commit=[PUSHED_SHA]` line complete publication. That line names the exact commit the push sent after rebase and SHA reconciliation. Save it as `[WORKTREE_PATH]/tmp/direct-push-[ISSUE_ID].md` with the harness file-write tool. A mailbox lane sends it through the existing completion notice:
+   **Direct completion.** With `DELIVERY=push-base`, the push owner rebases, then folds multiple item commits into one through normal commit guards. Micro repeats the normal commit chain even for one commit after rewrite. Before every direct transport, the existing restack-skip owner checks the final tree against its permitted local reuse proof. A refusal returns for the tier's local validation and internal review, including retries after hook changes. It reconciles every item and fix SHA through the existing map before completion. Exit 0 and the `delivery: mode=push-base base=[BASE] commit=[PUSHED_SHA]` line complete publication. That line identifies a landed push even when reconciliation later fails; exit 0 remains required for the completion notice. Save it as `[WORKTREE_PATH]/tmp/direct-push-[ISSUE_ID].md` with the harness file-write tool. A mailbox lane sends it through the existing completion notice:
 
    ```bash
    .agents/skills/mailbox/scripts/lane-mail notice --item [ISSUE_ID] --file [WORKTREE_PATH]/tmp/direct-push-[ISSUE_ID].md
@@ -112,9 +112,23 @@ For `pr` with `pr_order` reading `push-first`, read the existing PR's draft flag
 
    `worktree-push-base-non-fast-forward`, `worktree-push-base-conflict` or `worktree-push-rebase-failed` on direct delivery takes the guarded restack in [merge-pr-restack.md](merge-pr-restack.md) step 2. It needs no PR unarm. Preserve its local validation requirement, then retry this publication step through `worktree-push`. A failed restack or validation returns the named stop without a completion notice. Never force the base push.
 
+   | Direct refusal | Route |
+   |----------------|-------|
+   | `worktree-push-base-validation-required` | Read the reuse owner's result. A micro `tier-widened` or `tier-unreadable` takes the micro escape. Otherwise run the tier's local checks and internal review on this head, then retry. Full validation applies when no range command exists |
+   | `worktree-push-base-fold-content-changed` | Validate the hook-modified tree locally and repeat internal review for its changes. Micro repeats its normal commit chain and item-tier check. Retry remains blocked until the same owner permits transport |
+   | `worktree-push-base-fold-failed` | Repair the Git or commit-guard failure. Run the tier's checks and review on the repaired head before retrying |
+   | `worktree-push-base-dirty` | Commit the pending work through normal guards, then return through local checks and review |
+   | `worktree-push-base-empty` | Read the base history. Hand back when no publication receipt binds this item; infer no completion from an empty range |
+   | `worktree-push-base-claim` | Materialize through `worktree create --reuse`, then return through the tier's local checks and review |
+   | `worktree-push-base-check-missing` | Restore the conditional orch dependency before retrying |
+   | `worktree-push-base-record-unread` | Repair receipt access before retrying. Keep the worktree |
+   | `worktree-push-base-record-unwritten` | Keep the printed base and pushed SHA. Verify that commit in the base history and repair its receipt before reconciliation and completion. Send no second push |
+
+   A landed push whose wrapper returns `1 (pushed)` keeps its `delivery:` record for repair. Fix the reported reconciliation failure and rerun `worktree-push`: the worktree-private receipt confirms the exact commit in the updated base and returns it without another transport. Only the successful repair sends the completion notice. Keep `PUSHED_SHA` from that record even when the base later advances.
+
    The push rebases onto the updated base where that base needs it and reconciles every SHA workflow state records. A merge-queue base whose rules demand no up-to-date branch takes a branch that merges cleanly as it stands; `worktree push --help` § Merge-queue base owns that rule. Route its exit code and its `sha-reconcile:` line by `worktree-push --help`, which owns the reconciliation and repair contract.
 
-   A `worktree-push-base-conflict` refusal pushed and rebased nothing: the branch conflicts with that base, and the guarded restack is its one rebase. Run [merge-pr-restack.md](merge-pr-restack.md) steps 1-3, which unarm the PR where one exists, restack, validate the restacked head where the project sets `DEV_VALIDATE_RANGE_CMD`, and push through `worktree-push`, then continue here; a red run there hands back instead.
+   A `worktree-push-base-conflict` refusal pushed and rebased nothing: the branch conflicts with that base, and the guarded restack is its one rebase. Run [merge-pr-restack.md](merge-pr-restack.md) steps 1-3, which unarm the PR where one exists, restack, apply its validation route for this delivery mode, and push through `worktree-push`, then continue here; a red run there hands back instead.
 
    Regenerate any already-drafted publication text from the reconciled state, and resolve every SHA sourced from a review or QA artifact (e.g. a perf QA `benchmark_commit`) through `.rebase_map` before publishing it — follow the chain until no key matches. Publishing an unreconciled pre-rebase SHA is forbidden.
 

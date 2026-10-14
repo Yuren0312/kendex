@@ -42,7 +42,14 @@
 # answer, is a re-test: a missing fact widens the checks.
 #
 # Usage:
-#   restack-skip --worktree PATH --base REF
+#   restack-skip --worktree PATH --base REF [--publication-tier micro|small|standard]
+#
+# --publication-tier is the direct transport check. Small and standard require
+# a passing local candidate under the same reuse proof below. A no-verdict
+# candidate requires local validation. Micro uses item-tier on the committed
+# diff and prints publication=ready only for tier=micro. Its normal commit
+# chain belongs to the caller's commit, which direct publication repeats after
+# a rewrite. PR restack checks omit this option and keep their current policy.
 #
 # Output, one line on stdout:
 #   restack=skip condition=no-conflict|version-only run-dir=DIR validated-head=SHA head=SHA paths=P[,P...]|none   exit 0
@@ -108,10 +115,12 @@ usage() {
 
 worktree=""
 base=""
+publication_tier=""
 while (( $# > 0 )); do
   case "$1" in
     --worktree) (( $# >= 2 )) || die missing-value option=--worktree; worktree="$2"; shift 2 ;;
     --base) (( $# >= 2 )) || die missing-value option=--base; base="$2"; shift 2 ;;
+    --publication-tier) (( $# >= 2 )) || die missing-value option=--publication-tier; publication_tier="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die unknown-argument "argument=$1" ;;
   esac
@@ -121,6 +130,20 @@ done
 [[ -d "$worktree" ]] || die not-directory "path=$worktree"
 worktree="$(cd -- "$worktree" && pwd)"
 cd -- "$worktree"
+
+case "$publication_tier" in
+  '') ;;
+  micro)
+    tier_line="$("$SCRIPT_DIR/item-tier" --base "$base" --head HEAD --repo "$worktree")" \
+      || retest tier-unreadable
+    printf '%s\n' "$tier_line"
+    [[ "$tier_line" == 'tier=micro '* ]] || retest tier-widened
+    printf 'publication=ready tier=micro\n'
+    exit 0
+    ;;
+  small|standard) ;;
+  *) die invalid-tier "tier=$publication_tier" ;;
+esac
 
 last_rc=0
 last="$("$SCRIPT_DIR/dev-validate-run" --last-pass --worktree "$worktree" 2>/dev/null)" || last_rc=$?
@@ -137,6 +160,7 @@ for field in ${fields[@]+"${fields[@]}"}; do
 done
 [[ "$verdict" != FAILING || -z "$run_dir" ]] || retest newer-red "run-dir=$run_dir"
 [[ "$last_rc" == 0 && -n "$run_dir" && -n "$validated_head" && -n "$validated_tree" ]] || retest no-passing-run
+[[ -z "$publication_tier" || "$verdict" == pass ]] || retest local-pass-required "run-dir=$run_dir"
 new_base="$(git rev-parse --verify -q "$base^{commit}")" || retest base-unreadable "run-dir=$run_dir"
 head="$(git rev-parse --verify -q 'HEAD^{commit}')" || retest head-unreadable "run-dir=$run_dir"
 

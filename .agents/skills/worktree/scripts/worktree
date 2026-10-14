@@ -877,12 +877,17 @@ parse_push_args() {
   PUSH_SET_UPSTREAM=""
   PUSH_AUTO_REBASE=true
   PUSH_TO_BASE=false
+  PUSH_PUBLICATION_TIER=standard
+  local tier_given=false
   local arg_seen=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -u|--set-upstream) PUSH_SET_UPSTREAM="-u"; shift ;;
       --no-rebase) PUSH_AUTO_REBASE=false; shift ;;
       --to-base) PUSH_TO_BASE=true; shift ;;
+      --publication-tier)
+        [[ $# -ge 2 ]] || { worktree_message push-tier-missing --publication-tier "Error: publication tier requires a value." >&2; return 1; }
+        PUSH_PUBLICATION_TIER="$2"; tier_given=true; shift 2 ;;
       # An unknown --flag must fail rather than be dropped: a catch-all shift
       # would turn a typo like `--no-rebse` into a silent default-behavior
       # push, and force callers to pre-screen flags against a copy of this
@@ -911,6 +916,14 @@ parse_push_args() {
     worktree_message push-base-no-rebase --no-rebase "Error: base publication requires automatic rebase." >&2
     return 1
   fi
+  if [[ "$tier_given" == true && "$PUSH_TO_BASE" != true ]]; then
+    worktree_message push-tier-unused --publication-tier "Error: publication tier applies only to --to-base." >&2
+    return 1
+  fi
+  case "$PUSH_PUBLICATION_TIER" in
+    micro|small|standard) ;;
+    *) worktree_message push-tier-invalid "$PUSH_PUBLICATION_TIER" "Error: publication tier must be micro, small or standard." >&2; return 1 ;;
+  esac
 }
 
 # One path segment in the alphabet an issue ID is spelled in: a name composed
@@ -3770,6 +3783,11 @@ case "${1:-}" in
       exit 1
     fi
     PUSH_CHECKOUT_MODE="$(worktree_checkout_mode "$WT_PATH")" || exit 1
+    BASE_PUBLICATION_CHECK="$SCRIPT_DIR/../../orch/scripts/restack-skip"
+    if [[ "$PUSH_TO_BASE" == true && ! -x "$BASE_PUBLICATION_CHECK" ]]; then
+      worktree_message push-base-check-missing "$BASE_PUBLICATION_CHECK" "Error: direct publication requires the orch restack-skip owner." >&2
+      exit 1
+    fi
     if [[ "$PUSH_TO_BASE" == true && "$PUSH_CHECKOUT_MODE" == claim ]]; then
       worktree_message push-base-claim "$WT_PATH" "Error: check out the claim through create --reuse before publishing to the base." >&2
       exit 1
@@ -3816,6 +3834,18 @@ case "${1:-}" in
       worktree_message push-branch-read-failed "$WT_PATH" "Error: could not read the current branch of $WT_PATH; refusing to push." >&2
       exit 1
     fi
+    # The receipt belongs to this checkout and the exact commit the transport
+    # sent. Recovery after wrapper repair never sends that commit again.
+    BASE_PUBLISHED_RECORD=""
+    if [[ "$PUSH_TO_BASE" == true ]]; then
+      git -C "$PROJECT_ROOT" config extensions.worktreeConfig true || exit 1
+      BASE_RECORD_RC=0
+      BASE_PUBLISHED_RECORD="$(git -C "$WT_PATH" config --worktree --get kendex-base-push.record)" || BASE_RECORD_RC=$?
+      if (( BASE_RECORD_RC > 1 )); then
+        worktree_message push-base-record-unread "$WT_PATH" "Error: the direct publication receipt could not be read." >&2
+        exit 1
+      fi
+    fi
     PUSH_LEASE=()
     LEASE_EXPECTED_OID=""
     REPUBLISH_REWRITE=false
@@ -3839,6 +3869,15 @@ case "${1:-}" in
           worktree_message push-base-fetch-failed "origin/$DEFAULT_BRANCH" "Error: Could not fetch origin/$DEFAULT_BRANCH, so whether $CURRENT_BRANCH needs a rebase onto it is unknown; refusing to push. Retry once origin is reachable, or push with --no-rebase." >&2
           [[ -z "$BASE_FETCH_ERR" ]] || sed 's/^/  /' <<<"$BASE_FETCH_ERR" >&2
           exit 1
+        fi
+        if [[ "$PUSH_TO_BASE" == true && -n "$BASE_PUBLISHED_RECORD" ]]; then
+          read -r BASE_RECORDED_BRANCH BASE_RECORDED_HEAD BASE_RECORD_EXTRA <<< "$BASE_PUBLISHED_RECORD"
+          BASE_CURRENT_HEAD="$(git -C "$WT_PATH" rev-parse HEAD)" || exit 1
+          if [[ -z "$BASE_RECORD_EXTRA" && "$BASE_RECORDED_BRANCH" == "$DEFAULT_BRANCH" && "$BASE_RECORDED_HEAD" == "$BASE_CURRENT_HEAD" ]] \
+            && git -C "$WT_PATH" merge-base --is-ancestor "$BASE_RECORDED_HEAD" "origin/$DEFAULT_BRANCH"; then
+            printf 'worktree-pushed-base: base=%s commit=%s\n' "$DEFAULT_BRANCH" "$BASE_RECORDED_HEAD"
+            exit 0
+          fi
         fi
         base_reading "$WT_PATH" "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH" "$PUSH_TO_BASE"
         if [[ "$BASE_READING" == contained ]]; then
@@ -3943,7 +3982,7 @@ case "${1:-}" in
       fi
       # The direct-cycle recorder takes one commit, including after fix rounds.
       # Fold only after rebase so base commits never enter the item's commit.
-      if (( BASE_PUSH_COUNT > 1 )); then
+      if (( BASE_PUSH_COUNT > 1 )) || [[ "$PUSH_PUBLICATION_TIER" == micro ]]; then
         if ! git -C "$WT_PATH" diff --quiet || ! git -C "$WT_PATH" diff --cached --quiet; then
           worktree_message push-base-dirty "$WT_PATH" "Error: the item must be clean before folding its commits." >&2
           exit 1
@@ -3965,10 +4004,13 @@ case "${1:-}" in
         FOLDED_HEAD="$(git -C "$WT_PATH" rev-parse HEAD)" || exit 1
         FOLD_MAP=""
         while IFS= read -r FOLD_OLD; do
+          [[ "$FOLD_OLD" != "$FOLDED_HEAD" ]] || continue
           FOLD_MAP="${FOLD_MAP}${FOLD_MAP:+$'\n'}rebase-map: $FOLD_OLD $FOLDED_HEAD"
         done <<< "$FOLD_COMMITS"
-        printf '%s\n' "$FOLD_MAP"
-        append_rebase_hop "$WT_PATH" "$FOLD_MAP" || exit 1
+        if [[ -n "$FOLD_MAP" ]]; then
+          printf '%s\n' "$FOLD_MAP"
+          append_rebase_hop "$WT_PATH" "$FOLD_MAP" || exit 1
+        fi
         clear_pending_rewrite "$WT_PATH" || exit 1
         # Consumer commit hooks can rewrite staged files. Such a commit needs
         # local validation before direct delivery can publish it.
@@ -3980,6 +4022,12 @@ case "${1:-}" in
       fi
       BASE_PUSH_HEAD="$(git -C "$WT_PATH" rev-parse HEAD)" || exit 1
       PUSH_REF="$BASE_PUSH_HEAD:refs/heads/$DEFAULT_BRANCH"
+      # The same proof runs on every attempt, so an automatic rebase or an
+      # earlier hook-content refusal cannot publish a tree outside its checks.
+      if ! "$BASE_PUBLICATION_CHECK" --worktree "$WT_PATH" --base "origin/$DEFAULT_BRANCH" --publication-tier "$PUSH_PUBLICATION_TIER"; then
+        worktree_message push-base-validation-required "$BASE_PUSH_HEAD" "Error: run the tier's local checks and internal review before retrying direct publication." >&2
+        exit 1
+      fi
     fi
     if ! PUSH_COMMITTED_KEYS="$(committed_settings_keys)"; then
       worktree_message push-settings-unread "$PROJECT_ROOT" "Error: could not read the main checkout's committed settings to keep them out of the pre-push hooks; refusing to push." >&2
@@ -4010,13 +4058,19 @@ case "${1:-}" in
       [[ -n "$PUSH_OUTPUT" ]] && sed 's/^/  git: /' <<<"$PUSH_OUTPUT" >&2
       exit 1
     fi
+    if [[ "$PUSH_TO_BASE" == true ]]; then
+      # Print before any post-push write: a landed commit remains identifiable
+      # even if its receipt or the caller's SHA reconciliation cannot be saved.
+      printf 'worktree-pushed-base: base=%s commit=%s\n' "$DEFAULT_BRANCH" "$BASE_PUSH_HEAD"
+      if ! git -C "$WT_PATH" config --worktree kendex-base-push.record "$DEFAULT_BRANCH $BASE_PUSH_HEAD"; then
+        worktree_message push-base-record-unwritten "$BASE_PUSH_HEAD" "Error: the push landed but its receipt was not saved. Keep the printed publication record for repair." >&2
+        exit 1
+      fi
+    fi
     if [[ "$REPUBLISH_REWRITE" == true ]]; then
       worktree_message republished-after-rewrite "remote_oid=$LEASE_EXPECTED_OID"
     fi
     clear_restack_push_authorization "$WT_PATH"
-    if [[ "$PUSH_TO_BASE" == true ]]; then
-      printf 'worktree-pushed-base: base=%s commit=%s\n' "$DEFAULT_BRANCH" "$BASE_PUSH_HEAD"
-    fi
     ;;
 
   fix-links)

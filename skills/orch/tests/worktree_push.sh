@@ -885,7 +885,7 @@ for rule in push-argument conflicting-mode; do
   PUSH="$(mutant_scripts "record-$rule" worktree-push)/worktree-push"
   case "$rule" in
     push-argument)
-      mutate_file "$PUSH" '[[ "$check_live_round" == true || -n "$record_run_dir" ]]' '[[ "$check_live_round" == true ]]'
+      mutate_file "$PUSH" '[[ "$check_live_round" == true || "$resolve_delivery" == true || -n "$record_run_dir" ]]' '[[ "$check_live_round" == true || "$resolve_delivery" == true ]]'
       argument=--no-rebase
       ;;
     conflicting-mode)

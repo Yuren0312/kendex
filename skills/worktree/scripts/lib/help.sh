@@ -556,7 +556,7 @@ EOF
 print_push_help() {
   worktree_message help push
   cat <<'EOF'
-Usage: worktree push [ID|/path] [--set-upstream|-u] [--no-rebase] [--to-base]
+Usage: worktree push [ID|/path] [--set-upstream|-u] [--no-rebase] [--to-base [--publication-tier micro|small|standard]]
 
 --to-base publishes HEAD to origin's resolved default branch. It always
 rebases onto origin/<default> first when the base is not contained, including
@@ -567,7 +567,17 @@ The owner restores item history, or keeps the pending rewrite record if Git
 cannot restore it. The fold reconciles item SHAs through the
 same rebase-map record. A dirty index or worktree refuses the fold.
 A hook that changes staged content keeps the folded commit and its map,
-but refuses publication until the caller validates the changed content.
+but refuses publication. Every retry passes the final tree through orch's
+restack-skip owner before transport. Small and standard require a passing
+local candidate and its existing reuse proof. Micro repeats the normal
+commit chain and item-tier's committed-path check after rewrite. An absent
+orch checker refuses only this direct route. --publication-tier defaults to
+standard and applies only with --to-base.
+The worktree-private kendex-base-push.record Git config value binds the
+landed base and commit. A repair retry confirms that exact commit in the
+updated base and returns its record without a second push. The publication
+line prints before receipt writes and wrapper reconciliation; a nonzero
+exit still requires repair before the completion notice.
 It refuses --no-rebase and a remote-work claim. A base that advances after
 the fetch refuses with 'worktree-push-base-non-fast-forward'; use the guarded
 restack route and retry. Without --to-base, the branch route below applies.

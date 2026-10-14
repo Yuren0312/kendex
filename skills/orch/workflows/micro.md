@@ -90,6 +90,12 @@ Read the branch both routes now stand on and initialize the item's workflow stat
 .agents/skills/orch/scripts/workflow-state set [ISSUE_ID] branch "[BRANCH]"
 ```
 
+Record the tier for the publication owner:
+
+```bash
+.agents/skills/orch/scripts/workflow-state set [ISSUE_ID] tier micro
+```
+
 ## 2. Edit And Commit
 
 1. **Confirm the commit chain is armed**, before any file changes. That chain is this tier's whole validation: the diff-scoped guard rather than `DEV_VALIDATE_CMD`. An unarmed or unreadable answer escapes (§ Escape condition 2). Where the `commit-guards` package is installed this verb answers it and this workflow asks no other; elsewhere the project's own setup instructions name the verb.
@@ -125,6 +131,15 @@ Read the branch both routes now stand on and initialize the item's workflow stat
 ## 3. Push And Open The PR
 
 `ORCH_DELIVERY` is resolved by `worktree-push` through [submit-pr.md](submit-pr.md) § 2. `push-base` keeps § 2's commit-chain validation and takes submit's direct completion route. **Main checkout only**, restore `[BASE_BRANCH]` before returning. Then go to § 5 with `PUSHED_SHA`, omit the PR and Merge rows, and include `Pushed commit`. Skip § 4. `pr` keeps the route below.
+
+For direct publication, resolve the base and classify the committed paths:
+
+```bash
+.agents/skills/orch/scripts/resolve-base-branch [WT_PATH]
+.agents/skills/orch/scripts/item-tier --base origin/[BASE_BRANCH] --head HEAD --repo [WT_PATH]
+```
+
+Only `tier=micro` continues. A wider result or unreadable classification takes § Escape condition 6 before transport. The direct push repeats the normal commit chain after rebase or folding, then repeats the committed-path check before transport. A guard refusal takes condition 4. A changed hook tree returns through § 2's commit-chain check before retrying.
 
 **Run Workflow**: `⤵ workflows/submit-pr.md § 2 steps 1-4 → § 3 tail` with context `worktree`, `lifecycle: "managed"`, `issue_id`. That range owns the push and its `sha-reconcile:` routing, and the create. The body is the three lines below rather than step 3's template. No headings and no other section.
 

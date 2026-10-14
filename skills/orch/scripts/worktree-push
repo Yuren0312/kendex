@@ -94,7 +94,11 @@
 # --resolve-delivery prints delivery=<mode> without publishing or reading state.
 # A successful direct push prints the completion notice
 # 'delivery: mode=push-base base=<branch> commit=<pushed-sha>'. Submit routes
-# that notice to the overseer before any PR operation.
+# that notice to the overseer before any PR operation. The same line preserves
+# a landed push before post-push reconciliation; only exit 0 is completion.
+# Repair and rerun recover the worktree-private publication receipt without
+# another transport. Direct pushes pass the recorded tier to worktree's
+# conditional orch check before transport, including automatic rebases.
 #
 # Every argument outside this wrapper's own namespace (--worktree, --issue,
 # --state-dir, --check-live-round, --resolve-delivery,
@@ -423,6 +427,15 @@ fi
 # restack map and deletes no file: it answers one question and changes nothing.
 [[ "$check_live_round" != true ]] || exit 0
 
+if [[ "$delivery" == push-base && -z "$record_run_dir" ]]; then
+	publication_tier=standard
+	if [[ "$state_present" == true ]]; then
+		publication_tier="$("$WORKFLOW_STATE" ${state_flags[@]+"${state_flags[@]}"} get "$issue" '.tier // "standard"')" \
+			|| fail state-read "issue=$issue"
+	fi
+	push_args+=(--publication-tier "$publication_tier")
+fi
+
 # The push owns both pre-push and post-push restack timing. A supplied run
 # binds the post-push route; automatic selection binds the pre-push head.
 select_restack_validation() {
@@ -596,6 +609,14 @@ fail_post_push() {
 # exit, which is no record at all.
 cat "$push_out" || true
 
+pushed_record=''
+if [[ "$delivery" == push-base ]]; then
+	# This identifies a landed push, not a completion verdict. A failing wrapper
+	# keeps the record for repair; only exit 0 permits the completion notice.
+	pushed_record="$(sed -n 's/^worktree-pushed-base: /delivery: mode=push-base /p' "$push_out")" || exit 1
+	[[ -z "$pushed_record" ]] || printf '%s\n' "$pushed_record"
+fi
+
 restack_pushed=true
 consume_rebase_map_file sha-reconcile
 
@@ -607,10 +628,6 @@ if [[ "$push_rc" == 0 && -n "$restack_validation_head" ]]; then
 	fi
 fi
 if [[ "$push_rc" == 0 && "$delivery" == push-base ]]; then
-	# The push owner binds the ref and SHA it sent, which can differ from a
-	# later local HEAD or an independent default-branch lookup.
-	pushed_record="$(sed -n 's/^worktree-pushed-base: /delivery: mode=push-base /p' "$push_out")" || exit 1
 	[[ -n "$pushed_record" ]] || fail_post_push delivery-unrecorded "issue=$issue" push-exit=0
-	printf '%s\n' "$pushed_record"
 fi
 exit "$push_rc"

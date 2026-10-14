@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Surface: worktree-push delivery and submit-pr's publication command.
 # Inputs: orch/scripts/worktree-push, orch/scripts/orch-env, workflow-state,
-# orch/workflows/submit-pr.md, worktree/scripts/, github/scripts/lib/,
+# orch/scripts/restack-skip, dev-validate-run, item-tier, orch/references/,
+# orch/workflows/submit-pr.md, worktree/scripts/, harness-ci/scripts/, github/scripts/lib/,
 # mailbox/scripts/, and orch/tests/lib/{git-env,assertions,shared-skill-libs}.sh.
 # The Git transport and rebase are real. The PR service is a recorded fixture.
 set -euo pipefail
@@ -69,7 +70,9 @@ new_world() { # NAME SETTING
   {
     printf '[env]\nWORKTREE_DEFAULT_BRANCH = "trunk"\n'
     [[ "$setting" == unset ]] || printf 'ORCH_DELIVERY = "%s"\n' "$setting"
+    printf 'DEV_VALIDATE_CMD = "printf validated"\nDEV_VALIDATE_TIMEOUT_SECS = "20"\n'
   } > "$FIXTURE_MAIN/kendex.settings.toml"
+  printf 'a\n' > "$FIXTURE_MAIN/value"
   "$REAL_GIT" -C "$FIXTURE_MAIN" add .
   "$REAL_GIT" -C "$FIXTURE_MAIN" commit -qm base
   "$REAL_GIT" init -q --bare "$area/remote.git"
@@ -84,6 +87,9 @@ new_world() { # NAME SETTING
   BASE_HEAD="$("$REAL_GIT" -C "$FIXTURE_MAIN" rev-parse HEAD)"
   OLD_HEAD="$("$REAL_GIT" -C "$FIXTURE_LANE" rev-parse HEAD)"
   cp -R "$REPO_ROOT/skills/orch/scripts" "$area/installed/orch/"
+  cp -R "$REPO_ROOT/skills/orch/references" "$area/installed/orch/"
+  mkdir -p "$area/installed/harness-ci"
+  cp -R "$REPO_ROOT/skills/harness-ci/scripts" "$area/installed/harness-ci/"
   cp -R "$REPO_ROOT/skills/worktree/scripts" "$area/installed/worktree/"
   orch_fixture_shared_libs "$area/installed/orch"
   mkdir -p "$FIXTURE_LANE/.agents" "$FIXTURE_LANE/tmp"
@@ -98,6 +104,14 @@ new_world() { # NAME SETTING
   "$REPO_ROOT/skills/orch/scripts/workflow-state" --state-dir "$FIXTURE_MAIN/tmp" init KEN-1 --worktree "$FIXTURE_LANE" --branch ken-1 >/dev/null
   "$REPO_ROOT/skills/orch/scripts/workflow-state" --state-dir "$FIXTURE_MAIN/tmp" update KEN-1 --arg sha "$OLD_HEAD" '.fixed_items=[{commit:$sha}]'
   printf '{"overseer":{"server":"7000","pane":"%%0"}}\n' > "$FIXTURE_MAIN/tmp/workflow-state-oversee.json"
+}
+
+validate_current() {
+  (cd "$FIXTURE_LANE" && env -u DEV_VALIDATE_CMD -u DEV_VALIDATE_RANGE_CMD -u DEV_VALIDATE_SELECTION_CMD \
+    -u DEV_VALIDATE_CI_CONTEXT -u DEV_VALIDATE_BASE -u DEV_VALIDATE_CLASS -u DEV_VALIDATE_PATHS \
+    -u DEV_VALIDATE_DOCS_ONLY PATH="$TMP_ROOT/bin:$PATH" \
+    "$FIXTURE_LANE/.agents/skills/orch/scripts/dev-validate-run" --worktree "$FIXTURE_LANE" --poll 1) \
+    > "$FIXTURE_MAIN/tmp/validation.out" 2> "$FIXTURE_MAIN/tmp/validation.err"
 }
 
 publish() {
@@ -160,10 +174,10 @@ SH
       python3 - "$TMP_ROOT/$name/installed/worktree/scripts/worktree" <<'PY'
 import pathlib, sys
 path = pathlib.Path(sys.argv[1])
-old = 'if (( BASE_PUSH_COUNT > 1 )); then'
+old = 'if (( BASE_PUSH_COUNT > 1 )) || [[ "$PUSH_PUBLICATION_TIER" == micro ]]; then'
 text = path.read_text()
 assert text.count(old) == 1
-updated = text.replace(old, 'if (( BASE_PUSH_COUNT > 1 )) && false; then')
+updated = text.replace(old, 'if { (( BASE_PUSH_COUNT > 1 )) || [[ "$PUSH_PUBLICATION_TIER" == micro ]]; } && false; then')
 assert updated != text
 path.write_text(updated)
 PY
@@ -185,6 +199,8 @@ PY
   BEFORE_PUSH="$("$REAL_GIT" --git-dir "$TMP_ROOT/$name/remote.git" rev-parse trunk)"
   BEFORE_TREE="$("$REAL_GIT" -C "$FIXTURE_LANE" rev-parse HEAD^{tree})"
   : > "$FOLD_CALLS"
+  validate_current
+  : > "$GH_CALLS"
   publish
   head="$("$REAL_GIT" -C "$FIXTURE_LANE" rev-parse HEAD)"
   if [[ "$target" == refused ]]; then
@@ -206,6 +222,14 @@ PY
     assert_eq "$RC|$(sed -n '/^worktree-push-base-fold-content-changed:/p' "$FIXTURE_MAIN/tmp/push.err")" "1|worktree-push-base-fold-content-changed: $head" 'a hook content change refuses publication for local validation'
     assert_eq "$("$REAL_GIT" --git-dir "$TMP_ROOT/$name/remote.git" rev-parse trunk)|$NOTICE" "$BASE_HEAD|" 'unvalidated hook content stays off the base'
     assert_eq "$(jq -r --arg head "$head" 'all(.fixed_items[]; .commit == $head)' "$FIXTURE_MAIN/tmp/workflow-state-KEN-1.json")" true 'hook-content refusal preserves reconciled fix history'
+    GUARD_CHANGE=false
+    export GUARD_CHANGE
+    publish
+    assert_eq "$RC|$(sed -n '/^worktree-push-base-validation-required:/p' "$FIXTURE_MAIN/tmp/push.err")" "1|worktree-push-base-validation-required: $head" 'a hook-content retry without new local validation remains refused'
+    assert_eq "$(awk '/ push / { n++ } END { print n+0 }' "$GIT_CALLS")" 0 'hook-content retries attempt no transport before validation'
+    validate_current
+    publish
+    assert_eq "$RC|$("$REAL_GIT" --git-dir "$TMP_ROOT/$name/remote.git" rev-parse trunk)" "0|$head" 'a passing local full run permits the changed hook tree'
     continue
   fi
   if [[ "$target" == multi ]]; then
@@ -253,6 +277,133 @@ RC=0
 (cd "$FIXTURE_LANE" && "$PUSH" --worktree "$FIXTURE_LANE" --issue KEN-1 --no-rebase) > "$FIXTURE_MAIN/tmp/refused.out" 2> "$FIXTURE_MAIN/tmp/push.err" || RC=$?
 assert_eq "$RC|$(sed -n '1p' "$FIXTURE_MAIN/tmp/push.err")" '1|worktree-push-base-no-rebase: --no-rebase' 'caller cannot disable the base rebase'
 assert_eq "$("$REAL_GIT" --git-dir "$TMP_ROOT/forbidden-no-rebase/remote.git" rev-parse trunk)" "$BASE_HEAD" 'no-rebase refusal publishes nothing'
+
+echo '=== the optional publication checker is required only for direct transport ==='
+for delivery in push-base pr; do
+  new_world "missing-$delivery" "$delivery"
+  RACE_PUSH=false
+  export RACE_PUSH
+  rm -- "${TMP_ROOT:?}/missing-$delivery/installed/orch/scripts/restack-skip"
+  publish
+  remote="$("$REAL_GIT" --git-dir "$TMP_ROOT/missing-$delivery/remote.git" rev-parse trunk)"
+  if [[ "$delivery" == push-base ]]; then
+    assert_eq "$RC|$(sed -n 's/^worktree-push-base-check-missing:.*/missing/p' "$FIXTURE_MAIN/tmp/push.err")|$(awk '/ push / { n++ } END { print n+0 }' "$GIT_CALLS")|$remote" "1|missing|0|$BASE_HEAD" 'the absent optional checker refuses direct transport'
+  else
+    assert_eq "$RC|$(cat "$GH_CALLS")|$remote" "0|pr create|$BASE_HEAD" 'PR transport remains independent of the optional checker'
+  fi
+done
+
+echo '=== direct micro classification and normal commit-chain proof ==='
+for row in 'micro|ready' 'micro-standard|refused' 'micro-unreadable|refused'; do
+  IFS='|' read -r name want <<< "$row"
+  new_world "$name" push-base
+  RACE_PUSH=false
+  export RACE_PUSH
+  "$REPO_ROOT/skills/orch/scripts/workflow-state" --state-dir "$FIXTURE_MAIN/tmp" set KEN-1 tier micro >/dev/null
+  mkdir -p "$TMP_ROOT/$name/hooks"
+  FOLD_CALLS="$TMP_ROOT/$name/fold-calls"
+  export FOLD_CALLS
+  : > "$FOLD_CALLS"
+  cat > "$TMP_ROOT/$name/hooks/pre-commit" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'guard\n' >> "$FOLD_CALLS"
+SH
+  chmod +x "$TMP_ROOT/$name/hooks/pre-commit"
+  "$REAL_GIT" -C "$FIXTURE_MAIN" config core.hooksPath "$TMP_ROOT/$name/hooks"
+  case "$name" in
+    micro-standard)
+      printf 'HARNESS_CI_STANDARD_PATHS = "src/*.rs"\n' >> "$FIXTURE_MAIN/kendex.settings.toml"
+      mkdir -p "$FIXTURE_LANE/src"
+      printf 'fn main() {}\n' > "$FIXTURE_LANE/src/main.rs"
+      "$REAL_GIT" -C "$FIXTURE_LANE" add src/main.rs
+      "$REAL_GIT" -C "$FIXTURE_LANE" commit -qm standard
+      ;;
+    micro-unreadable) rm "$TMP_ROOT/$name/installed/orch/references/narrow-change.conf" ;;
+  esac
+  : > "$FOLD_CALLS"
+  publish
+  if [[ "$want" == ready ]]; then
+    head="$("$REAL_GIT" -C "$FIXTURE_LANE" rev-parse HEAD)"
+    assert_eq "$RC|$(cat "$FOLD_CALLS")|$("$REAL_GIT" --git-dir "$TMP_ROOT/$name/remote.git" rev-parse trunk)" "0|guard|$head" 'micro repeats its normal commit chain before direct transport'
+  else
+    assert_eq "$RC|$(awk '/ push / { n++ } END { print n+0 }' "$GIT_CALLS")|$("$REAL_GIT" --git-dir "$TMP_ROOT/$name/remote.git" rev-parse trunk)" "1|0|$BASE_HEAD" "$name refuses before direct transport"
+    assert_contains "$OUT" 'tier=standard ' "$name uses the existing committed-path classifier"
+  fi
+done
+
+echo '=== a change-and-revert rebase needs a new local full result ==='
+for name in revert guarded-restack revert-control; do
+  new_world "$name" push-base
+  RACE_PUSH=false
+  export RACE_PUSH
+  printf 'b\n' > "$FIXTURE_LANE/value"
+  "$REAL_GIT" -C "$FIXTURE_LANE" commit -qam change
+  printf 'a\n' > "$FIXTURE_LANE/value"
+  "$REAL_GIT" -C "$FIXTURE_LANE" commit -qam revert
+  validate_current
+  printf 'b\n' > "$FIXTURE_MAIN/value"
+  "$REAL_GIT" -C "$FIXTURE_MAIN" commit -qam advance
+  "$REAL_GIT" -C "$FIXTURE_MAIN" push -q origin trunk
+  ADVANCED_HEAD="$("$REAL_GIT" -C "$FIXTURE_MAIN" rev-parse HEAD)"
+  if [[ "$name" == guarded-restack ]]; then
+    # The guarded route hands the publisher an already restacked head. Its
+    # no-range consumer must still run full local validation when reuse fails.
+    "$REAL_GIT" -C "$FIXTURE_LANE" fetch -q origin trunk
+    "$REAL_GIT" -C "$FIXTURE_LANE" rebase origin/trunk > "$FIXTURE_MAIN/tmp/restack.out" 2>&1
+    mode="$("$FIXTURE_LANE/.agents/skills/orch/scripts/dev-validate-run" --resolve-mode --worktree "$FIXTURE_LANE")"
+    assert_eq "$mode" validate-mode=full 'no-range restack resolves to local full validation'
+  elif [[ "$name" == revert-control ]]; then
+    python3 - "$TMP_ROOT/$name/installed/worktree/scripts/worktree" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+old = 'if ! "$BASE_PUBLICATION_CHECK" --worktree "$WT_PATH" --base "origin/$DEFAULT_BRANCH" --publication-tier "$PUSH_PUBLICATION_TIER"; then'
+text = path.read_text()
+assert text.count(old) == 1
+updated = text.replace(old, 'if ! { "$BASE_PUBLICATION_CHECK" --worktree "$WT_PATH" --base "origin/$DEFAULT_BRANCH" --publication-tier "$PUSH_PUBLICATION_TIER"; true; }; then')
+assert updated != text
+path.write_text(updated)
+PY
+  fi
+  : > "$GIT_CALLS"
+  publish
+  if [[ "$name" == revert-control ]]; then
+    assert_eq "$RC|$("$REAL_GIT" --git-dir "$TMP_ROOT/$name/remote.git" show trunk:value)" '0|a' 'control: ignoring the existing reuse proof publishes the unvalidated revert'
+    continue
+  fi
+  assert_eq "$RC|$(awk '/ push / { n++ } END { print n+0 }' "$GIT_CALLS")|$("$REAL_GIT" --git-dir "$TMP_ROOT/$name/remote.git" rev-parse trunk)" "1|0|$ADVANCED_HEAD" "$name refuses before transport when the validated merge differs"
+  assert_contains "$OUT" 'restack=retest cause=path-unconflicted path=value ' "$name uses the existing restack-skip proof"
+  validate_current
+  publish
+  assert_eq "$RC|$(awk '/ push / { n++ } END { print n+0 }' "$GIT_CALLS")" '0|1' "$name publishes once after the new full pass"
+done
+
+echo '=== a landed commit survives post-push reconciliation failure ==='
+new_world repair push-base
+RACE_PUSH=false
+export RACE_PUSH
+printf 'fix\n' > "$FIXTURE_LANE/fix"
+"$REAL_GIT" -C "$FIXTURE_LANE" add fix
+"$REAL_GIT" -C "$FIXTURE_LANE" commit -qm fix
+validate_current
+cp "$FIXTURE_MAIN/tmp/workflow-state-KEN-1.json" "$FIXTURE_MAIN/tmp/state-kept.json"
+# A real receive hook damages the dependency's state after transport. The
+# production reconciliation owner still runs and reports its read failure.
+cat > "$TMP_ROOT/repair/remote.git/hooks/post-receive" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'invalid-json\n' > "$FIXTURE_MAIN/tmp/workflow-state-KEN-1.json"
+SH
+chmod +x "$TMP_ROOT/repair/remote.git/hooks/post-receive"
+publish
+landed="$("$REAL_GIT" --git-dir "$TMP_ROOT/repair/remote.git" rev-parse trunk)"
+landed_record="delivery: mode=push-base base=trunk commit=$landed"
+assert_eq "$RC|$NOTICE" '1|' 'a landed push with failed reconciliation sends no completion notice'
+assert_eq "$(sed -n '/^delivery: mode=push-base /p' <<< "$OUT")" "$landed_record" 'the failed wrapper preserves the exact landed commit'
+cp "$FIXTURE_MAIN/tmp/state-kept.json" "$FIXTURE_MAIN/tmp/workflow-state-KEN-1.json"
+rm "$TMP_ROOT/repair/remote.git/hooks/post-receive"
+publish
+assert_eq "$RC|$NOTICE|$(awk '/ push / { n++ } END { print n+0 }' "$GIT_CALLS")" "0|$landed_record|1" 'repair returns the same pushed commit with no second transport'
 
 printf 'pass: %d   fail: %d\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]
