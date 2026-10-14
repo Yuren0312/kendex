@@ -184,3 +184,26 @@ fn a_registry_with_no_owner_is_read_and_told_about_it() {
         )]
     );
 }
+
+#[test]
+fn local_directory_paths_allow_the_root_and_refuse_parent_or_absolute_paths() {
+    for (path, expected) in [
+        (".", Some("")),
+        ("./", Some("")),
+        ("./plugins/./media", Some("plugins/media")),
+        ("", None),
+        ("../outside", None),
+        ("./../outside", None),
+        ("/outside", None),
+    ] {
+        let resolved = relative_dir(REGISTRY, "media", path);
+        assert_eq!(
+            resolved.as_ref().ok(),
+            expected.map(PathBuf::from).as_ref(),
+            "{path}"
+        );
+        if let Err(finding) = resolved {
+            assert!(!finding.breakage, "{path}");
+        }
+    }
+}

@@ -7,7 +7,9 @@
 //! groups a plugin installs as. None of it belongs in `kendex.toml`, which
 //! records what the user chose, not what a catalog says about itself.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -18,6 +20,47 @@ use crate::source_read::SealedSource;
 
 use super::plugin_registry::{CatalogFinding, PLUGIN_MANIFEST, PluginEntry, Registry};
 
+/// One registry read owns the accepted item paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Offers {
+    items: BTreeMap<ItemKind, SharedItems>,
+}
+
+type SharedItems = Arc<BTreeMap<String, PathBuf>>;
+pub(super) type DefaultInventories = BTreeMap<PathBuf, BTreeMap<ItemKind, SharedItems>>;
+
+pub(super) fn read_offers(
+    sealed: &SealedSource,
+    entry: &PluginEntry,
+    mut declared_skills: Option<BTreeMap<String, PathBuf>>,
+    defaults: &mut DefaultInventories,
+    findings: &mut Vec<CatalogFinding>,
+) -> Offers {
+    let mut offers = Offers::default();
+    let source = sealed.root().join(&entry.dir);
+    for kind in [ItemKind::Agent, ItemKind::Command, ItemKind::Skill] {
+        let selected = (kind == ItemKind::Skill)
+            .then(|| declared_skills.take())
+            .flatten();
+        let items = if let Some(items) = selected {
+            Arc::new(items)
+        } else if let Some(items) = defaults.get(&source).and_then(|kinds| kinds.get(&kind)) {
+            Arc::clone(items)
+        } else {
+            // Aliases retain one physical inventory, and publish its warnings
+            // only when that inventory is first constructed during this read.
+            let items = Arc::new(offered(sealed, entry, kind, findings));
+            defaults
+                .entry(source.clone())
+                .or_default()
+                .insert(kind, Arc::clone(&items));
+            items
+        };
+        offers.items.insert(kind, items);
+    }
+    offers
+}
+
 /// The directory a plugin keeps this kind in, and the file that marks one
 /// item. Everything else a plugin may carry (hooks, servers) is left alone
 /// until kendex can install it from here.
@@ -27,25 +70,6 @@ fn kind_dir(kind: ItemKind) -> Option<(&'static str, Option<&'static str>)> {
         ItemKind::Command => Some(("commands", None)),
         ItemKind::Skill => Some(("skills", Some("SKILL.md"))),
         _ => None,
-    }
-}
-
-/// The path an item of this kind takes inside a plugin, whether or not it
-/// exists.
-fn item_path(sealed: &SealedSource, entry: &PluginEntry, kind: ItemKind, leaf: &str) -> PathBuf {
-    let (dir, marker) = kind_dir(kind).unwrap_or_default();
-    let base = sealed.root().join(&entry.dir).join(dir);
-    match marker {
-        Some(_) => base.join(leaf),
-        None => base.join(format!("{leaf}.md")),
-    }
-}
-
-/// Whether that path is really an item of this kind.
-fn exists(sealed: &SealedSource, path: &std::path::Path, kind: ItemKind) -> bool {
-    match kind_dir(kind).and_then(|(_, marker)| marker) {
-        Some(marker) => sealed.is_file(&path.join(marker)),
-        None => sealed.is_file(path),
     }
 }
 
@@ -61,35 +85,42 @@ pub fn find(
 ) -> Option<PathBuf> {
     let (plugin, leaf) = names::split(name)?;
     let entry = registry.entry(plugin)?;
-    kind_dir(kind)?;
-    let path = item_path(sealed, entry, kind, leaf);
-    exists(sealed, &path, kind).then_some(path)
+    let path = entry.offers.items.get(&kind)?.get(leaf)?;
+    let (_, marker) = kind_dir(kind)?;
+    let readable = match marker {
+        Some(marker) => sealed.is_file(&path.join(marker)),
+        None => sealed.is_file(path),
+    };
+    readable.then(|| path.clone())
 }
 
 /// Every item of this kind the catalog offers, named as it is declared. A
 /// leaf a filesystem cannot hold is left out here and reported by
 /// [`metadata`], which is where a catalog's problems are read.
-pub fn items(sealed: &SealedSource, registry: &Registry, kind: ItemKind) -> Vec<String> {
+pub fn items(_sealed: &SealedSource, registry: &Registry, kind: ItemKind) -> Vec<String> {
     let mut names = Vec::new();
     for entry in &registry.plugins {
-        for leaf in leaves(sealed, entry, kind) {
-            if names::segment_problem(&leaf).is_none() {
-                names.push(format!("{}/{leaf}", entry.name));
-            }
+        if let Some(items) = entry.offers.items.get(&kind) {
+            names.extend(items.keys().map(|leaf| format!("{}/{leaf}", entry.name)));
         }
     }
     names.sort();
     names
 }
 
-/// The item names one plugin's kind directory holds, whether or not each is
-/// a name that can be installed.
-fn leaves(sealed: &SealedSource, entry: &PluginEntry, kind: ItemKind) -> Vec<String> {
+/// Every readable item path from the default layout.
+fn item_paths(
+    sealed: &SealedSource,
+    entry: &PluginEntry,
+    kind: ItemKind,
+) -> Vec<(String, PathBuf)> {
     let Some((dir, marker)) = kind_dir(kind) else {
         return Vec::new();
     };
-    let Ok(paths) = sealed.entries(&sealed.root().join(&entry.dir).join(dir)) else {
-        return Vec::new();
+    let base = sealed.root().join(&entry.dir);
+    let paths = match sealed.entries(&base.join(dir)) {
+        Ok(paths) => paths,
+        Err(_) => return Vec::new(),
     };
     let mut leaves = Vec::new();
     for path in paths {
@@ -102,10 +133,56 @@ fn leaves(sealed: &SealedSource, entry: &PluginEntry, kind: ItemKind) -> Vec<Str
             None => None,
         };
         if let Some(leaf) = leaf.and_then(|leaf| leaf.to_str()) {
-            leaves.push(leaf.to_owned());
+            leaves.push((leaf.to_owned(), path));
         }
     }
     leaves
+}
+
+fn offered(
+    sealed: &SealedSource,
+    entry: &PluginEntry,
+    kind: ItemKind,
+    findings: &mut Vec<CatalogFinding>,
+) -> BTreeMap<String, PathBuf> {
+    let mut offered = BTreeMap::new();
+    let mut folded = BTreeMap::new();
+    for (leaf, path) in item_paths(sealed, entry, kind) {
+        let at = format!("{}/{}", crate::paths::slashed(&entry.dir), kind.name());
+        if let Err(finding) = insert_offer(&at, leaf, path, &mut offered, &mut folded) {
+            findings.push(finding);
+        }
+    }
+    offered
+}
+
+pub(super) fn insert_offer(
+    at: &str,
+    leaf: String,
+    path: PathBuf,
+    offered: &mut BTreeMap<String, PathBuf>,
+    folded: &mut BTreeMap<String, String>,
+) -> std::result::Result<(), CatalogFinding> {
+    if let Some(problem) = names::segment_problem(&leaf) {
+        return Err(CatalogFinding::new(
+            at,
+            format!("`{}` cannot be installed: {problem}", names::shown(&leaf)),
+            "rename it in the catalog",
+        ));
+    }
+    let key = names::fold(&leaf);
+    if let Some(other) = folded.get(&key) {
+        return Err(CatalogFinding::new(
+            at,
+            format!(
+                "`{leaf}` and `{other}` are the same name once a filesystem has folded case and trailing dots: one would overwrite the other"
+            ),
+            "rename one of them so they differ by more than case",
+        ));
+    }
+    folded.insert(key, leaf.clone());
+    offered.insert(leaf, path);
+    Ok(())
 }
 
 /// One item a plugin ships.
@@ -183,35 +260,11 @@ fn group(
     check_manifest(sealed, entry, &at, findings)?;
     let mut members = Vec::new();
     for kind in [ItemKind::Agent, ItemKind::Command, ItemKind::Skill] {
-        let mut seen: Vec<String> = Vec::new();
-        for leaf in leaves(sealed, entry, kind) {
-            let at = format!("{at}/{}", kind.name());
-            if let Some(problem) = names::segment_problem(&leaf) {
-                findings.push(CatalogFinding::new(
-                    at,
-                    format!("`{}` cannot be installed: {problem}", names::shown(&leaf)),
-                    "rename it in the catalog",
-                ));
-                continue;
-            }
-            if let Some(other) = seen
-                .iter()
-                .find(|other| names::fold(other) == names::fold(&leaf))
-            {
-                findings.push(CatalogFinding::new(
-                    at,
-                    format!(
-                        "`{leaf}` and `{other}` are the same name once a filesystem has folded case and trailing dots — one would overwrite the other"
-                    ),
-                    "rename one of them so they differ by more than case",
-                ));
-                continue;
-            }
-            seen.push(leaf.clone());
-            members.push(CatalogItem {
+        if let Some(items) = entry.offers.items.get(&kind) {
+            members.extend(items.keys().map(|leaf| CatalogItem {
                 kind,
                 name: format!("{}/{leaf}", entry.name),
-            });
+            }));
         }
     }
     Ok(CatalogGroup {
