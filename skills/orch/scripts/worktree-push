@@ -86,10 +86,19 @@
 # Usage:
 #   worktree-push --worktree PATH --issue ID [--state-dir DIR] [push flags...]
 #   worktree-push --check-live-round --worktree PATH --issue ID [--state-dir DIR]
+#   worktree-push --resolve-delivery --worktree PATH
 #   worktree-push --record-restack-validation RUN_DIR --worktree PATH --issue ID [--state-dir DIR]
 #
+# ORCH_DELIVERY resolves through orch-env in the worktree: pr (default)
+# publishes the item branch; push-base selects worktree push --to-base.
+# --resolve-delivery prints delivery=<mode> without publishing or reading state.
+# A successful direct push prints the completion notice
+# 'delivery: mode=push-base base=<branch> commit=<pushed-sha>'. Submit routes
+# that notice to the overseer before any PR operation.
+#
 # Every argument outside this wrapper's own namespace (--worktree, --issue,
-# --state-dir, --check-live-round, --record-restack-validation, --help) is forwarded verbatim to
+# --state-dir, --check-live-round, --resolve-delivery,
+# --record-restack-validation, --help) is forwarded verbatim to
 # `worktree push`, which rejects
 # a flag it does not know. The push flag vocabulary lives there alone; see
 # `worktree push --help`, which is where a mistyped flag is caught. The state
@@ -177,6 +186,8 @@ message() {
 	case "$reason" in
 	missing-value) printf 'The option requires a value.\n' ;;
 	required) printf 'The required option is missing.\n' ;;
+	delivery-invalid) printf 'ORCH_DELIVERY must be pr or push-base. No push ran.\n' ;;
+	delivery-unrecorded) printf 'The base push landed but its publication record is missing. Read the base history before retrying.\n' ;;
 	invalid-issue) printf 'The issue ID must be safe for a state file path.\n' ;;
 	check-argument) printf 'The read-only mode cannot forward push arguments or select another mode.\n' ;;
 	not-executable) printf 'The worktree script is not executable.\n' ;;
@@ -222,6 +233,7 @@ worktree=''
 issue=''
 state_dir=''
 check_live_round=false
+resolve_delivery=false
 record_run_dir=''
 push_args=()
 
@@ -258,6 +270,10 @@ while [[ $# -gt 0 ]]; do
 		check_live_round=true
 		shift
 		;;
+	--resolve-delivery)
+		resolve_delivery=true
+		shift
+		;;
 	--record-restack-validation)
 		[[ $# -ge 2 && -n "$2" ]] || fail missing-value option=--record-restack-validation
 		record_run_dir="$2"
@@ -278,24 +294,42 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$worktree" ]] || fail required option=--worktree
-[[ -n "$issue" ]] || fail required option=--issue
-[[ "$issue" =~ $ISSUE_GRAMMAR && "$issue" != *..* ]] || fail invalid-issue "issue=$issue"
+if [[ "$resolve_delivery" != true ]]; then
+	[[ -n "$issue" ]] || fail required option=--issue
+	[[ "$issue" =~ $ISSUE_GRAMMAR && "$issue" != *..* ]] || fail invalid-issue "issue=$issue"
+fi
 # Check mode never reaches the push, so nothing forwards push_args and a
 # mistyped flag would simply vanish: --sate-dir=... would leave the check
 # reading a different workflow state and answering about the wrong one. An
 # argument the check cannot honour leaves its answer unfounded, and an
 # unfounded answer is not permission to rebase.
-if [[ "$check_live_round" == true || -n "$record_run_dir" ]] && (( ${#push_args[@]} > 0 )); then
+if [[ "$check_live_round" == true || "$resolve_delivery" == true || -n "$record_run_dir" ]] && (( ${#push_args[@]} > 0 )); then
 	fail check-argument "argument=${push_args[0]}"
 fi
 [[ "$check_live_round" != true || -z "$record_run_dir" ]] || fail check-argument argument=--record-restack-validation
-[[ -x "$WORKTREE_BIN" ]] || fail not-executable "path=$WORKTREE_BIN"
-command -v jq >/dev/null 2>&1 || fail missing-command command=jq
-
+if [[ "$resolve_delivery" == true && ( "$check_live_round" == true || -n "$record_run_dir" ) ]]; then
+	fail check-argument argument=--resolve-delivery
+fi
 worktree_abs="$(cd -P -- "$worktree" 2>/dev/null && pwd -P)" \
 	|| fail not-directory "path=$worktree"
 git -C "$worktree_abs" rev-parse --absolute-git-dir >/dev/null 2>&1 \
 	|| fail not-worktree "path=$worktree_abs"
+
+delivery=pr
+if [[ "$check_live_round" != true && -z "$record_run_dir" ]]; then
+	delivery="$(cd -- "$worktree_abs" && "$SCRIPT_DIR/orch-env" ORCH_DELIVERY pr)" || exit 1
+	case "$delivery" in
+	pr | push-base) ;;
+	*) fail delivery-invalid "value=$delivery" ;;
+	esac
+fi
+if [[ "$resolve_delivery" == true ]]; then
+	printf 'delivery=%s\n' "$delivery"
+	exit 0
+fi
+[[ -x "$WORKTREE_BIN" ]] || fail not-executable "path=$WORKTREE_BIN"
+command -v jq >/dev/null 2>&1 || fail missing-command command=jq
+if [[ "$delivery" == push-base ]]; then push_args+=(--to-base); fi
 
 state_flags=()
 [[ -z "$state_dir" ]] || state_flags=(--state-dir "$state_dir")
@@ -556,7 +590,7 @@ fail_post_push() {
 	exit 1
 }
 
-# The transcript is replayed, never parsed: the push's own map reaches this
+# The map transcript is replayed, never parsed: the push's own map reaches this
 # process as a hop in the worktree's map file, consumed below. A map read from
 # here instead would be read out of a temporary capture this process removes on
 # exit, which is no record at all.
@@ -571,5 +605,12 @@ if [[ "$push_rc" == 0 && -n "$restack_validation_head" ]]; then
 	else
 		message stage-unrecorded "issue=$issue" >&2
 	fi
+fi
+if [[ "$push_rc" == 0 && "$delivery" == push-base ]]; then
+	# The push owner binds the ref and SHA it sent, which can differ from a
+	# later local HEAD or an independent default-branch lookup.
+	pushed_record="$(sed -n 's/^worktree-pushed-base: /delivery: mode=push-base /p' "$push_out")" || exit 1
+	[[ -n "$pushed_record" ]] || fail_post_push delivery-unrecorded "issue=$issue" push-exit=0
+	printf '%s\n' "$pushed_record"
 fi
 exit "$push_rc"

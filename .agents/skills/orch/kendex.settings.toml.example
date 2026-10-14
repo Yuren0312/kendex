@@ -1,5 +1,12 @@
 [env]
+# Delivery: pr opens a pull request. push-base pushes to the resolved base
+# branch after the tier's local validation and internal review, with no PR.
+# The push rebases first and never forces. Unset uses pr.
+# Multiple item commits fold into one after rebase, with normal commit guards.
+# ORCH_DELIVERY = "push-base"
+
 # Publication order, resolved by pr-order: review-first, open-first or push-first.
+# This orders review only when ORCH_DELIVERY is pr.
 # Leave unset to keep the defaults described by pr-order --help.
 # ORCH_PR_ORDER = "review-first"
 

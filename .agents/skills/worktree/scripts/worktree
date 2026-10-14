@@ -876,11 +876,13 @@ parse_push_args() {
   PUSH_ARG=""
   PUSH_SET_UPSTREAM=""
   PUSH_AUTO_REBASE=true
+  PUSH_TO_BASE=false
   local arg_seen=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -u|--set-upstream) PUSH_SET_UPSTREAM="-u"; shift ;;
       --no-rebase) PUSH_AUTO_REBASE=false; shift ;;
+      --to-base) PUSH_TO_BASE=true; shift ;;
       # An unknown --flag must fail rather than be dropped: a catch-all shift
       # would turn a typo like `--no-rebse` into a silent default-behavior
       # push, and force callers to pre-screen flags against a copy of this
@@ -905,6 +907,10 @@ parse_push_args() {
         ;;
     esac
   done
+  if [[ "$PUSH_TO_BASE" == true && "$PUSH_AUTO_REBASE" != true ]]; then
+    worktree_message push-base-no-rebase --no-rebase "Error: base publication requires automatic rebase." >&2
+    return 1
+  fi
 }
 
 # One path segment in the alphabet an issue ID is spelled in: a name composed
@@ -3764,6 +3770,10 @@ case "${1:-}" in
       exit 1
     fi
     PUSH_CHECKOUT_MODE="$(worktree_checkout_mode "$WT_PATH")" || exit 1
+    if [[ "$PUSH_TO_BASE" == true && "$PUSH_CHECKOUT_MODE" == claim ]]; then
+      worktree_message push-base-claim "$WT_PATH" "Error: check out the claim through create --reuse before publishing to the base." >&2
+      exit 1
+    fi
     # A remote-work claim publishes its creation snapshot. Rebasing it needs
     # a local checkout, which create --reuse/--restack materializes first.
     if [[ "$PUSH_CHECKOUT_MODE" == claim ]]; then AUTO_REBASE=false; fi
@@ -3778,6 +3788,7 @@ case "${1:-}" in
     fi
 
     REMOTE="${BOT_REMOTE_NAME:-origin}"
+    if [[ "$PUSH_TO_BASE" == true ]]; then REMOTE=origin; fi
     if ! git -C "$WT_PATH" remote get-url "$REMOTE" >/dev/null 2>&1; then
       worktree_message push-remote-fallback "$REMOTE" "Warning: Remote '$REMOTE' not found, falling back to origin" >&2
       REMOTE="origin"
@@ -3808,7 +3819,7 @@ case "${1:-}" in
     PUSH_LEASE=()
     LEASE_EXPECTED_OID=""
     REPUBLISH_REWRITE=false
-    if [[ "$AUTO_REBASE" == true && -n "$CURRENT_BRANCH" && "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" ]]; then
+    if [[ "$PUSH_TO_BASE" != true && "$AUTO_REBASE" == true && -n "$CURRENT_BRANCH" && "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" ]]; then
       if remote_ref_lease_oid "$WT_PATH" "$REMOTE" "$CURRENT_BRANCH"; then
         PUSH_LEASE=("--force-with-lease=refs/heads/$CURRENT_BRANCH:$LEASE_EXPECTED_OID")
       else
@@ -3819,7 +3830,7 @@ case "${1:-}" in
     if [[ "$AUTO_REBASE" == true ]]; then
       BASE_FETCH_FAILED=false
       BASE_FETCH_ERR="$(git_with_github_https_auth -C "$PROJECT_ROOT" fetch origin "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH" 2>&1 >/dev/null)" || BASE_FETCH_FAILED=true
-      if [[ -n "$CURRENT_BRANCH" && "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" ]]; then
+      if [[ "$PUSH_TO_BASE" == true || ( -n "$CURRENT_BRANCH" && "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" ) ]]; then
         # Every reading below compares the branch with origin/$DEFAULT_BRANCH,
         # and a failed fetch leaves that ref wherever it last was: a stale base
         # reads as contained or as merging cleanly after the base GitHub holds
@@ -3829,7 +3840,7 @@ case "${1:-}" in
           [[ -z "$BASE_FETCH_ERR" ]] || sed 's/^/  /' <<<"$BASE_FETCH_ERR" >&2
           exit 1
         fi
-        base_reading "$WT_PATH" "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH"
+        base_reading "$WT_PATH" "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH" "$PUSH_TO_BASE"
         if [[ "$BASE_READING" == contained ]]; then
           worktree_message rebase-skipped "$CURRENT_BRANCH" "→ origin/$DEFAULT_BRANCH already contained in $CURRENT_BRANCH; skipping rebase" >&2
         elif [[ "$BASE_READING" == merges-cleanly ]]; then
@@ -3923,6 +3934,53 @@ case "${1:-}" in
       PUSH_UPSTREAM_ARGS=("$SET_UPSTREAM")
       PUSH_REF="HEAD:refs/heads/${CURRENT_BRANCH}"
     fi
+    if [[ "$PUSH_TO_BASE" == true ]]; then
+      PUSH_UPSTREAM_ARGS=()
+      BASE_PUSH_COUNT="$(git -C "$WT_PATH" rev-list --count "origin/$DEFAULT_BRANCH..HEAD")" || exit 1
+      if [[ "$BASE_PUSH_COUNT" == 0 ]]; then
+        worktree_message push-base-empty "origin/$DEFAULT_BRANCH" "Error: the base already holds this item's work." >&2
+        exit 1
+      fi
+      # The direct-cycle recorder takes one commit, including after fix rounds.
+      # Fold only after rebase so base commits never enter the item's commit.
+      if (( BASE_PUSH_COUNT > 1 )); then
+        if ! git -C "$WT_PATH" diff --quiet || ! git -C "$WT_PATH" diff --cached --quiet; then
+          worktree_message push-base-dirty "$WT_PATH" "Error: the item must be clean before folding its commits." >&2
+          exit 1
+        fi
+        PRE_FOLD_HEAD="$(git -C "$WT_PATH" rev-parse HEAD)" || exit 1
+        PRE_FOLD_TREE="$(git -C "$WT_PATH" rev-parse "$PRE_FOLD_HEAD^{tree}")" || exit 1
+        FOLD_COMMITS="$(git -C "$WT_PATH" rev-list "origin/$DEFAULT_BRANCH..HEAD")" || exit 1
+        FOLD_SUBJECTS="$(git -C "$WT_PATH" log --reverse --format=%s "origin/$DEFAULT_BRANCH..HEAD")" || exit 1
+        FOLD_SUBJECT="${FOLD_SUBJECTS%%$'\n'*}"
+        record_pending_rewrite "$WT_PATH" "$PRE_FOLD_HEAD" || exit 1
+        if ! git -C "$WT_PATH" reset --soft "origin/$DEFAULT_BRANCH" || ! git -C "$WT_PATH" commit -m "$FOLD_SUBJECT"; then
+          # A guard refusal keeps the original item history available for repair.
+          if git -C "$WT_PATH" reset --soft "$PRE_FOLD_HEAD"; then
+            clear_pending_rewrite "$WT_PATH" || exit 1
+          fi
+          worktree_message push-base-fold-failed "$WT_PATH" "Error: the folded commit failed. Repair the Git or commit-guard diagnostic above before retrying." >&2
+          exit 1
+        fi
+        FOLDED_HEAD="$(git -C "$WT_PATH" rev-parse HEAD)" || exit 1
+        FOLD_MAP=""
+        while IFS= read -r FOLD_OLD; do
+          FOLD_MAP="${FOLD_MAP}${FOLD_MAP:+$'\n'}rebase-map: $FOLD_OLD $FOLDED_HEAD"
+        done <<< "$FOLD_COMMITS"
+        printf '%s\n' "$FOLD_MAP"
+        append_rebase_hop "$WT_PATH" "$FOLD_MAP" || exit 1
+        clear_pending_rewrite "$WT_PATH" || exit 1
+        # Consumer commit hooks can rewrite staged files. Such a commit needs
+        # local validation before direct delivery can publish it.
+        FOLDED_TREE="$(git -C "$WT_PATH" rev-parse "$FOLDED_HEAD^{tree}")" || exit 1
+        if [[ "$FOLDED_TREE" != "$PRE_FOLD_TREE" ]]; then
+          worktree_message push-base-fold-content-changed "$FOLDED_HEAD" "Error: a commit hook changed the folded content. Run local validation before retrying publication." >&2
+          exit 1
+        fi
+      fi
+      BASE_PUSH_HEAD="$(git -C "$WT_PATH" rev-parse HEAD)" || exit 1
+      PUSH_REF="$BASE_PUSH_HEAD:refs/heads/$DEFAULT_BRANCH"
+    fi
     if ! PUSH_COMMITTED_KEYS="$(committed_settings_keys)"; then
       worktree_message push-settings-unread "$PROJECT_ROOT" "Error: could not read the main checkout's committed settings to keep them out of the pre-push hooks; refusing to push." >&2
       exit 1
@@ -3942,6 +4000,8 @@ case "${1:-}" in
     )"; then
       if push_output_refused_by_hook "$PUSH_OUTPUT"; then
         worktree_message push-hook-rejected "$REMOTE/${CURRENT_BRANCH:-HEAD}" "Error: A pre-push hook refused the push. The hook's own keyed lines are in the git output below — fix what they name." >&2
+      elif [[ "$PUSH_TO_BASE" == true && "$PUSH_OUTPUT" == *'[rejected]'* && ( "$PUSH_OUTPUT" == *'(non-fast-forward)'* || "$PUSH_OUTPUT" == *'(fetch first)'* ) ]]; then
+        worktree_message push-base-non-fast-forward "$REMOTE/$DEFAULT_BRANCH" "Error: the base advanced before publication. Use the guarded restack route and retry." >&2
       elif push_output_lease_rejected "$PUSH_OUTPUT"; then
         worktree_message push-rejected "$REMOTE/$CURRENT_BRANCH" "Error: Push rejected. Git reports the force-with-lease expectation for '$REMOTE/$CURRENT_BRANCH' stale; fetch and rebase/merge before retrying." >&2
       else
@@ -3954,6 +4014,9 @@ case "${1:-}" in
       worktree_message republished-after-rewrite "remote_oid=$LEASE_EXPECTED_OID"
     fi
     clear_restack_push_authorization "$WT_PATH"
+    if [[ "$PUSH_TO_BASE" == true ]]; then
+      printf 'worktree-pushed-base: base=%s commit=%s\n' "$DEFAULT_BRANCH" "$BASE_PUSH_HEAD"
+    fi
     ;;
 
   fix-links)

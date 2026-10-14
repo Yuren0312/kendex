@@ -1,0 +1,1 @@
+- `worktree push --to-base` publishes one item commit to the resolved base branch after a rebase. It folds fix commits through normal commit guards, uses no force option, and refuses a base that advances during publication.

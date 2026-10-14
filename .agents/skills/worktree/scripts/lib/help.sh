@@ -556,7 +556,21 @@ EOF
 print_push_help() {
   worktree_message help push
   cat <<'EOF'
-Usage: worktree push [ID|/path] [--set-upstream|-u] [--no-rebase]
+Usage: worktree push [ID|/path] [--set-upstream|-u] [--no-rebase] [--to-base]
+
+--to-base publishes HEAD to origin's resolved default branch. It always
+rebases onto origin/<default> first when the base is not contained, including
+on a merge-queue base. It uses no force option and changes no upstream.
+It folds multiple item commits into one with the first item's subject after
+rebase. The new commit runs normal commit guards. A refusal publishes nothing.
+The owner restores item history, or keeps the pending rewrite record if Git
+cannot restore it. The fold reconciles item SHAs through the
+same rebase-map record. A dirty index or worktree refuses the fold.
+A hook that changes staged content keeps the folded commit and its map,
+but refuses publication until the caller validates the changed content.
+It refuses --no-rebase and a remote-work claim. A base that advances after
+the fetch refuses with 'worktree-push-base-non-fast-forward'; use the guarded
+restack route and retry. Without --to-base, the branch route below applies.
 
 Push worktree branch to remote.
 Uses BOT_REMOTE_NAME from project config if set, otherwise falls back to

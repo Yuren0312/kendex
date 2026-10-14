@@ -1,0 +1,1 @@
+- `ORCH_DELIVERY=push-base` publishes a lane's work to its base branch after local checks, with no pull request. It rebases, folds fix commits into one through normal commit guards, and reports the pushed commit for the existing direct-push cycle record. It uses no force option.

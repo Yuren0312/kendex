@@ -96,7 +96,7 @@ run_script() { # SCRIPT ARG...
   # means to hand one in names it in INHERITED_CLASS.
   OUT="$(env -u DEV_VALIDATE_CMD -u DEV_VALIDATE_TIMEOUT_SECS -u DEV_VALIDATE_RANGE_CMD -u DEV_VALIDATE_BASE \
     -u DEV_VALIDATE_CLASS -u DEV_VALIDATE_DOCS_ONLY -u DEV_VALIDATE_PATHS -u WORKTREE_DEFAULT_BRANCH -u DEV_VALIDATE_CI_CONTEXT -u DEV_VALIDATE_FINDING_PREFIX \
-    -u ORCH_PR_ORDER -u DEV_VALIDATE_SELECTION_CMD -u DEV_VALIDATE_SCOPED -u DEV_VALIDATE_MODE -u GH_TOKEN -u GITHUB_TOKEN -u GH_BOT_TOKEN -u KENDEX_GITHUB_VALIDATED_TOKEN \
+    -u ORCH_PR_ORDER -u ORCH_DELIVERY -u DEV_VALIDATE_SELECTION_CMD -u DEV_VALIDATE_SCOPED -u DEV_VALIDATE_MODE -u GH_TOKEN -u GITHUB_TOKEN -u GH_BOT_TOKEN -u KENDEX_GITHUB_VALIDATED_TOKEN \
     ${INHERITED_CLASS:+DEV_VALIDATE_CLASS=$INHERITED_CLASS} \
     PATH="${RUN_PATH:-$PATH}" "$script" "$@" 2>"$err")"
   RC=$?
@@ -943,7 +943,7 @@ fi
 # selectors straight off the log.
 LAYOUT="$TMP_ROOT/layout"
 mkdir -p "$LAYOUT/orch/scripts/lib" "$LAYOUT/harness-ci/scripts"
-cp "$SCRIPTS_DIR/dev-validate-run" "$SCRIPTS_DIR/orch-env" "$SCRIPTS_DIR/resolve-base-branch" "$SCRIPTS_DIR/pr-view-json" "$SCRIPTS_DIR/pr-order" "$LAYOUT/orch/scripts/"
+cp "$SCRIPTS_DIR/dev-validate-run" "$SCRIPTS_DIR/worktree-push" "$SCRIPTS_DIR/orch-env" "$SCRIPTS_DIR/resolve-base-branch" "$SCRIPTS_DIR/pr-view-json" "$SCRIPTS_DIR/pr-order" "$LAYOUT/orch/scripts/"
 cp -R "$SCRIPTS_DIR/lib/." "$LAYOUT/orch/scripts/lib/"
 # Exercise the installed PR lookup chain; only its external gh calls are stubs.
 mkdir -p "$LAYOUT/github"
@@ -1115,6 +1115,7 @@ SH
 chmod +x "$GH_STUB_BIN/jq"
 cat > "$GH_STUB_BIN/gh" <<'SH'
 #!/usr/bin/env bash
+[[ -z "${STUB_PR_LOG:-}" || "${1:-} ${2:-}" != 'pr view' ]] || printf 'pr-view\n' >> "$STUB_PR_LOG"
 case "${1:-} ${2:-}" in
   "auth status") exit 0 ;;
   "pr view") path=pr-view ;;
@@ -1863,6 +1864,45 @@ done
 
 fi
 if [[ "$PART" != runner ]]; then
+# Direct delivery retains local validation even when CI covers a stale open PR
+# and the consumer requests push-first or a CI-only round.
+direct_validation() { # SCRIPT LABEL REQUEST SELECTION
+  local script="$1" label="$2" request="$3" preview="$4" proj dir
+  local args=()
+  proj="$(ci_proj "direct-validation-$label-${script##*/}" CI)"
+  sed 's/ORCH_PR_ORDER = "review-first"/ORCH_PR_ORDER = "push-first"/' "$proj/kendex.settings.toml" > "$proj/settings.next"
+  mv "$proj/settings.next" "$proj/kendex.settings.toml"
+  printf 'ORCH_DELIVERY = "push-base"\n' >> "$proj/kendex.settings.toml"
+  [[ "$preview" == none ]] || printf 'DEV_VALIDATE_SELECTION_CMD = "printf selection=%s"\n' "$preview" >> "$proj/kendex.settings.toml"
+  ci_world rules
+  : > "$TMP_ROOT/direct-rule-reads"
+  : > "$TMP_ROOT/direct-pr-reads"
+  [[ "$request" == full ]] || args=(--base HEAD)
+  RUN_PATH="$GH_STUB_BIN:$PATH" STUB_PR_LOG="$TMP_ROOT/direct-pr-reads" STUB_CI_LOG="$TMP_ROOT/direct-rule-reads" \
+    STUB_ANSWER=change_class=standard STUB_DOCS=false STUB_MEASURED=true \
+    run_script "$script" --worktree "$proj" --poll 1 --validate-mode "$request" ${args[@]+"${args[@]}"}
+  dir="$(run_dir_of "$OUT")"
+  [[ -n "$dir" ]] || { printf 'start-refused:%s\n' "$RC"; return 0; }
+  printf '%s|%s|%s|%s|%s\n' "$RC" "$(start_line "$dir" validate-mode)" \
+    "$(output_of "$OUT")" "$(cat "$TMP_ROOT/direct-pr-reads")" "$(cat "$TMP_ROOT/direct-rule-reads")"
+}
+for row in 'full|full|none|full|full' 'range|range|none|range|range' 'ci|ci|none|range|range' 'selected|full|all|full|full'; do
+  IFS='|' read -r label request preview want_mode want_output <<< "$row"
+  assert_eq "$(direct_validation "$CI_SCRIPT" "$label" "$request" "$preview")" "0|$want_mode|$want_output||" \
+    "$label direct delivery runs local validation without PR or protection reads"
+done
+cp "$CI_SCRIPT" "$CI_SCRIPT.delivery-control"
+mutate_file "$CI_SCRIPT.delivery-control" 'delivery="${delivery_line#delivery=}"' 'delivery=pr'
+assert_eq "$(direct_validation "$CI_SCRIPT.delivery-control" unread ci none)" \
+  '0|ci||pr-view|repos/{owner}/{repo}/rules/branches/main
+repos/{owner}/{repo}/branches/main' \
+  'control: ignoring direct delivery defers validation to PR CI'
+direct_invalid="$(ci_proj direct-invalid CI)"
+printf 'ORCH_DELIVERY = "unknown"\n' >> "$direct_invalid/kendex.settings.toml"
+run_script "$CI_SCRIPT" --worktree "$direct_invalid" --poll 1
+assert_eq "$RC|$(sed -n '/^dev-validate-run:/p' "$ERR")" '2|dev-validate-run: unreadable-setting setting=ORCH_DELIVERY' \
+  'an unreadable delivery setting refuses validation'
+
 # --- No process the run starts outlives it ------------------------------------
 # Each command leaves a grandchild behind and records its pid in the worktree.
 # One that calls setsid leaves the run's process group, which only a unit's

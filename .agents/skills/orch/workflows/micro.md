@@ -124,6 +124,8 @@ Read the branch both routes now stand on and initialize the item's workflow stat
 
 ## 3. Push And Open The PR
 
+`ORCH_DELIVERY` is resolved by `worktree-push` through [submit-pr.md](submit-pr.md) § 2. `push-base` keeps § 2's commit-chain validation and takes submit's direct completion route. **Main checkout only**, restore `[BASE_BRANCH]` before returning. Then go to § 5 with `PUSHED_SHA`, omit the PR and Merge rows, and include `Pushed commit`. Skip § 4. `pr` keeps the route below.
+
 **Run Workflow**: `⤵ workflows/submit-pr.md § 2 steps 1-4 → § 3 tail` with context `worktree`, `lifecycle: "managed"`, `issue_id`. That range owns the push and its `sha-reconcile:` routing, and the create. The body is the three lines below rather than step 3's template. No headings and no other section.
 
 ```markdown

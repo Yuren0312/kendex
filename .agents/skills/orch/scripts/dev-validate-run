@@ -155,6 +155,8 @@
 #          for the branch, unless its command reports selection=battery: every
 #          lane it has, none stood down for that class.
 #   ci     a round deferred to required CI after publication.
+#          ORCH_DELIVERY=push-base keeps the local range/full route because
+#          direct publication starts no PR CI. worktree-push owns that setting.
 #          It runs no command and completes the local round at once, with
 #          a zero-second wall time, only where the project names the status
 #          check context that runs its validation in DEV_VALIDATE_CI_CONTEXT
@@ -849,9 +851,14 @@ if [[ "$mode" == start || "$mode" == resolve ]]; then
   orphaned_sha=""
   cmd=""
   requested_mode="$validate_mode"
+  delivery_line="$("$SCRIPT_DIR/worktree-push" --resolve-delivery --worktree "$worktree")" \
+    || die unreadable-setting setting=ORCH_DELIVERY
+  delivery="${delivery_line#delivery=}"
+  # Direct delivery has no downstream CI to accept a deferred receipt.
+  if [[ "$delivery" == push-base && "$validate_mode" == ci ]]; then validate_mode=range; fi
   # pr-order owns the setting. A failed resolution retains review-first.
   pr_order=review-first
-  if order_line="$("$SCRIPT_DIR/pr-order" "$worktree")"; then
+  if [[ "$delivery" == pr ]] && order_line="$("$SCRIPT_DIR/pr-order" "$worktree")"; then
     pr_order="${order_line#pr-order=}"
   fi
   selection_previewed=false
@@ -880,7 +887,7 @@ if [[ "$mode" == start || "$mode" == resolve ]]; then
   classify "$class_base"
   # A ci request runs as range where CI may not run the checks for the change;
   # --help's ci mode names when.
-  if [[ "$validate_mode" == ci || "$pr_order" == push-first ]]; then
+  if [[ "$delivery" == pr && ( "$validate_mode" == ci || "$pr_order" == push-first ) ]]; then
     ci_admission_attempted=true
     classify ""
     [[ "$requested_mode" == full ]] || validate_mode=range
@@ -934,7 +941,7 @@ if [[ "$mode" == start || "$mode" == resolve ]]; then
         if [[ "$ci_admission_attempted" == false ]]; then
           classify ""
         fi
-        if [[ "$ci_admission_attempted" == false ]] && ci_class_covered true && ci_runs_validation; then
+        if [[ "$delivery" == pr && "$ci_admission_attempted" == false ]] && ci_class_covered true && ci_runs_validation; then
           validate_mode=ci
           class_base=""
         else

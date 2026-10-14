@@ -87,6 +87,14 @@ The full session from inside a worktree: implement → publication and review in
 
 ### 2.1 Open Early
 
+Ask the publication owner before selecting an early PR order:
+
+```bash
+.agents/skills/orch/scripts/worktree-push --resolve-delivery --worktree [WORKTREE_PATH] --issue [ISSUE_ID]
+```
+
+`delivery=push-base` records `pr_order` as `review-first` through the state command below, then goes directly to the caller's internal review step. It opens no early PR. A refusal stops the session. `delivery=pr` continues below.
+
 Read the consumer's publication order through `pr-order --help`:
 
 ```bash
@@ -135,6 +143,8 @@ Before submit-pr can arm the PR, move a Linear development item to In Review. Re
 **Run Workflow**: `⤵ workflows/submit-pr.md § 1-7 → § 5` with context `worktree`, `lifecycle: "managed"`, `issue_id`. After an `open-first` § 2.1 this pass updates the open pull request: its § 2 step 1 pushes § 3's fix round with the fixes for Copilot's threads in one push, then writes § 3's verdict line and routes the pushed head, and its step 5 arms the head once § 3 has returned.
 
 ## 5. Finalize
+
+**Direct delivery.** A successful `DELIVERY=push-base` return from submit-pr completes this session with `PUSHED_SHA`. Retire agents through § 5.4, then return that commit. Submit sent the completion notice for the overseer's existing direct-push cycle. Skip the PR summary, merge gates and § 5.5. A failed direct publication returns its named stop and keeps the worktree.
 
 Before either summary, `MERGE_READY = false` preserves submit-pr's stop or creates `merge-gates-unmet`:
 

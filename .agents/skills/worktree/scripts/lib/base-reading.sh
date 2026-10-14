@@ -58,11 +58,17 @@ base_policy_read() { # WT BRANCH
 #   trial-failed    queue policy, and the trial merge could not run
 #   behind          any other policy
 # Only contained and merges-cleanly let the branch go without a rebase.
-base_reading() { # WT BRANCH BASE_REF
+base_reading() { # WT BRANCH BASE_REF [REQUIRE_CONTAINMENT]
   local wt="$1" branch="$2" base_ref="$3" rc=0
   BASE_POLICY=""
   if git -C "$wt" merge-base --is-ancestor "$base_ref" HEAD 2>/dev/null; then
     BASE_READING=contained
+    return 0
+  fi
+  # A direct push cannot use a queue's trial merge as publication proof.
+  # It needs containment and no GitHub policy lookup.
+  if [[ "${4:-false}" == true ]]; then
+    BASE_READING=behind
     return 0
   fi
   base_policy_read "$wt" "$branch"
