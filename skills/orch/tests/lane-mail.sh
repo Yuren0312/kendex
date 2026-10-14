@@ -10,6 +10,7 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/git-env.sh"
 unset ORCH_ARCHIVE_ROOT
+export MSYS=winsymlinks:nativestrict
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)"
 LANE_MAIL="$REPO_ROOT/skills/mailbox/scripts/lane-mail"
@@ -88,6 +89,76 @@ text() { # NAME CONTENT
 }
 
 echo "=== lane-mail ==="
+
+root_subdir() {
+  lm ask --item KEN-1 --root tmp/lane-mail --file "$(text root 'Which checkout?')"
+  assert_eq "$RC=$ERR=$OUT" "2=lane-mail: root-not-checkout=tmp/lane-mail top=$LANE=" \
+    "a mailbox directory refuses as a checkout root"
+  assert_eq "$(wc -l < "$TMP_ROOT/err" | tr -d ' ')" 1 "the root refusal is one keyed line"
+  assert_eq "$([ -e "$LANE/tmp/lane-mail/tmp" ] && echo written || echo untouched)" untouched \
+    "a refused root writes no nested mailbox"
+}
+new_lane root_base
+git -C "$LANE" config gc.auto 0
+git -C "$LANE" config maintenance.auto false
+git -C "$LANE" -c user.name=Test -c user.email=test@example.com commit -q --allow-empty -m root
+git -C "$LANE" worktree add -q -b root-lane "$TMP_ROOT/root-lane"
+LANE="$TMP_ROOT/root-lane"
+mkdir -p "$LANE/tmp/lane-mail"
+ln -s "$LANE" "$TMP_ROOT/root-link"
+root_subdir
+for root in "$LANE" "$TMP_ROOT/root-link" omitted; do
+  args=()
+  [ "$root" = omitted ] || args=(--root "$root")
+  lm ask --item KEN-1 ${args[@]+"${args[@]}"} --file "$(text root "Checkout $root?")"
+  assert_eq "$RC=$(jq -r 'select(.id == "'"${OUT#id=}"'") | .text' "$LANE/tmp/lane-mail/KEN-1/to-overseer.jsonl")" \
+    "0=Checkout $root?" "$root: an ask lands in the worktree mailbox"
+done
+
+# Each envelope writer selects the same root owner before any mailbox effect.
+for verb in ask notice send resolve; do
+  args=()
+  case "$verb" in
+    ask | notice) args=(--file "$(text root 'Which checkout?')") ;;
+    send) args=(--directive --file "$(text root 'Which checkout?')") ;;
+    resolve) args=(--id missing) ;;
+  esac
+  item=KEN-1
+  [[ "$verb" != resolve ]] || item=overseer
+  lm "$verb" --item "$item" --root tmp/lane-mail ${args[@]+"${args[@]}"}
+  assert_eq "$RC=${ERR%% top=*}" '2=lane-mail: root-not-checkout=tmp/lane-mail' \
+    "$verb: a mailbox directory cannot receive envelope writes"
+  assert_eq "$([ -e "$LANE/tmp/lane-mail/tmp" ] && echo written || echo untouched)" untouched \
+    "$verb: the refusal creates no nested mailbox"
+done
+root_reads() {
+  mkdir -p "$TMP_ROOT/read-directory"
+  for verb in pending drain inbox events watch; do
+    args=()
+    [[ "$verb" != drain ]] || args=(--after 0)
+    [[ "$verb" != inbox ]] || args=(--peek)
+    if [[ "$verb" == watch ]]; then
+      args=(--once)
+      printf '{"id":"read-wake","kind":"directive","text":"Wake"}\n' > "$TMP_ROOT/read-directory/tmp/lane-mail/KEN-1/to-lane.jsonl"
+    fi
+    lm "$verb" --item KEN-1 --root "$TMP_ROOT/read-directory" ${args[@]+"${args[@]}"}
+    assert_eq "$RC=$ERR" '0=' "$verb: reads keep their existing directory root contract"
+  done
+  clock_lm wait --item KEN-1 --root "$TMP_ROOT/read-directory" --id missing --timeout 1 --interval 1
+  assert_eq "$RC" 124 'wait: a read timeout keeps its existing directory root contract'
+}
+root_reads
+root_compact() {
+  mkdir -p "$TMP_ROOT/compact-directory"
+  lm compact --item overseer --root "$TMP_ROOT/compact-directory"
+  assert_eq "$RC=$ERR" '0=' 'compact: retention keeps its existing outside-Git root contract'
+}
+root_compact
+lm ask --item KEN-1 --root "$TMP_ROOT/removed-write-root" --file "$(text root 'Which checkout?')"
+assert_eq "$RC=${ERR%% top=*}" "2=lane-mail: root-not-checkout=$TMP_ROOT/removed-write-root" \
+  'a missing root cannot receive an envelope write'
+assert_eq "$([[ -e "$TMP_ROOT/removed-write-root" ]] && echo written || echo untouched)" untouched \
+  'a refused missing root creates no mailbox'
 
 new_lane envelope
 lm ask --item KEN-1 --file "$(text q 'Cut the scanner?')" --options cut,keep
@@ -1460,6 +1531,30 @@ done
 # to the shipped rest (lane-mail resolves its lock library, the transport and
 # the checkout judge beside itself), and removes one behaviour.
 
+mutant unchecked-root 'if [ -z "$top" ] || [ "$canonical" != "$top" ]; then' \
+  'if false && { [ -z "$top" ] || [ "$canonical" != "$top" ]; }; then'
+LANE="$TMP_ROOT/root-lane"
+ROOT_ASSERT_RC=0
+( FAIL=0; root_subdir; [ "$FAIL" -eq 0 ] ) >"$TMP_ROOT/root-control.out" || ROOT_ASSERT_RC=$?
+assert_eq "$ROOT_ASSERT_RC" 1 "control: removing the checkout check fails the same refusal assertions"
+assert_eq "$(jq -r '.text' "$LANE/tmp/lane-mail/tmp/lane-mail/KEN-1/to-overseer.jsonl")" 'Which checkout?' \
+  "control: the old root behavior writes the question where no overseer reads"
+
+# shellcheck disable=SC2016  # Mutations use literal production text.
+mutant checked-reads 'ask | notice | send | resolve | peer)' \
+  'ask | notice | send | resolve | peer | pending | drain | inbox | events | watch | wait)'
+LANE="$TMP_ROOT/root-lane"
+ROOT_ASSERT_RC=0
+( FAIL=0; root_reads; [ "$FAIL" -eq 0 ] ) >"$TMP_ROOT/read-root-control.out" || ROOT_ASSERT_RC=$?
+assert_eq "$ROOT_ASSERT_RC" 1 'control: applying checkout validation to reads fails the same read-root assertions'
+
+# shellcheck disable=SC2016  # Mutations use literal production text.
+mutant checked-compact 'ask | notice | send | resolve | peer)' \
+  'ask | notice | send | resolve | compact | peer)'
+ROOT_ASSERT_RC=0
+( FAIL=0; root_compact; [ "$FAIL" -eq 0 ] ) >"$TMP_ROOT/compact-root-control.out" || ROOT_ASSERT_RC=$?
+assert_eq "$ROOT_ASSERT_RC" 1 'control: applying checkout validation to compact fails the same outside-Git assertion'
+
 new_lane control_wait_cursor
 LANE_MAIL_BIN="$LANE_MAIL" lm ask --item KEN-1 --file "$(text q 'Read once?')"
 WAIT_ID="${OUT#id=}"
@@ -1548,7 +1643,7 @@ mutant interval-overshoots '[ "$LEFT" -ge "$NAP" ] || NAP="$LEFT"' ':'
 clock_lm wait --item KEN-1 --id "$OVERSHOOT_ID" --timeout 1 --interval 5
 assert_eq "$RC=$SLEPT" "124=5" "control: without the cap the wait sleeps the whole interval past its deadline"
 
-mutant unowned-send 'if { [ "$VERB" = send ] || [ "$VERB" = resolve ]; } && [ "$HOST" -eq 0 ]; then' 'if false; then'
+mutant unowned-send 'if [ "$2" = own ] || [ "$VERB" = send ] || [ "$VERB" = resolve ]; then' 'if false; then'
 LANE="$PEER_A"
 lm send --item KEN-1 --root "$PEER_B" --directive --file "$(text d 'Not yours.')"
 assert_eq "$RC=$(jq -r '.text' < "$PEER_B/tmp/lane-mail/KEN-1/to-lane.jsonl")" "0=Not yours." \
