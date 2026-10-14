@@ -69,7 +69,7 @@ WORKFLOW="$ROOT/.github/workflows/skill-tests.yml"
 [ -f "$GH_EVAL" ] || { echo "missing $GH_EVAL" >&2; exit 1; }
 AGGREGATE="$ROOT/tools/ci-aggregate"
 
-step_field() { # WORKFLOW JOB ID_OR_NAME FIELD: base, directory or run body
+step_field() { # WORKFLOW JOB ID_OR_NAME FIELD: base, step/checkout input or run body
   awk -v job="$2:" -v id="$3" -v field="$4" '
     /^  [A-Za-z0-9_-]+:/ { in_job = ($1 == job); in_step = 0; in_run = 0 }
     /^      - / { in_step = (in_job && ($0 == "      - id: " id || $0 == "      - name: " id)); in_run = 0 }
@@ -79,6 +79,9 @@ step_field() { # WORKFLOW JOB ID_OR_NAME FIELD: base, directory or run body
     }
     field == "working-directory" && /^        working-directory: / {
       sub(/^        working-directory: /, ""); print
+    }
+    (field == "ref" || field == "path" || field == "fetch-depth") && $1 == field ":" {
+      sub(/^          [^:]+: /, ""); print
     }
     field == "run" && /^        run: / {
       sub(/^        run: /, "")
@@ -228,7 +231,7 @@ patch_upload_order() { # WORKFLOW — sequence of the selector and patch upload
 }
 check "patch upload follows actual PR selection" 'select
 upload' "$(patch_upload_order "$WORKFLOW")"
-plant "$WORKFLOW" '        uses: actions/upload-artifact@v4' '        uses: actions/download-artifact@v4' "$TMP/no-patch-upload.yml" changes
+plant "$WORKFLOW" 'uses: actions/upload-artifact@' 'uses: actions/download-artifact@' "$TMP/no-patch-upload.yml" changes
 check "must-fail: no patch upload loses recorded coverage" select "$(patch_upload_order "$TMP/no-patch-upload.yml")"
 
 # A shard matrix key's expression, `os` or `shard`, the `${{ }}` stripped.
@@ -812,13 +815,9 @@ check "must-fail: a run step the table does not hold is named" "missing=planted 
 
 # The secrets scan in the content-scan job judges each pull request commit
 # against its own parents, which only the whole history (depth 0) holds.
-checkout_depth() { # WORKFLOW JOB — fetch-depth of the job's actions/checkout step, or none
+checkout_depth() { # WORKFLOW JOB — the candidate checkout's depth, or none
   local depth
-  depth="$(awk -v job="$2" '
-    /^  [A-Za-z0-9_-]+:/ { in_job = ($1 == job ":"); next }
-    in_job && /^      - / { in_co = ($0 ~ /uses: actions\/checkout@/) }
-    in_job && in_co && /^          fetch-depth: / { print $2 }
-  ' "$1")"
+  depth="$(step_field "$1" "$2" candidate-checkout fetch-depth)" || return 1
   printf '%s' "${depth:-none}"
 }
 SCAN_JOB="$(job_of_run "$WORKFLOW" "$DOC_LIMITS")"
@@ -828,6 +827,81 @@ check "the content-scan job checks out the whole history, every commit's parents
 plant "$WORKFLOW" "          fetch-depth: 0" "" "$TMP/wf-shallow.yml" "$SCAN_JOB"
 check "must-fail: a content-scan checkout without fetch-depth 0 is named" "none" \
   "$(checkout_depth "$TMP/wf-shallow.yml" "$SCAN_JOB")"
+
+# The pull-request producer can replace its guard scripts and exclusions.
+# Use the template suite's neutral credential fixture with this source
+# workflow's actual checkout inputs and scan body. No candidate script may
+# run first: it shares the runner directory with the scanner executable.
+check "the credential scan runs before candidate scripts" "$SECRETS_STEP" \
+  "$(job_steps "$WORKFLOW" "$SCAN_JOB" | awk -F '\t' '$3 == "yes" { print $1; exit }')"
+CREDENTIAL_REPO="$TMP/credential-source"
+mkdir -p "$CREDENTIAL_REPO/skills/commit-guards"
+git -C "$CREDENTIAL_REPO" init -q -b main
+git -C "$CREDENTIAL_REPO" config user.email credential-fixture@example.invalid
+git -C "$CREDENTIAL_REPO" config user.name credential-fixture
+git -C "$CREDENTIAL_REPO" config gc.auto 0
+git -C "$CREDENTIAL_REPO" config maintenance.auto false
+cp -R "$ROOT/skills/commit-guards/scripts" "$CREDENTIAL_REPO/skills/commit-guards/"
+git -C "$CREDENTIAL_REPO" add -A
+git -C "$CREDENTIAL_REPO" commit -qm base
+git -C "$CREDENTIAL_REPO" checkout -qb candidate
+for script in install-gitleaks secrets; do
+  printf '#!/usr/bin/env bash\nprintf ran >"$RUNNER_TEMP/candidate-code-ran"\nexit 0\n' \
+    >"$CREDENTIAL_REPO/skills/commit-guards/scripts/$script"
+done
+printf '%s\n' "AKIA""Z7Q3R5T2V4X6Y7W2" >"$CREDENTIAL_REPO/cred.txt"
+mkdir -p "$CREDENTIAL_REPO/tools"
+printf '*\tthe candidate excludes every path\n' >"$CREDENTIAL_REPO/tools/secrets-excludes"
+git -C "$CREDENTIAL_REPO" add -A
+git -C "$CREDENTIAL_REPO" commit -qm 'candidate guard fixture'
+git -C "$CREDENTIAL_REPO" checkout -qb pr-merge main
+git -C "$CREDENTIAL_REPO" merge -q --no-ff candidate -m merge
+if ! GITLEAKS_BIN="$(command -v gitleaks)"; then
+  "$ROOT/skills/commit-guards/scripts/install-gitleaks" "$TMP/gitleaks"
+  GITLEAKS_BIN="$TMP/gitleaks/gitleaks"
+fi
+
+# Keep the scanner call and its flags, but execute the candidate's copy.
+# This inverse control must lose both refusal and source isolation.
+plant "$WORKFLOW" '/guards/skills/commit-guards/scripts/secrets' \
+  '/candidate/skills/commit-guards/scripts/secrets' "$TMP/candidate-scanner.yml" "$SCAN_JOB"
+while IFS='|' read -r row wf expected; do
+  root="$TMP/credential-$row"
+  mkdir -p "$root/runner/gitleaks"
+  cp "$GITLEAKS_BIN" "$root/runner/gitleaks/gitleaks"
+  for checkout in candidate-checkout 'the credential guards, from the default branch'; do
+    path="$(step_field "$wf" "$SCAN_JOB" "$checkout" path)" || exit 1
+    ref="$(step_field "$wf" "$SCAN_JOB" "$checkout" ref)" || exit 1
+    depth="$(step_field "$wf" "$SCAN_JOB" "$checkout" fetch-depth)" || exit 1
+    [ -n "$path" ] || { echo 'credential checkout has no path' >&2; exit 1; }
+    case "$ref" in
+      '') branch=pr-merge ;;
+      '${{ github.event.repository.default_branch }}') branch=main ;;
+      *) echo 'credential checkout has an unsupported ref' >&2; exit 1 ;;
+    esac
+    if [ "$depth" = 0 ]; then
+      git clone -q --no-hardlinks --branch "$branch" "$CREDENTIAL_REPO" "$root/$path"
+    else
+      git clone -q --depth "${depth:-1}" --branch "$branch" "file://$CREDENTIAL_REPO" "$root/$path"
+    fi
+  done
+  work="$(step_field "$wf" "$SCAN_JOB" "$SECRETS_STEP" working-directory)" || exit 1
+  body="$(step_field "$wf" "$SCAN_JOB" "$SECRETS_STEP" run)" || exit 1
+  [ -n "$body" ] || { echo 'credential scan has no run body' >&2; exit 1; }
+  status=0
+  (cd -- "$root/${work:-.}" && env -i PATH="$PATH" HOME="$root" \
+    KENDEX_REAL_HOME=1 CI=true GITHUB_ACTIONS=true GITHUB_WORKSPACE="$root" RUNNER_TEMP="$root/runner" \
+    "$BASH" --noprofile --norc -e -o pipefail -c "$body") >"$root/out" 2>&1 || status=$?
+  finding=no
+  if grep -qx 'secrets: secret=cred.txt:1:aws-access-token' "$root/out"; then finding=yes; fi
+  candidate=no
+  [ ! -e "$root/runner/candidate-code-ran" ] || candidate=yes
+  check "$row: scan exit, credential finding, and candidate execution" \
+    "$expected" "$status:$finding:$candidate"
+done <<ROWS
+trusted|$WORKFLOW|1:yes:no
+must-fail|$TMP/candidate-scanner.yml|0:no:yes
+ROWS
 
 # Execute the decision step read from the workflow, not a second invocation
 # written by the test. The create-decision workflow can allocate D035 on two
@@ -995,14 +1069,14 @@ done
 concurrency_rows=0
 while IFS='|' read -r event group cancel; do
   concurrency_rows=$((concurrency_rows + 1))
-  concurrency_ctx="$(jq -cn --arg e "$event" '{github: {event_name: $e, run_id: 7}}
+  concurrency_ctx="$(jq -cn --arg e "$event" '{github: {workflow: "fixture-ci", event_name: $e, run_id: 7}}
     | if $e == "pull_request" then .github.event = {pull_request: {number: 42}} else . end')"
   check "a $event run's concurrency group and cancel" "$group $cancel" \
     "$(concurrency_value "$WORKFLOW" group "$concurrency_ctx") $(concurrency_value "$WORKFLOW" cancel-in-progress "$concurrency_ctx")"
 done <<'ROWS'
-pull_request|skill-tests-pull_request-42|true
-merge_group|skill-tests-merge_group-7|false
-push|skill-tests-push-7|false
+pull_request|fixture-ci-pull_request-42|true
+merge_group|fixture-ci-merge_group-7|false
+push|fixture-ci-push-7|false
 ROWS
 [ "$concurrency_rows" -ge 3 ] || { echo "the concurrency table read $concurrency_rows rows" >&2; exit 1; }
 plant "$WORKFLOW" "cancel-in-progress: \${{ github.event_name == 'pull_request' }}" "cancel-in-progress: true" \
