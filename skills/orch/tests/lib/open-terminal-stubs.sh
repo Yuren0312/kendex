@@ -235,6 +235,25 @@ cat > "$1/ghostty" <<'STUBEOF'
 exit 0
 STUBEOF
 chmod +x "$1/worktree" "$1/gh" "$1/tmux" "$1/ghostty" "$1/sleep"
+# Synchronous handoff reads use SSH, independently of the terminal prefix.
+# A neutral host has no handoff. Integration rows execute the real judge in
+# an isolated remote worktree, with no control-host state environment.
+cat > "$1/ssh" <<'STUBEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$OT_TMUX_LOG.handoff"
+[[ "$*" == *'workflow-state handoff-standing '* ]] || exit 2
+[[ -z "${OT_HANDOFF_READY_FILE:-}" || -f "$OT_HANDOFF_READY_FILE" ]] || exit 1
+[[ "${OT_HANDOFF_SSH_STATUS:-0}" == 0 ]] || { printf 'ssh-fixture: failed\n' >&2; exit "$OT_HANDOFF_SSH_STATUS"; }
+if [[ -n "${OT_HANDOFF_ANSWER:-}" ]]; then printf '%s\n' "$OT_HANDOFF_ANSWER"; exit 0; fi
+if [[ -n "${OT_HANDOFF_WORKTREE:-}" ]]; then
+  line="${!#}"
+  line="${line//\/srv\/lane/$OT_HANDOFF_WORKTREE}"
+  exec env -i PATH="$PATH" HOME="$OT_HANDOFF_WORKTREE" "$BASH" -c "$line"
+fi
+printf 'workflow-state: handoff-standing=none\n'
+STUBEOF
+chmod +x "$1/ssh"
 }
 
 # Read the remote command from a pane log and remove the two shell-quote
@@ -255,7 +274,7 @@ ot_replay_relaunch() { # LINE SCRIPTS RUN HARNESS KIND STATUS [ITEM]
   )" || return 1
   [[ -n "$unattended" ]] || { echo "ot-replay-relaunch: unattended-text=empty" >&2; return 1; }
   mkdir -p "$sandbox/.agents/skills/orch" "$sandbox/tmp/lane-mail/$item" "$home" "$run/harness-bin" || return 1
-  ln -s "$scripts" "$sandbox/.agents/skills/orch/scripts" || return 1
+  [[ -e "$sandbox/.agents/skills/orch/scripts" ]] || ln -s "$scripts" "$sandbox/.agents/skills/orch/scripts" || return 1
   orch_fixture_shared_libs "$sandbox/.agents/skills/orch"
   case "$harness" in
     codex) root="$home/codex account/sessions"; expected_prompt="Read .agents/skills/orch/SKILL.md and execute the orch start workflow for $item. $unattended" ;;
@@ -298,6 +317,24 @@ ot_replay_relaunch() { # LINE SCRIPTS RUN HARNESS KIND STATUS [ITEM]
 #!/usr/bin/env bash
 # NUL preserves argument boundaries, including spaces and an empty resume id.
 printf '%s\0' __run__ "$@" >> "$HARNESS_LOG"
+if [[ "${HANDOFF_PROBE:-false}" == true ]]; then
+  fresh=true
+  for arg in "$@"; do
+    case "$arg" in resume | --session) fresh=false ;; esac
+  done
+  state=not-start remaining="" resumed=skipped
+  if [[ "$fresh" == true ]]; then
+    source .agents/skills/orch/scripts/lib/lane-state.sh || exit 2
+    lane_handoff_standing "$PWD" "$HANDOFF_LOG.err" .agents/skills/orch/scripts/workflow-state handoff-standing "$HANDOFF_ITEM"
+    state="$LANE_HANDOFF_STATE"
+    if [[ "$state" == stands ]]; then
+      remaining="$(jq -r '.remaining' <<<"$LANE_HANDOFF_RECORD")" || exit 2
+      resumed=0
+      .agents/skills/orch/scripts/workflow-state handoff-resume "$HANDOFF_ITEM" > "$HANDOFF_LOG.resume" 2>&1 || resumed=$?
+    fi
+  fi
+  printf 'state=%s\nremaining=%s\nresume=%s\n' "$state" "$remaining" "$resumed" > "$HANDOFF_LOG"
+fi
 exit "$HARNESS_RC"
 EOF
   chmod +x "$run/harness-bin/$harness" || return 1
@@ -306,6 +343,7 @@ EOF
   line="${line/cd \/srv\/lane /cd $sandbox }"
   env -i GIT_CEILING_DIRECTORIES="$GIT_CEILING_DIRECTORIES" PATH="$run/harness-bin:$PATH" HOME="$home" CODEX_HOME="$home/codex account" \
     PI_CODING_AGENT_DIR="$home/pi agent" HARNESS_LOG="$run/harness.log" HARNESS_RC="$status" \
+    HANDOFF_PROBE="${OT_REPLAY_HANDOFF:-false}" HANDOFF_LOG="$run/handoff.log" HANDOFF_ITEM="$item" \
     bash -c "$line" 2> "$run/replay.err" || rc=$?
   while IFS= read -r -d '' arg; do
     case "$previous" in
