@@ -51,12 +51,24 @@
 # chain belongs to the caller's commit, which direct publication repeats after
 # a rewrite. PR restack checks omit this option and keep their current policy.
 #
-# Output, one line on stdout:
+# Output without --publication-tier, or with small or standard, is one stdout line:
 #   restack=skip condition=no-conflict|version-only run-dir=DIR validated-head=SHA head=SHA paths=P[,P...]|none   exit 0
 #   restack=retest cause=CAUSE [path=P] [run-dir=DIR]                                                           exit 1
 # paths= names the files the merge left conflicted, none for no-conflict.
+# With --publication-tier micro, readable classification prints item-tier's
+# tier= line first. The second stdout line is:
+#   publication=ready tier=micro                                                                            exit 0
+#   restack=retest cause=tier-widened                                                                        exit 1
+# Unreadable micro classification prints only restack=retest cause=tier-unreadable
+# on stdout and exits 1. A usage error prints restack-skip: KEY [FIELD...] on
+# stderr and exits 2. An invalid publication tier uses invalid-tier tier=VALUE.
 # Causes:
 #   no-passing-run    the worktree holds no reusable run with a recorded tree
+#   local-pass-required  small or standard publication selected a no-verdict
+#                     run; direct delivery requires passing local validation
+#   tier-unreadable   item-tier could not classify the committed micro diff
+#   tier-widened      the committed micro diff requires a wider tier; take
+#                     the caller's tier escape
 #   newer-red         a newer run failed or has unreadable evidence; run-dir=
 #                     names it. A no-verdict run whose log holds no finding
 #                     line reuses its recorded tree with the same rules, as
