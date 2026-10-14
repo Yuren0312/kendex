@@ -229,11 +229,11 @@ run_hook() { # WORLD PAYLOAD [PATH]
   cp "$HOOK" "$hook"
   set +e
   if [ -n "${3:-}" ]; then
-    (cd "$cwd" && printf '%s' "$2" | env -i HOME="$home" PWD="$cwd" PATH="$3" \
-      GIT_CEILING_DIRECTORIES="$TMP_ROOT" "$BASH_BIN" "$hook") >/dev/null 2>"$ERR_FILE"
+    (cd "$cwd" && env -i HOME="$home" PWD="$cwd" PATH="$3" \
+      GIT_CEILING_DIRECTORIES="$TMP_ROOT" "$BASH_BIN" "$hook" <<<"$2") >/dev/null 2>"$ERR_FILE"
   else
-    (cd "$cwd" && printf '%s' "$2" | env HOME="$home" GIT_CEILING_DIRECTORIES="$TMP_ROOT" \
-      "$BASH_BIN" "$hook") >/dev/null 2>"$ERR_FILE"
+    (cd "$cwd" && env HOME="$home" GIT_CEILING_DIRECTORIES="$TMP_ROOT" \
+      "$BASH_BIN" "$hook" <<<"$2") >/dev/null 2>"$ERR_FILE"
   fi
   rc=$?
   set -e
