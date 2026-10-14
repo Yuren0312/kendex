@@ -99,6 +99,9 @@
 # Repair and rerun recover the worktree-private publication receipt without
 # another transport. Direct pushes pass the recorded tier to worktree's
 # conditional orch check before transport, including automatic rebases.
+# Linear direct delivery also prints direct-push-time: at=<UTC> from the
+# cycle owner's repository activity reader. A failed time read returns nonzero
+# with delivery-time-unread; completion must wait for repair and rerun.
 #
 # The wrapper accepts only the named options above.
 # State directory resolution is defined by `workflow-state --help`.
@@ -184,6 +187,7 @@ message() {
 	missing-value) printf 'The option requires a value.\n' ;;
 	required) printf 'The required option is missing.\n' ;;
 	delivery-invalid) printf 'ORCH_DELIVERY must be pr or push-base. No push ran.\n' ;;
+	delivery-time-unread) printf 'The base push landed but its tracker completion time could not be read. Repair the named cause and rerun before sending completion.\n' ;;
 	delivery-unrecorded) printf 'The base push landed but its publication record is missing. Read the base history before retrying.\n' ;;
 	invalid-issue) printf 'The issue ID must be safe for a state file path.\n' ;;
 	check-argument) printf 'The wrapper cannot accept this argument or option combination.\n' ;;
@@ -485,7 +489,8 @@ fi
 pending_validation_file="${restack_map_file%/*}/kendex-restack-validation"
 pending_validation_tmp=''
 push_out=''
-trap 'rm -f -- "$pending_validation_tmp" "$push_out"' EXIT
+push_time_dir=''
+trap 'rm -f -- "$pending_validation_tmp" "$push_out"; if [[ -n "$push_time_dir" ]]; then rm -f -- "$push_time_dir/activity.json" "$push_time_dir/push.err" "$push_time_dir/pushes"; rmdir -- "$push_time_dir"; fi' EXIT
 
 # The map is a SHA repair receipt, not a publication receipt. Keep timing in
 # its own private record before clearing a reconciled pre-push map, so a
@@ -610,5 +615,34 @@ if [[ "$push_rc" == 0 && -n "$restack_validation_head" ]]; then
 fi
 if [[ "$push_rc" == 0 && "$delivery" == push-base ]]; then
 	[[ -n "$pushed_record" ]] || fail_post_push delivery-unrecorded "issue=$issue" push-exit=0
+	# GitHub items keep their Closes commit line. Linear completion uses the
+	# cycle owner's repository-activity reading, never the commit's date.
+	if [[ ! "$issue" =~ ^[Ii][Ss][Ss][Uu][Ee]-[0-9]+$ ]]; then
+		for helper in "$SCRIPT_DIR/lib/lane-gitfile.sh" "$SCRIPT_DIR/../../github/scripts/lib/gh-repo.sh"; do
+			[[ -f "$helper" ]] || fail_post_push delivery-time-unread cause=helper-missing "path=$helper" push-exit=0
+		done
+		source "$SCRIPT_DIR/lib/lane-gitfile.sh" || fail_post_push delivery-time-unread cause=helper-unread push-exit=0
+		source "$SCRIPT_DIR/../../github/scripts/lib/gh-repo.sh" || fail_post_push delivery-time-unread cause=helper-unread push-exit=0
+		oversee_info="$("$WORKFLOW_STATE" ${state_flags[@]+"${state_flags[@]}"} exists --json oversee)" \
+			|| fail_post_push delivery-time-unread cause=state-unreadable push-exit=0
+		oversee_present="$(jq -er 'if (.exists | type) == "boolean" then .exists | tostring else error("invalid exists result") end' <<<"$oversee_info")" \
+			|| fail_post_push delivery-time-unread cause=state-unreadable push-exit=0
+		oversee_lane='{}'
+		if [[ "$oversee_present" == true ]]; then
+			oversee_state="$("$WORKFLOW_STATE" ${state_flags[@]+"${state_flags[@]}"} get oversee)" \
+				|| fail_post_push delivery-time-unread cause=state-unreadable push-exit=0
+			oversee_lane="$(jq -c --arg item "$issue" '[.lanes[]? | select(.item == $item)] | first // {}' <<<"$oversee_state")" \
+				|| fail_post_push delivery-time-unread cause=state-unreadable push-exit=0
+		fi
+		push_repo="$(jq -r '.repo // empty' <<<"$oversee_lane")" \
+			|| fail_post_push delivery-time-unread cause=state-unreadable push-exit=0
+		pushed_commit="${pushed_record##* commit=}"
+		mkdir -p "$worktree_abs/tmp" || fail_post_push delivery-time-unread cause=scratch-unwritable push-exit=0
+		push_time_dir="$(mktemp -d "$worktree_abs/tmp/direct-time.XXXXXX")" \
+			|| fail_post_push delivery-time-unread cause=scratch-unwritable push-exit=0
+		lane_push_time "$push_repo" "$SCRIPT_DIR/resolve-base-branch" "$worktree_abs" "$oversee_lane" "$pushed_commit" "$push_time_dir"
+		[[ -n "$MERGED_AT" ]] || fail_post_push delivery-time-unread "cause=$MERGED_CAUSE" "commit=$pushed_commit" push-exit=0
+		printf 'direct-push-time: at=%s\n' "$MERGED_AT"
+	fi
 fi
 exit "$push_rc"

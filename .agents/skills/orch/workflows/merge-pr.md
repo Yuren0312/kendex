@@ -347,7 +347,7 @@ Use the output as `MAIN_REPO_ROOT`.
 
 2. **Complete the issue and close a finished container** — **Linear only**. Skip the WHOLE step for GitHub work items: resolve the tracker first; an `issue-N` key in any casing is a GitHub item.
 
-   The lane owns completion after merge. The overseer owns the remaining post-merge checks on the same item.
+   The lane owns completion after merge or direct publication. The overseer owns the remaining post-merge checks on the same item. A direct caller returns to submit-pr after this step, before step 3. For that caller, each `rerun merge-pr` instruction below repeats this completion step through submit-pr.
 
    Give every development remainder from a cut its own issue or bundle before completion. Prove every branch-provable Done-when box before merge. Keep post-merge boxes on `[ISSUE]` in the form the project-management skill's SKILL.md § Disposition states. Each box names its reading, location, why the branch cannot prove it, and a UTC deadline no later than three days after merge.
 
@@ -357,11 +357,13 @@ Use the output as `MAIN_REPO_ROOT`.
    [MAIN_REPO_ROOT]/.agents/skills/linear/scripts/linear.sh issues get [ISSUE]
    ```
 
+   On PR delivery, read the merge time:
+
    ```bash
    env -u GH_REPO -u GITHUB_REPOSITORY gh pr view [PR_NUMBER] --json mergedAt --jq .mergedAt
    ```
 
-   Use that live UTC timestamp as `[MERGED_AT]`. An absent or unreadable timestamp is a tracker-completion failure.
+   Use that live UTC timestamp as `[MERGED_AT]`. On direct delivery, submit-pr supplies `[MERGED_AT]=[PUSHED_AT]` from the publication owner's repository activity record; skip the PR read. An absent or unreadable timestamp is a tracker-completion failure.
 
    ```bash
    [MAIN_REPO_ROOT]/.agents/skills/linear/scripts/linear.sh issues complete [ISSUE] --post-merge-at [MERGED_AT] --done-when-met [MET_BOXES]

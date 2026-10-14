@@ -144,7 +144,7 @@ Before submit-pr can arm the PR, move a Linear development item to In Review. Re
 
 ## 5. Finalize
 
-**Direct delivery.** A successful `DELIVERY=push-base` return from submit-pr completes this session with `PUSHED_SHA`. Retire agents through § 5.4, then return that commit. Submit sent the completion notice for the overseer's existing direct-push cycle. Skip the PR summary, merge gates and § 5.5. A failed direct publication returns its named stop and keeps the worktree.
+**Direct delivery.** A successful `DELIVERY=push-base` return from submit-pr completes this session with `PUSHED_SHA`. Retire agents through § 5.4, then return that commit. Submit completed the Linear item and its finished-container route, leaving open post-merge checks Verifying, then sent the completion notice for the overseer's existing direct-push cycle. Skip the PR summary, merge gates and § 5.5. A failed direct publication returns its named stop and keeps the worktree.
 
 Before either summary, `MERGE_READY = false` preserves submit-pr's stop or creates `merge-gates-unmet`:
 

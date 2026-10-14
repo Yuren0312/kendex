@@ -130,7 +130,7 @@ Record the tier for the publication owner:
 
 ## 3. Push And Open The PR
 
-`ORCH_DELIVERY` is resolved by `worktree-push` through [submit-pr.md](submit-pr.md) § 2. `push-base` keeps § 2's commit-chain validation and takes submit's direct completion route. **Main checkout only**, restore `[BASE_BRANCH]` before returning. Then go to § 5 with `PUSHED_SHA`, omit the PR and Merge rows, and include `Pushed commit`. Skip § 4. `pr` keeps the route below.
+`ORCH_DELIVERY` is resolved by `worktree-push` through [submit-pr.md](submit-pr.md) § 2. `push-base` keeps § 2's commit-chain validation and takes submit's direct completion route, including existing Linear completion and finished-container closure. Open post-merge checks leave Verifying. **Main checkout only**, restore `[BASE_BRANCH]` before returning. Then go to § 5 with `PUSHED_SHA`, omit the PR and Merge rows, and include `Pushed commit`. Skip § 4. `pr` keeps the route below.
 
 For direct publication, resolve the base and classify the committed paths:
 

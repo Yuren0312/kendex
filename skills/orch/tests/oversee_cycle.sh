@@ -1179,15 +1179,15 @@ RECORD_ARGS=(--commit "$MERGE")
 # Each rule of the push read alone: the push leaving the branch at the
 # commit, a later push containing it, the launch bound on the compared pushes,
 # no stand-in for an unplaced push, and the period the log is read over.
-control m-push-exact oversee-cycle '([.[] | select(.after == $commit)] | first' '([.[] | select(false)] | first'
+control m-push-exact lib/lane-gitfile.sh '([.[] | select(.after == $commit)] | first' '([.[] | select(false)] | first'
 new_case c-push-exact; printf small > "$CASE/class"; pushes "300:$BASE" "1200:$MERGE"
 assert_eq "$(field actual "$(record KEN-1 micro)")" 'actual=-' \
   "control: without the exact match, a push leaving the branch at the commit is compared and goes unplaced"
-control m-push-ahead oversee-cycle '[[ "$status" == ahead ]] || continue' '[[ "$status" == never ]] || continue'
+control m-push-ahead lib/lane-gitfile.sh '[[ "$status" == ahead ]] || continue' '[[ "$status" == never ]] || continue'
 new_case c-push-ahead; printf small > "$CASE/class"; pushes "1500:$BATCH"; answer "$BATCH" ahead
 assert_eq "$(field actual "$(record KEN-1 micro)")" 'actual=-' \
   "control: without the containment answer, a batch push containing the commit goes unplaced"
-control m-push-since oversee-cycle 'select((.at | fromdate) >= ($since | tonumber))' 'select(true)'
+control m-push-since lib/lane-gitfile.sh 'select((.at | fromdate) >= ($since | tonumber))' 'select(true)'
 new_case c-push-since; printf small > "$CASE/class"; pushes "-100:$OLD" "1500:$BATCH"; answer "$BATCH" ahead
 assert_eq "$(field actual "$(record KEN-1 micro)")|$(sed -n 's/^oversee-cycle: merged-unread commit=[^ ]* //p' "$CASE/err")" 'actual=-|cause=compare-failed' \
   "control: without the launch bound, a push before the launch is compared"
@@ -1195,7 +1195,7 @@ control m-push-fallback oversee-cycle 'merged: (if $merged == "" then null' 'mer
 new_case c-push-fallback; printf small > "$CASE/class"; pushes "300:$OTHER"; answer "$OTHER" diverged
 assert_eq "$(field actual "$(record KEN-1 micro)")" 'actual=60' \
   "control: a stand-in date for an unplaced push turns the null-merged assertion red"
-control m-push-period oversee-cycle 'query+="&time_period=${span%%:*}"' 'query+=""'
+control m-push-period lib/lane-gitfile.sh 'query+="&time_period=${span%%:*}"' 'query+=""'
 new_case c-push-period; printf small > "$CASE/class"; pushes "1200:$MERGE"
 edit_json "$CASE/state/workflow-state-oversee.json" ".lanes[0].launched_at = \"$(jq -rn 'now - 7200 | floor | todate')\""
 record KEN-1 micro >/dev/null

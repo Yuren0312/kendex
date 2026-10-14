@@ -2,7 +2,7 @@
 # Surface: worktree-push delivery and submit-pr's publication command.
 # Inputs: orch/scripts/worktree-push, orch/scripts/orch-env, workflow-state,
 # orch/scripts/restack-skip, dev-validate-run, item-tier, orch/references/,
-# orch/workflows/submit-pr.md, worktree/scripts/, harness-ci/scripts/, github/scripts/lib/,
+# orch/workflows/{submit-pr,merge-pr}.md, worktree/scripts/, harness-ci/scripts/, github/scripts/lib/,
 # mailbox/scripts/, and orch/tests/lib/{git-env,assertions,shared-skill-libs}.sh.
 # The Git transport and rebase are real. The PR service is a recorded fixture.
 set -euo pipefail
@@ -43,6 +43,15 @@ set -euo pipefail
 printf '%s\n' "$*" >> "$GH_CALLS"
 if [[ "${1:-}" == pr && "${2:-}" == create ]]; then
   printf 'fixture-pr\n'
+  exit 0
+fi
+if [[ "${1:-}" == repo && "${2:-}" == view ]]; then
+  printf 'owner/repo\n'
+  exit 0
+fi
+if [[ "$*" == 'api --paginate repos/owner/repo/activity?'* ]]; then
+  head="$("$REAL_GIT" --git-dir "${FIXTURE_MAIN%/main}/remote.git" rev-parse trunk)"
+  jq -cn --arg head "$head" --arg at "$ACTIVITY_AT" '[{timestamp:$at, after:$head}]'
   exit 0
 fi
 exit 1
@@ -88,6 +97,15 @@ new_world() { # NAME SETTING
   OLD_HEAD="$("$REAL_GIT" -C "$FIXTURE_LANE" rev-parse HEAD)"
   cp -R "$REPO_ROOT/skills/orch/scripts" "$area/installed/orch/"
   cp -R "$REPO_ROOT/skills/orch/references" "$area/installed/orch/"
+  mkdir -p "$area/installed/orch/workflows" "$area/installed/linear/scripts"
+  cp "$REPO_ROOT/skills/orch/workflows/submit-pr.md" "$REPO_ROOT/skills/orch/workflows/merge-pr.md" "$area/installed/orch/workflows/"
+  cat > "$area/installed/linear/scripts/linear.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$COMPLETE_CALLS"
+printf 'Verifying\n'
+SH
+  chmod +x "$area/installed/linear/scripts/linear.sh"
   mkdir -p "$area/installed/harness-ci"
   cp -R "$REPO_ROOT/skills/harness-ci/scripts" "$area/installed/harness-ci/"
   cp -R "$REPO_ROOT/skills/worktree/scripts" "$area/installed/worktree/"
@@ -98,9 +116,12 @@ new_world() { # NAME SETTING
   GIT_CALLS="$area/git-calls"
   GH_CALLS="$area/gh-calls"
   RACE_FLAG="$area/race"
-  export FIXTURE_MAIN FIXTURE_LANE GIT_CALLS GH_CALLS RACE_FLAG
+  COMPLETE_CALLS="$area/complete-calls"
+  ACTIVITY_AT='2026-10-14T17:00:00Z'
+  export FIXTURE_MAIN FIXTURE_LANE GIT_CALLS GH_CALLS RACE_FLAG COMPLETE_CALLS ACTIVITY_AT
   : > "$GIT_CALLS"
   : > "$GH_CALLS"
+  : > "$COMPLETE_CALLS"
   "$REPO_ROOT/skills/orch/scripts/workflow-state" --state-dir "$FIXTURE_MAIN/tmp" init KEN-1 --worktree "$FIXTURE_LANE" --branch ken-1 >/dev/null
   "$REPO_ROOT/skills/orch/scripts/workflow-state" --state-dir "$FIXTURE_MAIN/tmp" update KEN-1 --arg sha "$OLD_HEAD" '.fixed_items=[{commit:$sha}]'
   printf '{"overseer":{"server":"7000","pane":"%%0"}}\n' > "$FIXTURE_MAIN/tmp/workflow-state-oversee.json"
@@ -121,6 +142,17 @@ publish() {
   [[ "$RC" == 0 ]] || return 0
   NOTICE="$(sed -n '/^delivery: mode=push-base /p' <<< "$OUT")"
   if [[ -n "$NOTICE" ]]; then
+    # Execute the existing completion owner's fence only when submit routes
+    # to it. The service fixture records the exact command, not a publisher.
+    if grep -Fq 'Complete the item through [merge-pr.md § 5 step 2]' "$FIXTURE_LANE/.agents/skills/orch/workflows/submit-pr.md"; then
+      pushed_at="$(sed -n 's/^direct-push-time: at=//p' <<< "$OUT")"
+      completion_command="$(awk '{ sub(/\r$/, ""); sub(/^[[:space:]]+/, "") } /^```bash$/ { fence=1; next } /^```$/ { fence=0 } fence && /linear.sh issues complete/ { print; found++ } END { if (found != 1) exit 1 }' "$FIXTURE_LANE/.agents/skills/orch/workflows/merge-pr.md")"
+      completion_command="${completion_command//\[MAIN_REPO_ROOT\]/\$FIXTURE_LANE}"
+      completion_command="${completion_command//\[ISSUE\]/KEN-1}"
+      completion_command="${completion_command//\[MERGED_AT\]/\$pushed_at}"
+      completion_command="${completion_command//\[MET_BOXES\]/1}"
+      (cd "$FIXTURE_LANE" && pushed_at="$pushed_at" "$BASH" -c "$completion_command") > "$FIXTURE_MAIN/tmp/completion.out" || { RC=$?; NOTICE=''; return 0; }
+    fi
     printf '%s\n' "$NOTICE" > "$FIXTURE_LANE/tmp/direct-push-KEN-1.md"
     (cd "$FIXTURE_LANE" && "$REPO_ROOT/skills/mailbox/scripts/lane-mail" notice --item KEN-1 --file "$FIXTURE_LANE/tmp/direct-push-KEN-1.md") > "$FIXTURE_MAIN/tmp/notice.out"
   else
@@ -246,7 +278,7 @@ PY
   assert_eq "$("$REAL_GIT" --git-dir "$TMP_ROOT/$name/remote.git" rev-parse "$target")" "$head" "$name publishes the actual commit to $target"
   if [[ "$target" == trunk ]]; then
     assert_eq "$NOTICE" "delivery: mode=push-base base=trunk commit=$head" "$name completion notice names the pushed remote commit"
-    assert_eq "$(cat "$GH_CALLS")" '' "$name makes no PR or GitHub API call"
+    assert_not_contains "$(cat "$GH_CALLS")" 'pr create' "$name makes no PR call"
     assert_not_contains "$(cat "$GIT_CALLS")" '--force' "$name uses no force option"
     assert_eq "$(awk '/ push / { n++ } END { print n+0 }' "$GIT_CALLS")" 1 "$name pushes once"
     assert_eq "$("$REAL_GIT" -C "$FIXTURE_LANE" branch --show-current)" ken-1 "$name keeps the item branch"
@@ -398,6 +430,38 @@ cp "$FIXTURE_MAIN/tmp/state-kept.json" "$FIXTURE_MAIN/tmp/workflow-state-KEN-1.j
 rm "$TMP_ROOT/repair/remote.git/hooks/post-receive"
 publish
 assert_eq "$RC|$NOTICE|$(awk '/ push / { n++ } END { print n+0 }' "$GIT_CALLS")" "0|$landed_record|1" 'repair returns the same pushed commit with no second transport'
+
+echo '=== direct Linear completion uses the repository push time ==='
+for name in completion completion-control; do
+  new_world "$name" push-base
+  RACE_PUSH=false
+  export RACE_PUSH
+  validate_current
+  if [[ "$name" == completion-control ]]; then
+    python3 - "$FIXTURE_LANE/.agents/skills/orch/workflows/submit-pr.md" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+text = p.read_text()
+old = 'Complete the item through [merge-pr.md § 5 step 2](merge-pr.md#5-execute-the-merge)'
+assert text.count(old) == 1
+p.write_text(text.replace(old, 'Omit tracker completion'))
+PY
+  fi
+  publish
+  observed="$RC|$(cat "$COMPLETE_CALLS")|$(cat "$FIXTURE_MAIN/tmp/completion.out" 2>/dev/null || true)"
+  expected="0|issues complete KEN-1 --post-merge-at $ACTIVITY_AT --done-when-met 1|Verifying"
+  if [[ "$name" == completion-control ]]; then
+    control_rc=0
+    (PASS=0; FAIL=0; assert_eq "$observed" "$expected" 'direct completion and push time'; [[ "$FAIL" == 0 ]]) > "$FIXTURE_MAIN/tmp/control.out" || control_rc=$?
+    assert_eq "$control_rc" 1 'control: removing completion fails the same completion/time row'
+    assert_contains "$(cat "$FIXTURE_MAIN/tmp/control.out")" 'FAIL  direct completion and push time' 'control fails for the missing completion call'
+  else
+    assert_eq "$observed" "$expected" 'direct completion and push time' "$FIXTURE_MAIN/tmp/push.err"
+    assert_eq "$(sed -n 's/^direct-push-time: at=//p' <<< "$OUT")" "$ACTIVITY_AT" 'completion receives the repository activity time'
+    assert_not_contains "$(cat "$GH_CALLS")" 'pr create' 'Linear completion creates no PR'
+  fi
+done
 
 printf 'pass: %d   fail: %d\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]

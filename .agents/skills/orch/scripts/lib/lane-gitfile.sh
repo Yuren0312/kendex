@@ -338,3 +338,48 @@ lane_hosted_item_state() {
     *) return "$rc" ;;
   esac
 }
+
+# lane_push_time — when COMMIT reached the base branch, from GitHub's own record of
+# the push: the push whose `after` is COMMIT, else the earliest push from the
+# lane's launch on whose `after` contains it, as a landing queue's batch push
+# does. The committer date never stands in: a rebase or amend before the push
+# rewrites it, and a queue's wait and the push come after it. The log is read
+# over the shortest period GitHub filters by that holds the launch, an hour of
+# clock skew spared. Sets MERGED_AT, or MERGED_CAUSE with push.err.
+lane_push_time() { # REPO BASE_RESOLVER CHECKOUT LANE_JSON COMMIT SCRATCH
+  local repo="$1" resolver="$2" checkout="$3" lane="$4" COMMIT="$5" WORK="$6"
+  local base query launched span at after status
+  MERGED_AT="" MERGED_CAUSE=""
+  : >"$WORK/push.err"
+  [[ -n "$repo" ]] || repo="$(unset GH_REPO; kendex_github_resolve_gh_repo "${checkout:-.}" 2>/dev/null)" \
+    || { MERGED_CAUSE="repo-unresolved"; return; }
+  base="$("$resolver" "${checkout:-.}" 2>"$WORK/push.err")" \
+    || { MERGED_CAUSE="base-unresolved"; return; }
+  query="ref=$(jq -rn --arg r "refs/heads/$base" '$r | @uri')&activity_type=push&per_page=100"
+  launched="$(jq -r '.launched_at // empty | fromdate' <<<"$lane" 2>"$WORK/push.err")" \
+    || { MERGED_CAUSE="launch-unreadable"; return; }
+  for span in day:86400 week:604800 month:2419200 quarter:7689600 year:31536000; do
+    if [[ -n "$launched" ]] && (( $(date +%s) - launched + 3600 < ${span#*:} )); then
+      query+="&time_period=${span%%:*}"
+      break
+    fi
+  done
+  if ! gh api --paginate "repos/$repo/activity?$query" >"$WORK/activity.json" 2>"$WORK/push.err" \
+    || ! jq -rs --arg commit "$COMMIT" --arg since "${launched:-0}" '[.[][] | {at: .timestamp, after}] | sort_by(.at)
+      | ([.[] | select(.after == $commit)] | first | .at // empty | "\(.) exact"),
+        (.[] | select((.at | fromdate) >= ($since | tonumber)) | "\(.at) \(.after)")' \
+      "$WORK/activity.json" >"$WORK/pushes" 2>"$WORK/push.err"; then
+    MERGED_CAUSE="activity-unread"
+    return
+  fi
+  while read -r at after; do
+    if [[ "$after" != exact ]]; then
+      status="$(gh api "repos/$repo/compare/$COMMIT...$after" --jq .status 2>"$WORK/push.err")" \
+        || { MERGED_CAUSE="compare-failed"; return; }
+      [[ "$status" == ahead ]] || continue
+    fi
+    MERGED_AT="$at"
+    return
+  done <"$WORK/pushes"
+  MERGED_CAUSE="no-push"
+}
