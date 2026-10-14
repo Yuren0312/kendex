@@ -9,9 +9,7 @@
 set -euo pipefail
 unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-common_git="$(git -C "$ROOT" rev-parse --git-common-dir)" || exit 1
-case "$common_git" in /*) ;; *) common_git="$ROOT/$common_git" ;; esac
-scratch_parent="$(cd -- "$common_git/.." && pwd -P)" || exit 1
+scratch_parent="$ROOT"
 mkdir -p "$scratch_parent/tmp"
 # HOOK_UNDER_TEST overrides the hook each fixture installs, so a must-fail
 # control runs against these same assertions.
@@ -291,7 +289,7 @@ environment_rows() {
 [2, "eval 'cat \u007c& cat' <<'EOF'\nenv\nEOF", "eval-inherited-pipeline-heredoc-retains-main-refusal"]
 [0, "cat <<'EOF' | bash\nprintf done\nEOF", "pipeline-heredoc-without-known-read"]
 [0, "cat <<'EOF' \u007c& bash\nprintf done\nEOF", "merged-pipeline-heredoc-without-known-read"]
-[2, "cat <<'EOF' '\u007c&' > script.py\nif __name__ == \"__main__\":\n    options = 'set -euo pipefail'\n    launcher = \"env NAME=value command-name\"\n    print(options)\nEOF", "quoted-operator-with-heredoc-remains-data"]
+[0,"cat <<'EOF' '\u007c&' > script.py\nif __name__ == \"__main__\":\n    options = 'set -euo pipefail'\n    launcher = \"env NAME=value command-name\"\n    print(options)\nEOF","quoted-operator-with-heredoc-remains-data"]
 [2,"cat <<'EOF' | cat | sh -s\nprintenv\nEOF","indirect-piped-heredoc-program"]
 [2,"{ cat <<'EOF' | command env NAME=value bash; }\nenv\nEOF","grouped-piped-heredoc-program"]
 [2,"source /dev/stdin <<'EOF'\nenv\nEOF","sourced-heredoc-program"]
@@ -346,7 +344,7 @@ environment_rows() {
 [2,"cat <<FIRST <<'SECOND'\n\\$(env)\nFIRST\n$(env)\nSECOND","mixed-heredoc-literal-data"]
 [2,"cat <<EOF\nenv\nEOF","unquoted-heredoc-literal-word-data"]
 [2,"cat <<$EOF\n$(env >&2)\n$EOF","unquoted-dollar-delimiter-expansion"]
-[2,"cat <<\\$EOF\n$(env)\n$EOF","escaped-dollar-delimiter-data"]
+[0,"cat <<\\$EOF\n$(env)\n$EOF","escaped-dollar-delimiter-data"]
 [2,"{ bash -c 'env'; }","grouped-shell-command-string"]
 [2,"{ sh -c 'env'; }","grouped-sh-command-string"]
 [2,"exec bash -c 'env'","exec-shell-command-string"]
@@ -531,8 +529,8 @@ environment_rows() {
 [2,"bash wrapper.sh set > out","wrapper-bare-set-redirect"]
 [0,"cat <<'EOF' > script.py\nif __name__ == \"__main__\":\n    options = 'set -euo pipefail'\n    launcher = \"env NAME=value command-name\"\n    print(options)\nEOF","quoted-heredoc-script"]
 [0,"cat <<\"EOF\" > script.py\nset -euo pipefail\nenv -u NAME -u OTHER command-name\n$(env)\nEOF","double-quoted-heredoc-data"]
-[2,"cat <<\\EOF\nenv\nEOF","escaped-heredoc-delimiter"]
-[2,"cat <<E'OF'\nenv\nEOF","split-quoted-heredoc-delimiter"]
+[0,"cat <<\\EOF\nenv\nEOF","escaped-heredoc-delimiter"]
+[0,"cat <<E'OF'\nenv\nEOF","split-quoted-heredoc-delimiter"]
 [2,"cat <<-'EOF'\n\tenv\n\tEOF","tab-stripped-quoted-heredoc"]
 [2,"cat <<'FIRST' <<'SECOND'\nenv\nFIRST\nset\nSECOND","multiple-quoted-heredocs"]
 [2,"cat <<'EOF' > out\nenv NAME=value command-name\nEOF\nenv","dump-after-quoted-heredoc"]
@@ -821,7 +819,7 @@ environment_rows() {
 [2,"if typeset PATH; then :; fi","conservative-typeset-named"]
 [2,"if printenv PATH; then :; fi","conservative-printenv-named"]
 [2,"unknown > receipt <<'EOF'\nenv\nEOF","quoted-file-body-unknown-reader"]
-[2,"cat <<'EOF'\nenv\nEOF","quoted-body-stdout-only"]
+[0,"cat <<'EOF'\nenv\nEOF","quoted-body-stdout-only"]
 [2,"cat > receipt <<EOF\nenv\nEOF","unquoted-file-body-literal"]
 [2,"bash <<'OUTER'\nbash wrapper.sh 'env NAME=value command-name args'\nOUTER","interpreted-quoted-data-retains-main-refusal"]
 [2,"bash <<'OUTER'\ncat <<'EOF' > script.py\nif __name__ == \"__main__\":\n    options = 'set -euo pipefail'\n    launcher = \"env NAME=value command-name\"\n    print(options)\nEOF\nOUTER","interpreted-file-body-retains-main-refusal"]
@@ -846,6 +844,86 @@ environment_rows() {
 [2,"bash <<'DOC'; builtin :\ndeclare\nDOC\n","r12-body-after-later-header-wrapper"]
 [0,"bash <<'DOC'\ndeclare\nDOC\nbuiltin :\n","r12-body-before-later-wrapper"]
 [2,"bash <<EOF; script.sh","unread-shell-heredoc-body-without-marker"]
+[0,"python3 - <<'PY'\nfrom pathlib import Path\np=Path('scripts/test-plugin-logic.js')\ntext=p.read_text(); lines=text.splitlines(keepends=True)\nfor i,line in enumerate(lines):\n    if '\"a description link to a plugin\\'s page\"' in line:\n        lines[i]=line.replace('null],', r'\"schema.a.link has unknown key \\\"pane\\\"\"],')\n    elif '\"a description link with both an address and a page\"' in line:\n        lines[i]=line.replace('\"schema.a.link must declare exactly one of url and pane\"', r'\"schema.a.link has unknown key \\\"pane\\\"\"')\n    elif '\"a description link with neither an address nor a page\"' in line:\n        lines[i]=line.replace('\"schema.a.link must declare exactly one of url and pane\"','\"schema.a.link.url must be an https address\"')\n    elif '\"a description link to a page that is no plugin id\"' in line or '\"a description link to a page that is not a string\"' in line:\n        lines[i]=''\n    elif '\"a status hint link to a plugin\\'s page\"' in line:\n        lines[i]=line.replace('\"status.a.link.pane needs a setting description\"', r'\"status.a.link has unknown key \\\"pane\\\"\"')\n    elif '\"a description link may name a page\"' in line:\n        lines[i]='    [\"a description link refuses the old pane key\", \\'var LINK_KEYS = [\"text\", \"url\"];\\', \\'var LINK_KEYS = [\"text\", \"url\", \"pane\"];\\'],\\n'\n    elif any(x in line for x in ['\"a description link declares no address beside its page\"','\"a description link declares an address or a page\"','\"only a description link names a page\"','\"a description link\\'s page is a plugin id\"','\"a description link\\'s page is a string\"']):\n        lines[i]=''\nassert ''.join(lines)!=text\np.write_text(''.join(lines))\nPY","ken-3998-allow-original-source-edit"]
+[0,"python3 - <<'PY'\nfrom pathlib import Path\nimport struct\nr=Path('tmp/ui-shots/VG-563')\npaths=sorted(p for folder in ['after','after-consumers'] for p in (r/folder).rglob('*.png'))\nlines=[]\nfor p in paths:\n w,h=struct.unpack('>II',p.read_bytes()[16:24]); lines.append(f'- `{p}`: {w} \u00d7 {h}')\nPath('tmp/qa-after-inventory-VG-563.md').write_text('# After images available\\n\\n'+'\\n'.join(lines)+'\\n')\nprint('After completed-set images',len(paths))\nPY","ken-3998-allow-png-inventory"]
+[2,"sh tmp/runtime-tests/launch.sh /home/method/dev/.worktrees/vgshell/vgs-1686/tmp/runtime-tests/tui env VGS_TEST_RUN=1 scripts/test-tui.sh","ken-3998-allow-launcher-report"]
+[2,"sh /home/dev/dev/.worktrees/hyprtrade/ht-970/tmp/waiter.q9BEPa/launch.sh /home/dev/dev/.worktrees/hyprtrade/ht-970/tmp/waiter.q9BEPa/wait env -u GH_REPO -u GITHUB_REPOSITORY .agents/skills/orch/scripts/copilot-wait 1034 --item HT-970","ken-3998-allow-waiter-report"]
+[2,"python3 - <<PY\nfor name in ['NAME']:\n    print('env', name)\nPY","ken-3998-allow-unquoted-python-data"]
+[0,"mkdir -p build && cat > build/x.py <<'PY'\nfor name in ['NAME']:\n    print('The printed run set passed.')\nPY\npython3 build/x.py","ken-3998-allow-file-write-and-run"]
+[0,"cat > build/x.py <<'PY' && python3 build/x.py\nfor name in ['NAME']:\n    print('The printed run set passed.')\nPY","ken-3998-allow-file-write-inline-run"]
+[0,"cat > build/control.py <<'PY'\nimport os, subprocess\nfor directory in ['build']:\n    subprocess.run(['python3', 'check.py'], env={'PATH': os.defpath, 'HOME': directory, 'VGS_TEST_RUN': '1'})\nPY\npython3 build/control.py && echo ok","ken-3998-allow-subprocess-environment-data"]
+[0,"mkdir -p notes && cat > notes/brief.md <<'EOF'\nIf a command prints the environment, use a named variable.\nfor example: replace env, printenv, export -p, declare -x, /proc/*/environ and show-environment with named reads.\nEOF","ken-3998-allow-brief-data"]
+[2,"sh wrap.sh env","ken-3998-refuse-wrapper-no-program"]
+[0,"receiver one two env -u NAME","ken-3998-refuse-ordinary-receiver-no-program"]
+[0,"receiver one two env -i -u NAME --unset=OTHER -C build NAME=value program extra words > out","ken-3998-launcher-any-receiver-arity"]
+[0,"receiver 'env' 'set' 'declare -x'","ken-3998-quoted-arguments-any-receiver"]
+[2,"if :; then printf '%s' 'env set declare -x'; fi","ken-3998-compound-quoted-data"]
+[2,"env | sort","ken-3998-refuse-sort"]
+[2,"printenv > out","ken-3998-refuse-output-file"]
+[2,"eval env","ken-3998-refuse-eval"]
+[2,"cd /tmp && env","ken-3998-refuse-list"]
+[2,"echo \"$(env)\"","ken-3998-refuse-substitution"]
+[2,"python3 - <<PY\nprint(\"\"\"$(env)\"\"\")\nPY","ken-3998-refuse-unquoted-python-substitution"]
+[2,"python3 - <<PY\nprint(\"\"\"`env`\"\"\")\nPY","ken-3998-refuse-unquoted-python-backtick"]
+[2,"cat <<'EOF' \u007c& cat\nenv\nEOF","ken-3998-merged-pipe-data"]
+[2,"if :; then printf '%s' set; fi","ken-3998-compound-unquoted-set-data"]
+[2,"if :; then declare; fi","ken-3998-compound-bare-declare"]
+[2,"bash -c 'cat < input.txt' < /proc/$$/environ","proc-input-data-replaced-file"]
+[2,"bash -c \"cat <<< 'env'\" < /proc/$$/environ","proc-input-data-replaced-here-string"]
+[2,"bash -c 'cat 3<&- <&3' 3< /proc/$$/environ","proc-input-data-closed-descriptor"]
+[2,"bash -c \"printf '%s' 'env'\" < /proc/$$/environ","proc-input-data-quoted-data"]
+[2,"bash -c \"printf '%s' 'env' | cat\" < /proc/$$/environ","proc-input-data-pipeline-data"]
+[2,"bash -c 'printf done' 3< /proc/$$/environ","proc-input-data-unused-descriptor"]
+[2,"bash -c 'cat <&3' 3< /proc/$$/environ 3> out","proc-input-data-replaced-output"]
+[2,"bash -c 'cat <&3' 3< /proc/$$/environ 3>> out","proc-input-data-replaced-append"]
+[2,"bash -c 'cat /dev/fd/1 | cat' 1< /proc/$$/environ","proc-input-data-replaced-stdout-pipe"]
+[2,"bash -c 'cat /dev/fd/2 \u007c& cat' 2< /proc/$$/environ","proc-input-data-replaced-merged-pipe"]
+[2,"{ eval cat < /dev/null; } < /proc/self/environ","compound-replace-proc"]
+[2,"bash -c '{ cat /proc/$$/fd/3; } 3</dev/null; :' 3< /proc/$$/environ","identity-pid-brace-replace"]
+[2,"bash -c 'cat /proc/$BASH\u0050ID/fd/1 | cat >&2; :' 1< /proc/$$/environ","identity-bashpid-reader-output-pipe"]
+[2,"bash -c '(cat /proc/$BASH\u0050ID/fd/3) 3</dev/null; :' 3< /proc/$$/environ","identity-bashpid-subshell-replace"]
+[2,"bash -c 'printf done | cat /proc/$BASH\u0050ID/fd/0; :' < /proc/$$/environ","identity-bashpid-pipeline-input"]
+[2,"bash -c '{ cat /proc/$BASH\u0050ID/fd/3; } 3</dev/null; :' 3< /proc/$$/environ","identity-bashpid-brace-replace"]
+[2,"bash -c 'cat /proc/${BASH\u0050ID}/fd/1 | cat >&2; :' 1< /proc/$$/environ","identity-braced-bashpid-reader-output-pipe"]
+[2,"bash -c '(cat /proc/${BASH\u0050ID}/fd/3) 3</dev/null; :' 3< /proc/$$/environ","identity-braced-bashpid-subshell-replace"]
+[2,"bash -c 'printf done | cat /proc/${BASH\u0050ID}/fd/0; :' < /proc/$$/environ","identity-braced-bashpid-pipeline-input"]
+[2,"bash -c '{ cat /proc/${BASH\u0050ID}/fd/3; } 3</dev/null; :' 3< /proc/$$/environ","identity-braced-bashpid-brace-replace"]
+[2,"bash -c 'cat /dev/fd/3 3</dev/null; :' 3< /proc/$$/environ","identity-dev-replace"]
+[2,"bash -c 'cat /dev/fd/3 3<&-; :' 3< /proc/$$/environ","identity-dev-close"]
+[2,"bash -c 'cat /dev/fd/3 3<&4; :' 3< /proc/$$/environ 4</dev/null","identity-dev-plain-copy"]
+[2,"bash -c 'cat 3</dev/null < /dev/fd/3; :' 3< /proc/$$/environ","identity-dev-selected-redirect"]
+[2,"bash -c 'cat /proc/self/fd/3 3</dev/null; :' 3< /proc/$$/environ","identity-self-replace"]
+[2,"bash -c 'cat /proc/self/fd/3 3<&-; :' 3< /proc/$$/environ","identity-self-close"]
+[2,"bash -c 'cat /proc/self/fd/3 3<&4; :' 3< /proc/$$/environ 4</dev/null","identity-self-plain-copy"]
+[2,"bash -c 'cat 3</dev/null < /proc/self/fd/3; :' 3< /proc/$$/environ","identity-self-selected-redirect"]
+[2,"bash -c 'cat /proc/thread-self/fd/3 3</dev/null; :' 3< /proc/$$/environ","identity-thread-replace"]
+[2,"bash -c 'cat /proc/thread-self/fd/3 3<&-; :' 3< /proc/$$/environ","identity-thread-close"]
+[2,"bash -c 'cat /proc/thread-self/fd/3 3<&4; :' 3< /proc/$$/environ 4</dev/null","identity-thread-plain-copy"]
+[2,"bash -c 'cat 3</dev/null < /proc/thread-self/fd/3; :' 3< /proc/$$/environ","identity-thread-selected-redirect"]
+[2,"bash -c 'cat /proc/1/fd/3 3</dev/null; :' 3< /proc/$$/environ","identity-other-process"]
+[2,"bash -c \"cat /proc/$BASH\u0050ID/fd/3\" 3< /proc/$$/environ","identity-bashpid-expanded-outer-data"]
+[2,"bash -c \"cat /proc/${BASH\u0050ID}/fd/3\" 3< /proc/$$/environ","identity-braced-bashpid-expanded-outer-data"]
+[2,"bash -c 'false || { cat /proc/$$/fd/3; } 3</dev/null; :' 3< /proc/$$/environ","identity-pid-or-incoming-brace"]
+[2,"bash -c '{ cat /proc/$$/fd/3; } 3</dev/null || :; :' 3< /proc/$$/environ","identity-pid-or-outgoing-brace"]
+[2,"bash -c ': && { cat /proc/$$/fd/3; } 3</dev/null; :' 3< /proc/$$/environ","identity-pid-and-incoming-brace"]
+[2,"bash -c \"false || eval 'cat /proc/\\$\\$/fd/3' 3</dev/null; :\" 3< /proc/$$/environ","identity-pid-or-eval-replace"]
+[2,"bash -c 'false || { cat /proc/$BASH\u0050ID/fd/3; } 3</dev/null; :' 3< /proc/$$/environ","identity-bashpid-or-incoming-brace"]
+[2,"bash -c '{ cat /proc/$BASH\u0050ID/fd/3; } 3</dev/null || :; :' 3< /proc/$$/environ","identity-bashpid-or-outgoing-brace"]
+[2,"bash -c ': && { cat /proc/$BASH\u0050ID/fd/3; } 3</dev/null; :' 3< /proc/$$/environ","identity-bashpid-and-incoming-brace"]
+[2,"bash -c \"false || eval 'cat /proc/\\$BASH\u0050ID/fd/3' 3</dev/null; :\" 3< /proc/$$/environ","identity-bashpid-or-eval-replace"]
+[2,"bash -c \"bash 3</dev/null <<'EOF'\ne\\\\\\\\nv\nEOF\n:\" 3< /proc/$$/environ","final-input-quoted-transform-data"]
+[2,"bash -c \"cat 3</dev/null <<EOF\ne\\\\\\\\nv\nEOF\n:\" 3< /proc/$$/environ","final-input-unproved-transform-nonshell-data"]
+[2,"bash -c \"cat '/proc/\\$\\$/fd/3'\" 3< /proc/$$/environ","proc-alias-literal-pid-data"]
+[2,"bash -c \"cat '/proc/\\$BASH\u0050ID/fd/3'\" 3< /proc/$$/environ","proc-alias-literal-bashpid-data"]
+[2,"bash -c 'cat /proc/1/fd/3' 3< /proc/$$/environ","proc-alias-other-process-data"]
+[2,"bash -c \"cat /proc/$$/fd/3\" 3< /proc/$$/environ","proc-alias-expanded-outer-source-data"]
+[2,"bash -c \"FD=3; cat '/proc/\\$\\$'/fd/\\$FD\" 3< /proc/$$/environ","proc-alias-literal-pid-expanded-fd-data"]
+[2,"bash -c 'cat /proc/$$/fd/3 3</dev/null | cat; :' 3<<'EOF'\nenv\nEOF","identity-pid-body-forward-cat"]
+[2,"bash -c 'cat /proc/$BASH\u0050ID/fd/3 3</dev/null | cat; :' 3<<'EOF'\nenv\nEOF","identity-bashpid-body-forward-cat"]
+[2,"bash -c 'cat /proc/${BASH\u0050ID}/fd/3 3</dev/null | cat; :' 3<<'EOF'\nenv\nEOF","identity-braced-bashpid-body-forward-cat"]
+[2,"bash -c 'cat /proc/$$/fd/$1 3</dev/null | cat' _ 3 3<<'EOF'\nenv\nEOF","final-input-unknown-body-data-control"]
+[2,"bash -c 'cat /proc/$BASH\u0050ID/fd/$1 3</dev/null | bash 3</dev/null' _ 3 3<<'EOF'\nenv\nEOF","final-input-unknown-current-body-cleared-receiver"]
+[2,"bash -c '{ cat /proc/$$/fd/3; } 3</proc/self/environ'","inner_source_candidate"]
 ENVIRONMENT_ROWS
   ) || exit 1
   while IFS=$'\t' read -r expected command_json label world; do
@@ -936,6 +1014,7 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "no-check" { swap("if environment_dump \"$command_kind\"; then", "if false; then") }
       defect == "main-evidence-cut" { swap("[[ ! $evidence =~ $opaque_re ]] || return 0", ":") }
       defect == "exec-context" { swap("program=opaque; unsupported=1; compound=1", "program=opaque") }
+      defect == "quoted-data-cut" { swap("[ \"$1\" = shell ] && [ -z \"${2:-}$unsupported$pipeline$incoming_sources\" ]", "false") }
       defect == "main-command-cut" { swap("if environment_main_command \"$1\"; then return 0; fi", "if false; then return 0; fi") }
       defect == "flat-main-command" { swap("if environment_main_command \"$1\"; then return 0; fi", "if environment_main_evidence \"$text\"; then return 0; fi") }
       defect == "late-check" && $0 == "if environment_dump \"$command_kind\"; then" {
@@ -1011,6 +1090,7 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       printf 'FAIL environment control %s: exit=%s missing=%s\n' "$defect" "$control_status" "$failed_row"; failed=$((failed + 1))
     fi
   done <<'ENVIRONMENT_CONTROLS'
+quoted-data-cut|FAIL environment: quoted-operator-with-heredoc-remains-data: exit=2 expected=0
 no-check|FAIL environment: incident: exit=0 expected=2
 exec-context|FAIL environment: r12-exec-list-unnamed-declaration: exit=0 expected=2
 exec-context|FAIL environment: r12-builtin-list-unnamed-declaration: exit=0 expected=2
@@ -1040,7 +1120,6 @@ no-check|FAIL environment: shell-heredoc-bodies-have-independent-quotes: exit=0 
 no-check|FAIL environment: unregistered-heredoc-final-word: exit=0 expected=2
 no-check|FAIL environment: unquoted-heredoc-single-quotes-expand: exit=0 expected=2
 main-evidence-cut|FAIL environment: eval-quoted-argument-data: exit=0 expected=2
-main-command-cut|FAIL environment: escaped-heredoc-delimiter: exit=0 expected=2
 main-evidence-cut|FAIL environment: syntax-assignment-data: exit=0 expected=2
 main-evidence-cut|FAIL environment: syntax-function-name: exit=0 expected=2
 main-evidence-cut|FAIL environment: syntax-coproc-name: exit=0 expected=2

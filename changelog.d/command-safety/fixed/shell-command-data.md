@@ -1,0 +1,1 @@
+- Permit one local quoted heredoc as data for direct cat or python3 commands while retaining the existing checks for executable commands and environment reads.
