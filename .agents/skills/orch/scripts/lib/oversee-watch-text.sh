@@ -107,12 +107,13 @@ The long pass's events, checked and reported in this order:
                              standing unless its account measures room, its
                              message, or message=unrecorded, under the line; from `account`, a live
                              session whose own account judgement reads
-                             mark-reached kind=headroom value=0, account
+                             mark-reached kind=headroom value=0 without
+                             reserve_only=true, account
                              and reset under the line; both on the first pass that
                              reads them. Or, from the `pane` fallback, on N
                              consecutive passes read by the same judge AND
                              that judgement reading mark-reached
-                             kind=headroom: the harness is still running
+                             kind=headroom without reserve_only=true: the harness is still running
                              and its ACCOUNT is spent. Such a session
                              takes no turn, so it answers no lane, reads no
                              mail and cannot hand itself over — a fleet as
@@ -121,9 +122,10 @@ The long pass's events, checked and reported in this order:
                              `oversee-succeed --check-marks`, the same one
                              overseer-mark rests on, and it is required
                              because THIS pane carries the limit banners this
-                             watch relays about other lanes: a wall the
-                             account refutes is one of those, and the pane is
-                             left alone under overseer-wall-unconfirmed. The
+                             watch relays about other lanes. A banner the
+                             account judgement does not confirm causes no wall
+                             recovery, under overseer-wall-unconfirmed.
+                             Independent reserve recovery can still run. The
                              banner's own window follows a pane wall's line,
                              as it does for a lane's usage-limit. The line
                              goes to the
@@ -139,6 +141,22 @@ The long pass's events, checked and reported in this order:
                              account=unknown and resets=none. Login recovery
                              has no usage reset: sign in to an account, then
                              start a fresh overseer by hand
+  EVENT overseer-reserve <pane> window=<window> passes=1 succession=<on|off> source=<source>
+                             Positive spendable credits remain below the
+                             launch reserve. The coordinator stays live.
+                             The existing successor route runs once, with
+                             its bounded retry for launch failures. Refusal,
+                             exhaustion or succession off keeps this watch
+                             reading mail, lane checks and ask deadlines.
+                             Capacity notices reach the fleet log and the
+                             overseer mailbox. A successful successor ends
+                             the old watch through its usual handover.
+                             This watch manages its automatic attempt and
+                             sends no parallel overseer-mark instruction
+                             for this reading. The turn-end hook keeps its
+                             own policy. The request and failure distinction
+                             is in references/overseer-session-events.md,
+                             Recovery requests.
   EVENT overseer-mark <pane> kind=<headroom|rate|qualifying> value=<N> mark=<N>
                              succession=<on|off>
                              the OVERSEER's own account reached its mark,
@@ -729,7 +747,7 @@ first repository's OVERSEE_WATCH_STATE_DIR baseline from kept or canceled
 verdicts. Lane prompts use pane and turn.
 
 A line already delivered is not delivered again by a re-run: overseer-dead,
-overseer-walled, merged, lane-asking, usage-limit, model-capacity,
+overseer-walled, overseer-reserve, merged, lane-asking, usage-limit, model-capacity,
 lane-exited, idle-after-return, handoff, account and outside-contribution
 are keyed in that baseline. A security-alert is keyed there too, and a re-run
 prints it again only as report=repeat while no verdict names it. Mail is reported at least once and never lost: lane-question,
@@ -926,9 +944,8 @@ Options:
 
 Exit codes:
   0  at least one EVENT line was printed
-  3  overseer-dead or overseer-walled was reported and a successor took that
-     overseer's
-     window. This watch is done: the successor runs its own. Repeat mode
+  3  a successor took the overseer's window after death, a wall or a launch
+     reserve. This watch is done: the successor runs its own. Repeat mode
      stops on it and exits 0
   2  usage or global failure, or a lane-local mailbox, clone or
      workflow-state read failed. A lane-local
@@ -1049,7 +1066,8 @@ Environment:
                               exits 2
   OVERSEE_WATCH_SUCCEED       path to oversee-succeed, which records the
                               overseer's launch line and relaunches a dead or
-                              walled overseer. A missing one leaves the
+                              walled overseer or selects a reserve successor.
+                              A missing one leaves the
                               overseer check to report and launch nothing,
                               said once
   ORCH_OVERSEER_DEAD_PASSES   consecutive passes the overseer must read
@@ -1059,16 +1077,18 @@ Environment:
                               poll that caught a live session between its
                               harness and its shell. A screen wall also needs
                               its account judged mark-reached
-                              kind=headroom; passes alone never
+                              kind=headroom without reserve_only=true;
+                              passes alone never
                               close a window whose harness is alive. A rows
                               wall, which stands unless its account measures
                               room, and an account wall at value=0 go
                               out on the first pass
-  ORCH_OVERSEER_SUCCESSION    `off` leaves the overseer-dead and
-                              overseer-walled notices and
+  ORCH_OVERSEER_SUCCESSION    `off` leaves the overseer-dead,
+                              overseer-walled and overseer-reserve notices and
                               launches no successor; `oversee-succeed` owns
-                              every other value. An overseer-mark line still
-                              goes out under it, carrying succession=off
+                              every other value. Reserve supervision stays
+                              live. Other reached account marks still emit
+                              overseer-mark with succession=off
   ORCH_OVERSEER_MARK_REPEAT   passes a standing overseer-mark, start-stalled
                               or refresh-failing waits before it is reported
                               again (default 5). The first event is always
@@ -1160,7 +1180,7 @@ ow_message() { # REASON FIELD=VALUE...
     mark-repeat-invalid) text='ORCH_OVERSEER_MARK_REPEAT must be a positive integer.' ;;
     overseer-mark-unjudged) text='The overseer own-mark judgement could not be made this pass, so its account marks settle nothing here. A standing mark is not cleared by a reading that failed; oversee-succeed owns the judgement and its own keyed line says why.' ;;
     overseer-wall-unjudged) text='The overseer pane read walled and the account judgement that would confirm it could not be made, so nothing is acted on: this pane carries the limit banners this watch relays about OTHER lanes, and the screen alone cannot tell those from the overseer own account running out. The reading is left to the next pass.' ;;
-    overseer-wall-unconfirmed) text='The overseer pane read walled and its own account measures room, so the banner on that screen is one this watch relayed about another lane and the overseer is working. Nothing is launched and no window is closed. The fields name the judgement that refuted it.' ;;
+    overseer-wall-unconfirmed) text='The account judgement did not confirm that the pane banner describes a wall on this overseer. The fields name that judgement. This watch declines wall recovery for this reading. Independent reserve recovery can still launch a successor in the same pass. See references/overseer-session-events.md, Recovery requests.' ;;
     overseer-wall-lifted) text='The overseer session rows last recorded a usage-limit failure and its own account now measures room, so the wall has lifted and the session is read as live. Only a finished turn writes the row that clears it.' ;;
     overseer-context-alerted) text='The overseer context record carried the same gap on two consecutive long passes, so the owner was sent one notice naming the pane and the gap, or already held the same notice text from a send within the last 24 hours that lane-mail refused to repeat as owner-notice-repeated, and the fleet log took one row unless an overseer-notice-failed line for its channel precedes this one; the event is not repeated while that gap stands. A notice to the owner that fails prints no such line and is sent again the next pass.' ;;
     overseer-context-unread) text='The overseer context record, or the session rows file its staleness is judged against, could not be read or is not a shape the lane-mail-check hook writes, so neither overseer-context event nor a context wedge is judged on it this pass. A harness field names a record whose harness no context adapter reads.' ;;
@@ -1172,7 +1192,9 @@ ow_message() { # REASON FIELD=VALUE...
     overseer-notice-failed) text='An overseer notice could not be delivered on the channel the field names. A notice from a pass still had its event line printed; a notice from the watch start has none.' ;;
     overseer-relaunch-failed) text='oversee-succeed refused or failed the relaunch; the overseer is not replaced and this watch keeps running. Its own keyed line says why.' ;;
     overseer-recovery-blocked) text='No account in the fleet qualifies for a successor, so the recovery stops rather than retry the same accounts. The notice reaches the fleet log and the overseer mailbox. Measured account and reset values come from an account mark. Unmeasured fields read account=unknown and resets=none. Login recovery has no usage reset: sign in to an account, then start a fresh overseer by hand.' ;;
-    overseer-succeeded) text='A successor holds the dead overseer window and runs its own watch. This one stops rather than read the fleet twice.' ;;
+    overseer-capacity-blocked) text='No account qualifies for a successor at the launch reserve. The current coordinator can still spend credits. Its watch continues without repeating the account sweep.' ;;
+    overseer-capacity-failed) text='The successor launch failed at the launch reserve. The current coordinator stays live. Its watch continues through the bounded retry and after exhaustion.' ;;
+    overseer-succeeded) text='A successor holds the overseer window and runs its own watch. This one stops rather than read the fleet twice.' ;;
     repeat-invalid) text='The repeat delay must be a non-negative integer.' ;;
     state-required) text='The option reads its lanes from the oversee workflow state. Add --state PATH.' ;;
     state-unreadable) text='The oversee state file could not be read. The watch stops rather than carry a partial fleet.' ;;
