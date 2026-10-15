@@ -2,15 +2,9 @@
 # oversee-cycle: a closed lane's record against its class target, the stamps
 # it writes to the lane record, the repeat-miss bar, and the per-class rollup.
 #
-# The real script runs from links to the shipped orch/scripts, laid out by
-# mutant_scripts beside a stub github skill, whose pr-timeline answers the
-# case's timeline.json, and a stub harness-ci classifier, which answers the
-# case's class file; a lane-host fake, which serves a hosted lane's files from
-# the case's host directory, stands in for that one link.
-# Each stub logs its argv to the case. The checkout is a two-commit
-# repository whose HEAD is the merge commit the timeline names; its origin
-# holds one more commit the checkout lacks. Each case asserts the printed
-# line, and the lane record's `cycle` read back from the fleet state.
+# The shipped recorder and evidence helper read a real first-parent range.
+# GitHub fixtures supply measured Actions logs. The executable classifier stub
+# records forbidden proof calls. A lane-host fake serves hosted lane state.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/git-env.sh"
 
@@ -71,7 +65,7 @@ case "$1" in
   *) exit 9 ;;
 esac
 SH
-# gh answers `repo view` with the case's slug file, owner/repo by default,
+# gh answers `repo view` with the case's slug file, vanillagreencom/kendex by default,
 # which is the repository this checkout resolves to. Its `api` answers a
 # repository activity read with the case's activity.json and a compare of
 # BASE with HEAD with the case's compare-BASE...HEAD file, the status
@@ -83,15 +77,36 @@ cat > "$TMP_ROOT/bin/gh" <<'SH'
 if [[ "$1" == api ]]; then
   printf '%s\n' "$*" >> "$CASE/gh.calls"
   case "$*" in
-    "api --paginate repos/owner/repo/activity?"*) file="$CASE/activity.json" ;;
-    "api repos/owner/repo/compare/"*" --jq .status") file="$CASE/compare-${2#*/compare/}" ;;
+    "api repos/vanillagreencom/kendex/commits/"*"/check-runs?"*)
+      head=${2#*/commits/}; head=${head%%/*}
+      base=$(git rev-parse "$head^1")
+      printf '%s\n' "--base $base --head $head" >> "$CASE/evidence.calls"
+      printf '%s' "$head" > "$CASE/request-head"
+      # The production job skips pushes. Only PR timeline cases have a
+      # merge-group producer; a direct push has no classifier check.
+      [[ -f $CASE/timeline.json && -f $CASE/class ]] || { printf '[{"total_count":0,"check_runs":[]}]\n'; exit 0; }
+      jq -cn --arg head "$head" '[{total_count:1,check_runs:[{id:72,name:"Classify the diff",app:{slug:"github-actions"},head_sha:$head,status:"completed",conclusion:"success"}]}]'; exit 0 ;;
+    "api repos/vanillagreencom/kendex/actions/jobs/72")
+      jq -cn --arg head "$(cat "$CASE/request-head")" '{id:72,run_id:20,check_run_url:"https://api.github.com/repos/vanillagreencom/kendex/check-runs/72",name:"Classify the diff",head_sha:$head,status:"completed",conclusion:"success"}'; exit 0 ;;
+    "api repos/vanillagreencom/kendex/actions/runs/20")
+      jq -cn --arg head "$(cat "$CASE/request-head")" --arg repo "$(cat "$CASE/run-repo" 2>/dev/null || printf vanillagreencom/kendex)" '{id:20,path:".github/workflows/skill-tests.yml",event:"merge_group",head_sha:$head,repository:{full_name:$repo},head_repository:{full_name:$repo},status:"completed",conclusion:"success"}'; exit 0 ;;
+    "api repos/vanillagreencom/kendex/actions/jobs/72/logs --allow-escape-sequences")
+      [[ ! -e $CASE/log-failed ]] || exit 1
+      head=$(cat "$CASE/request-head"); base=$(git rev-parse "$head^1")
+      [[ ! -e $CASE/log-head ]] || head=$(cat "$CASE/log-head")
+      [[ ! -e $CASE/log-base ]] || base=$(cat "$CASE/log-base")
+      measured=true; [[ ! -e $CASE/measured ]] || measured=$(cat "$CASE/measured")
+      reason=stub; [[ ! -e $CASE/reason ]] || reason=$(cat "$CASE/reason")
+      printf 'base-rev: %s\nhead-rev: %s\nclass: class=%s measured=%s cause=%s\n' "$base" "$head" "$(cat "$CASE/class")" "$measured" "$reason"; exit 0 ;;
+    "api --paginate repos/vanillagreencom/kendex/activity?"*) file="$CASE/activity.json" ;;
+    "api repos/vanillagreencom/kendex/compare/"*" --jq .status") file="$CASE/compare-${2#*/compare/}" ;;
     *) exit 9 ;;
   esac
   [[ -f "$file" ]] || { echo 'gh: Not Found (HTTP 404)' >&2; exit 1; }
   exec cat -- "$file"
 fi
 [[ "$1 $2" == "repo view" ]] || exit 1
-if [[ -f "$CASE/slug" ]]; then cat "$CASE/slug"; else echo owner/repo; fi
+if [[ -f "$CASE/slug" ]]; then cat "$CASE/slug"; else echo vanillagreencom/kendex; fi
 SH
 chmod +x "$LAYOUT/github/scripts/github.sh" "$LAYOUT/harness-ci/scripts/change-class" "$LAYOUT/orch/scripts/lane-host" "$TMP_ROOT/bin/gh"
 
@@ -102,6 +117,10 @@ REPO="$TMP_ROOT/repo"
 git init -q "$REPO"
 git -C "$REPO" config gc.auto 0
 git -C "$REPO" config maintenance.auto false
+mkdir -p "$REPO/.github/workflows" "$REPO/.github/actions/change-class"
+cp "$TEST_DIR/../../../.github/workflows/skill-tests.yml" "$REPO/.github/workflows/"
+cp "$TEST_DIR/../../../.github/actions/change-class/"{action.yml,classify,proof} "$REPO/.github/actions/change-class/"
+git -C "$REPO" add .github
 commit "$REPO" base
 env GIT_AUTHOR_DATE='1790000060 +0000' GIT_COMMITTER_DATE='1790000900 +0000' \
   git -C "$REPO" -c user.name=t -c user.email=t@t commit -q --allow-empty -m merge
@@ -141,7 +160,7 @@ timeline() {
   jq -n --arg merge "$MERGE" --arg fc "$(at 60)" --arg cr "$(at 120)" --arg gate "$(at 300)" \
     --arg ci "$(at 360)" --arg armed "$(at 420)" --arg merged "$(at "$1")" --argjson open "$(($1 - 120))" \
     --arg fg "$(at "${2:-300}")" --arg push "$(at "${3:-110}")" --argjson rounds "${PR_ROUNDS:-[]}" \
-    '{pr: 7, repo: "owner/repo", state: "MERGED", head: "h", merge_commit: $merge,
+    '{pr: 7, repo: "vanillagreencom/kendex", state: "MERGED", head: "h", merge_commit: $merge,
       stamps: {first_commit: $fc, created: $cr, last_push: $push, first_bot_review: null,
                first_gate_met: $fg, gate_met: $gate, ci_green: $ci, armed: $armed,
                queued: null, merged: $merged},
@@ -193,7 +212,7 @@ while IFS='|' read -r name form want_out want_err; do
     "${want_out//SHA/$MERGE}|$want_err" "delivery flags: $name"
 done <<'ROWS'
 PR|pr|rc=0 cycle item=KEN-1 pr=7 class=small tier=micro target=1800 merge_group=- ci_head=60 ci_clean=- lane=900 actual=900 open=780 verdict=met|
-direct push|commit|rc=0 cycle item=KEN-1 commit=SHA class=small tier=micro target=1800 merge_group=- ci_head=- ci_clean=- lane=900 actual=900 open=- verdict=met|
+direct push|commit|rc=0 cycle item=KEN-1 commit=SHA class=- tier=micro target=- merge_group=- ci_head=- ci_clean=- lane=900 actual=900 open=- verdict=unclassified|
 both|both|rc=2 |oversee-cycle: usage=--pr,--commit
 neither|neither|rc=2 |oversee-cycle: usage=--pr,--commit
 ROWS
@@ -208,19 +227,19 @@ RECORD_ARGS=(--commit "$MERGE")
 pushes "300:$BASE" "1200:$MERGE"
 got="$(record KEN-1 '')"
 assert_eq "$got" \
-  "rc=0 cycle item=KEN-1 commit=$MERGE class=small tier=micro target=1800 merge_group=- ci_head=- ci_clean=- lane=1200 actual=1200 open=- verdict=met phase=- phase_secs=- cause=- bot_wait=- draft=- thread_fix=- paused=- missing=pr_opened,gate_green,ci_green,armed review=- fix=- bot=- full_validations=- pr_rounds=- escaped=true tier_inputs=- class_reason=stub escape_cause=- refixed=-" \
-  "direct push prints the commit, elapsed time to its push, escape and absent PR fields"
+  "rc=0 cycle item=KEN-1 commit=$MERGE class=- tier=micro target=- merge_group=- ci_head=- ci_clean=- lane=1200 actual=1200 open=- verdict=unclassified phase=- phase_secs=- cause=- bot_wait=- draft=- thread_fix=- paused=- missing=pr_opened,gate_green,ci_green,armed review=- fix=- bot=- full_validations=- pr_rounds=- escaped=- tier_inputs=- class_reason=- escape_cause=- refixed=-" \
+  "direct push prints its timing, unclassified verdict and absent PR fields"
 assert_eq "$(state '.lanes[0].cycle | [.commit, has("pr"), .class, .tier, .actual, .escaped, .stamps]')" \
-  "[\"$MERGE\",false,\"small\",\"micro\",1200,true,{\"launched\":\"$(at 0)\",\"first_commit\":\"$(at 60)\",\"pr_opened\":null,\"gate_green\":null,\"ci_green\":null,\"armed\":null,\"merged\":\"$(at 1200)\"}]" \
+  "[\"$MERGE\",false,null,\"micro\",1200,null,{\"launched\":\"$(at 0)\",\"first_commit\":\"$(at 60)\",\"pr_opened\":null,\"gate_green\":null,\"ci_green\":null,\"armed\":null,\"merged\":\"$(at 1200)\"}]" \
   "direct push persists its authored date and its push time, not its committer date, in UTC"
-assert_eq "$(grep -c '^api --paginate repos/owner/repo/activity?ref=refs%2Fheads%2Fmain&activity_type=push&per_page=100' "$CASE/gh.calls")|$(grep -c compare/ "$CASE/gh.calls" || true)" \
+assert_eq "$(grep -c '^api --paginate repos/vanillagreencom/kendex/activity?ref=refs%2Fheads%2Fmain&activity_type=push&per_page=100' "$CASE/gh.calls")|$(grep -c compare/ "$CASE/gh.calls" || true)" \
   "1|0" "the push is read from the base branch's push log, and a push leaving the branch at the commit needs no compare"
 assert_eq "$(state '.fleet_log[-1].text')" "\"${got#rc=0 }\"" "direct cycle row is the printed row"
-assert_eq "$(grep -o -- '--base [^ ]* --head [^ ]*' "$CASE/class.calls")" "--base $BASE --head $MERGE" \
-  "direct push reuses the first-parent classifier"
-assert_eq "$(test -f "$CASE/github.calls" && echo called || echo absent)" absent "direct push reads no PR or CI checks"
+assert_eq "$(grep -o -- '--base [^ ]* --head [^ ]*' "$CASE/evidence.calls")" "--base $BASE --head $MERGE" \
+  "direct push reads first-parent evidence"
+assert_eq "$(test -f "$CASE/github.calls" && echo called || echo absent)" absent "direct push reads no PR timeline"
 assert_contains "$(cd "$REPO" && "$BIN" --state-dir "$CASE/state" rollup)" \
-  'rollup class=small items=1 median=1200 p90=1200 lane_median=1200 open_median=- miss_share=0/1 misses=0' "rollup includes the direct push in its class"
+  'rollup class=unclassified items=1 median=1200 p90=1200 lane_median=1200 open_median=- miss_share=- misses=0' "rollup retains direct-push timing without a measured miss"
 
 # A push the log cannot place: each row is the base branch's push log, the
 # compare answers, and the merged stamp, actual and merged-unread cause the
@@ -321,17 +340,17 @@ got="$(record KEN-1 micro)"
 assert_eq "$(field actual "$got") $(field open "$got") $(field verdict "$got")" "actual=2000 open=1100 verdict=miss" \
   "the lane verdict includes work before PR opened, while open time stays visible"
 
-echo "=== the class is read over the merge commit's first parent to the merge ==="
-assert_eq "$(grep -o -- '--base [^ ]* --head [^ ]*' "$CASE/class.calls")" "--base $BASE --head $MERGE" \
-  "the classifier is handed merge^1 and the merge commit"
+echo "=== evidence binds the merge commit and its first parent ==="
+assert_eq "$(grep -o -- '--base [^ ]* --head [^ ]*' "$CASE/evidence.calls")" "--base $BASE --head $MERGE" \
+  "evidence is requested for merge^1 and the merge commit"
 
-echo "=== a class the classifier did not give is unclassified, never judged ==="
+echo "=== a class the evidence did not give is unclassified, never judged ==="
 new_case unclassified
 timeline 5401
 assert_eq "$(record KEN-1 standard)" \
   "rc=0 cycle item=KEN-1 pr=7 class=- tier=standard target=- merge_group=- ci_head=60 ci_clean=- lane=5401 actual=5401 open=5281 verdict=unclassified phase=merged phase_secs=4981 cause=- bot_wait=180 draft=0 thread_fix=0 paused=0 missing=- review=- fix=- bot=- full_validations=- pr_rounds=0 escaped=- tier_inputs=- class_reason=- escape_cause=- refixed=false" \
-  "the classifier's refusal records no class and no target"
-assert_eq "$(grep '^oversee-cycle: class-unread' "$CASE/err")" "oversee-cycle: class-unread cause=classifier-exit-2" "and names the cause on stderr"
+  "absent evidence records no class and no target"
+assert_eq "$(grep '^oversee-cycle: class-unread' "$CASE/err")" "oversee-cycle: class-unread cause=ci-proof-missing" "and names the cause on stderr"
 
 new_case unmeasured-class
 printf standard > "$CASE/class"; printf false > "$CASE/measured"
@@ -355,8 +374,45 @@ printf micro > "$CASE/class"
 timeline 1000
 edit_json "$CASE/timeline.json" ".merge_commit = \"$FAR\""
 got="$(record KEN-1 micro)"
-assert_eq "$(field class "$got")|$(grep -o -- '--head [^ ]*' "$CASE/class.calls")" "class=micro|--head $FAR" \
-  "a merge commit only origin holds is fetched and classified"
+assert_eq "$(field class "$got")|$(grep -o -- '--head [^ ]*' "$CASE/evidence.calls")" "class=micro|--head $FAR" \
+  "a merge commit only origin holds is fetched for its evidence"
+
+# Exact evidence reaches the production recorder without executable proof.
+while IFS='|' read -r row cause; do
+  new_case "evidence-$row"
+  printf micro > "$CASE/class"
+  timeline 1000
+  case "$row" in
+    accepted) ;;
+    unreadable) touch "$CASE/log-failed" ;;
+    repository) printf other/repo > "$CASE/run-repo" ;;
+    base) printf '%s' "$MERGE" > "$CASE/log-base" ;;
+    head) printf '%s' "$BASE" > "$CASE/log-head" ;;
+    origin) printf owner/other > "$CASE/slug" ;;
+  esac
+  got="$(record KEN-1 micro)"
+  if [[ $cause == pass ]]; then
+    assert_eq "$(state '.lanes[0].cycle | [.class,.target,.class_reason]')" '["micro",1200,"stub"]' "$row exact evidence"
+  else
+    assert_eq "$(state '.lanes[0].cycle | [.class,.verdict,.class_cause]')" "[null,\"unclassified\",\"$cause\"]" "$row refuses evidence"
+  fi
+  assert_eq "$(test -e "$CASE/class.calls" && echo called || echo absent)" absent "$row runs no classifier"
+done <<'ROWS'
+accepted|pass
+unreadable|ci-proof-missing
+repository|ci-proof-missing
+base|ci-proof-missing
+head|ci-proof-missing
+origin|origin-untrusted
+ROWS
+CYCLE_CONTROL="$LAYOUT/orch/scripts/cycle-executable-control"
+cp "$BIN" "$CYCLE_CONTROL"
+mutate_file "$CYCLE_CONTROL" 'change_class_merged "$base" "$merge" "$checkout" "$evidence_repo" "$WORK/class.err"' 'change_class_read "$base" "$merge" "$checkout" "$WORK/class.err"'
+new_case evidence-control
+printf micro > "$CASE/class"
+timeline 1000
+RUN_BIN="$CYCLE_CONTROL" record KEN-1 micro >/dev/null
+assert_eq "$(test -s "$CASE/class.calls" && echo called || echo absent)" called 'cycle control makes the no-execution assertion red'
 
 # --- the stamps are written to the record and read back ----------------------
 echo "=== the record carries its seven stamps, its class and its rounds ==="
@@ -413,25 +469,28 @@ no-green|1394|null|963|3557|pr|present|target=2163 ci_head=1394 ci_clean=- lane=
 no-group|1394|1394|null|2594|pr|present|target=2594 ci_head=1394 ci_clean=1394 lane=1200 verdict=met|[2594,1394,1394,1200,2474]
 no-ci|null|null|null|1200|pr|present|target=1200 ci_head=- ci_clean=- lane=1200 verdict=met|[1200,null,null,1200,1080]
 missing-launch|1394|1394|963|3557|pr|missing|target=3557 ci_head=1394 ci_clean=1394 lane=- verdict=unmeasured|[3557,1394,1394,null,3437]
-direct|null|null|null|1200|commit|present|target=1200 ci_head=- ci_clean=- lane=1200 verdict=met|[1200,null,null,1200,null]
+direct|null|null|null|1200|commit|present|target=- ci_head=- ci_clean=- lane=1200 verdict=unclassified|[null,null,null,1200,null]
 ROWS
   RECORD_ARGS=(--pr 7)
 }
 clean_ci_rows shipped
 RUN_BIN=""
 
-# Direct pushes use the same measured lane verdict as the rollup.
+# Direct pushes retain elapsed time without a class target or miss verdict.
 direct_verdicts() {
-  while IFS='|' read -r name secs verdict share misses; do
+  while IFS='|' read -r name secs; do
     new_case "direct-verdict-$1-$name"
     printf small > "$CASE/class"
     RECORD_ARGS=(--commit "$MERGE"); pushes "$secs:$MERGE"
     got="$(record KEN-1 micro)"
-    assert_eq "$(field verdict "$got") $(field target "$got") $(field ci_head "$got") $(field ci_clean "$got")|$(cd "$REPO" && "${RUN_BIN:-$BIN}" --state-dir "$CASE/state" report | grep -o 'miss_share=[^ ]* misses=[^ ]*')" \
-      "verdict=$verdict target=1800 ci_head=- ci_clean=-|miss_share=$share misses=$misses" "direct $name: record and rollup agree"
+    assert_eq "$(state '.lanes[0].cycle | [.class,.class_cause,.verdict,.actual,.lane_secs,.target]')" \
+      "[null,\"ci-proof-missing\",\"unclassified\",$secs,$secs,null]" "direct $name: absent production evidence preserves timing without classification"
+    assert_eq "$(field verdict "$got") $(field target "$got") $(field ci_head "$got") $(field ci_clean "$got")|$(cd "$REPO" && "${RUN_BIN:-$BIN}" --state-dir "$CASE/state" report | sed -E 's/ draft=.*//')" \
+      "verdict=unclassified target=- ci_head=- ci_clean=-|rollup class=unclassified items=1 median=$secs p90=$secs lane_median=$secs open_median=- miss_share=- misses=0" "direct $name: unclassified rollup retains elapsed time"
+    assert_not_contains "$(cat "$CASE/gh.calls")" '/actions/jobs/' "direct $name: discovery supplies no invented job or log"
   done <<'ROWS'
-boundary|1800|met|0/1|0
-miss|1801|miss|1/1|1
+earlier|1800
+later|1801
 ROWS
   RECORD_ARGS=(--pr 7)
 }
@@ -625,14 +684,14 @@ timeline 1200
 edit_json "$CASE/state/workflow-state-oversee.json" "(.lanes[] | select(.item == \"KEN-5\")).mail_root = \"$ELSE\" | (.lanes[] | select(.item == \"KEN-6\")).mail_root = \"$TMP_ROOT/same\""
 while IFS='|' read -r label item args want; do
   [[ -n "$label" ]] || continue
-  : > "$CASE/class.calls"
+  : > "$CASE/evidence.calls"
   # shellcheck disable=SC2086
   got="$(record "$item" micro $args)"
-  assert_eq "$(field class "$got") $(field fix "$got")|$(grep -m 1 class-unread "$CASE/err" || true)|$(wc -l < "$CASE/class.calls" | tr -d ' ')" "$want" "$label"
+  assert_eq "$(field class "$got") $(field fix "$got")|$(grep -m 1 class-unread "$CASE/err" || true)|$(wc -l < "$CASE/evidence.calls" | tr -d ' ')" "$want" "$label"
 done <<'ROWS'
 a local lane whose worktree names another origin|KEN-5||class=- fix=9|oversee-cycle: class-unread cause=checkout-other-repo|0
 a lane named in another repository|KEN-1|--repo owner/other|class=- fix=-|oversee-cycle: class-unread cause=checkout-other-repo|0
-a lane named in this repository, in any case|KEN-1|--repo Owner/Repo|class=micro fix=-||1
+a lane named in this repository, in any case|KEN-1|--repo Vanillagreencom/Kendex|class=micro fix=-||1
 a local lane in a worktree of this checkout|KEN-6||class=micro fix=-||1
 ROWS
 git -C "$REPO" worktree remove --force "$TMP_ROOT/same"
@@ -1127,7 +1186,7 @@ assert_eq "$(state '.lanes[0].cycle | [.tier_inputs, .class_cause, .class_reason
 assert_contains "$(state '.fleet_log[-1].text')" 'class_reason=production-past-small escape_cause=estimate-miss' "fleet log retains escape evidence"
 assert_eq "$(record KEN-1 standard)|$(cat "$CASE/err")" \
   'rc=1 |oversee-cycle: tier-mismatch item=KEN-1 launch=small given=standard' "a hand tier cannot erase a launch escape"
-assert_eq "$(wc -l < "$CASE/class.calls" | tr -d ' ')" '1' "tier mismatch refuses before classification"
+assert_eq "$(wc -l < "$CASE/evidence.calls" | tr -d ' ')" '1' "tier mismatch refuses before evidence read"
 RUN_BIN=""
 
 # Existing classifier evidence explains misses without another classifier.
@@ -1253,7 +1312,7 @@ mkdir -p "$hosted_root/tmp" "$hosted_clone/lane-state" "$CASE/ssh-bin" "$CASE/ho
 printf 'gitdir: %s/.git/worktrees/KEN-1\n' "$hosted_clone" > "$hosted_root/.git"
 cp "$stage_case_root/stage-state.saved" "$hosted_root/tmp/workflow-state-pr-7.json"
 jq -n --arg clone "$hosted_clone" --arg account "$CASE/account" \
-  '[{repo:"owner/repo",item:"KEN-1",target:"lane.example",clone:$clone,account:$account}]' > "$CASE/hosts.json"
+  '[{repo:"vanillagreencom/kendex",item:"KEN-1",target:"lane.example",clone:$clone,account:$account}]' > "$CASE/hosts.json"
 cat > "$CASE/ssh-bin/ssh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
