@@ -98,6 +98,28 @@ screen_for() {
     copilot_working) cat "$CODEX_PANES/copilot-working.txt" ;;
     copilot_trust) cat "$CODEX_PANES/copilot-dialog-trust.txt" ;;
     pi_working) cat "$CODEX_PANES/pi-working.txt" ;;
+    # Fleet's retained Pi 1.2.0 viewer, captured 2026-10-15T01:20:55Z with
+    # tmux capture-pane -pJ from fleet:gh-1326 pane %1656, after the refusals.
+    # Full viewport/provenance: KEN-4109 attachment overseer215-pi-screen-capture-source.md.
+    pi_current) cat "$CODEX_PANES/pi-current.txt" ;;
+    pi_current_no_title) sed '1d' "$CODEX_PANES/pi-current.txt" ;;
+    pi_current_no_footer) sed '/^● fleet /d' "$CODEX_PANES/pi-current.txt" ;;
+    pi_current_no_dashboard) sed '/^┏/,/^┗/d' "$CODEX_PANES/pi-current.txt" ;;
+    pi_current_no_prompt) sed '/^π/d' "$CODEX_PANES/pi-current.txt" ;;
+    pi_current_empty_bar) sed '/^● fleet /{s/─/ /g;s/[0-9][0-9]*%/0%/;}' "$CODEX_PANES/pi-current.txt" ;;
+    pi_current_empty_bar_no_dashboard) screen_for pi_current_empty_bar | sed '/^┏/,/^┗/d' ;;
+    # QolStatusEditor omits the prefix at idle. Pi's CompactionStatusIndicator
+    # renders its label through the same footer; unknown usage and the optional
+    # child badge come from renderStatusLine and subagentStatuslineMarker.
+    pi_current_idle) sed '/^● fleet /s/^● //' "$CODEX_PANES/pi-current.txt" ;;
+    pi_current_other_busy) sed '/^● fleet /s/^● /⠋ Compacting context... (esc to cancel) /' "$CODEX_PANES/pi-current.txt" ;;
+    pi_current_idle_empty_bar_no_dashboard) screen_for pi_current_empty_bar_no_dashboard | sed '/^● fleet /s/^● //' ;;
+    pi_current_unknown_context_suffix) screen_for pi_current_idle_empty_bar_no_dashboard | sed '/^fleet /s/0%/…% child-agent/' ;;
+    pi_current_idle_no_title) screen_for pi_current_idle_empty_bar_no_dashboard | sed '1d' ;;
+    pi_current_idle_no_footer) screen_for pi_current_idle_empty_bar_no_dashboard | sed '/^fleet /d' ;;
+    pi_current_idle_no_prompt) screen_for pi_current_idle_empty_bar_no_dashboard | sed '/^π/d' ;;
+    pi_current_variable) sed -e '1s/Fleet PR 1326 Fallback Approval Review - issue-1326/Another session/' -e '/^● fleet /c\
+● other-project (branch) Provider / Other model / setting                          ───────── 4%' "$CODEX_PANES/pi-current.txt" ;;
     pi_header_only) sed '/^──/,$d' "$CODEX_PANES/pi-working.txt" ;;
     pi_editor_only) sed -n '/^──/,$p' "$CODEX_PANES/pi-working.txt" ;;
     *) printf 'screen_for: no such screen: %s\n' "$1" >&2; return 1 ;;
@@ -219,10 +241,10 @@ unset LANE_HOST_STUB_HARNESS_STATE LANE_HOST_STUB_PROBE_STATUS
 # Whether a launcher sees the harness up on a pane it opened: the Copilot
 # composer is two lines, so it is the one screen the one-line pattern misses.
 # A dialog answers no, the direction the launcher waits out.
-while IFS='|' read -r name screen want; do
+while IFS='|' read -r name screen want screen_locale; do
   [[ -n "$name" ]] || continue
   up=no
-  ! pane_harness_up "$(screen_for "$screen")" || up=yes
+  ! LC_ALL="${screen_locale:-C}" pane_harness_up "$(screen_for "$screen")" || up=yes
   assert_eq "$up" "$want" "$name"
 done <<'ROWS'
 a claude composer is the harness up|idle|yes
@@ -230,31 +252,48 @@ an idle copilot composer is the harness up|copilot_idle|yes
 a signed-out copilot composer is still the harness up|copilot_signed_out_idle|yes
 a copilot command in flight is the harness up|copilot_working|yes
 copilot's folder-trust dialog is not|copilot_trust|no
-a Pi compact working screen is the harness up|pi_working|yes
+a Pi compact working screen is the harness up in C locale|pi_working|yes|C
+a Pi compact working screen is the harness up in UTF-8 locale|pi_working|yes|C.UTF-8
+a reported current Pi screen is ready in C locale|pi_current|yes|C
+a reported current Pi screen is ready in UTF-8 locale|pi_current|yes|C.UTF-8
+current Pi without its optional dashboard is ready in C locale|pi_current_no_dashboard|yes|C
+current Pi without its optional dashboard is ready in UTF-8 locale|pi_current_no_dashboard|yes|C.UTF-8
+current Pi with an empty context bar is ready in C locale|pi_current_empty_bar|yes|C
+current Pi with an empty context bar is ready in UTF-8 locale|pi_current_empty_bar|yes|C.UTF-8
+current Pi with an empty bar and no dashboard is ready in C locale|pi_current_empty_bar_no_dashboard|yes|C
+current Pi with an empty bar and no dashboard is ready in UTF-8 locale|pi_current_empty_bar_no_dashboard|yes|C.UTF-8
+current Pi at idle is ready in C locale|pi_current_idle|yes|C
+current Pi at idle is ready in UTF-8 locale|pi_current_idle|yes|C.UTF-8
+current Pi with another busy indicator is ready in C locale|pi_current_other_busy|yes|C
+current Pi with another busy indicator is ready in UTF-8 locale|pi_current_other_busy|yes|C.UTF-8
+idle Pi with an empty bar and no dashboard is ready in C locale|pi_current_idle_empty_bar_no_dashboard|yes|C
+idle Pi with an empty bar and no dashboard is ready in UTF-8 locale|pi_current_idle_empty_bar_no_dashboard|yes|C.UTF-8
+current Pi with unknown context and a child suffix is ready in C locale|pi_current_unknown_context_suffix|yes|C
+current Pi with unknown context and a child suffix is ready in UTF-8 locale|pi_current_unknown_context_suffix|yes|C.UTF-8
+idle Pi with an empty bar and no title is not ready in C locale|pi_current_idle_no_title|no|C
+idle Pi with an empty bar and no title is not ready in UTF-8 locale|pi_current_idle_no_title|no|C.UTF-8
+idle Pi with an empty bar and no footer is not ready in C locale|pi_current_idle_no_footer|no|C
+idle Pi with an empty bar and no footer is not ready in UTF-8 locale|pi_current_idle_no_footer|no|C.UTF-8
+idle Pi with an empty bar and no prompt is not ready in C locale|pi_current_idle_no_prompt|no|C
+idle Pi with an empty bar and no prompt is not ready in UTF-8 locale|pi_current_idle_no_prompt|no|C.UTF-8
+current Pi readiness allows different title and footer content|pi_current_variable|yes
+current Pi without its title is not ready|pi_current_no_title|no
+current Pi without its footer is not ready|pi_current_no_footer|no
+current Pi without its prompt is not ready|pi_current_no_prompt|no
 a Pi startup interrupted before its editor is not ready|pi_header_only|no
 a Working border without Pi startup is not proof of Pi|pi_editor_only|no
 a bare shell is not the harness up|shell|no
+a blank screen is not the harness up|blank|no
 ROWS
 
-# Each requirement in Pi's readiness proof has its own inverse. The disabled
-# proof rejects the live capture; dropping either requirement accepts a partial
-# redraw. mutate_file asserts each edit on a private copy of the shared owner.
-for row in 'disabled|pi_working|no' 'header|pi_editor_only|yes' 'editor|pi_header_only|yes'; do
-  rule="${row%%|*}" rest="${row#*|}" screen="${rest%%|*}" want="${rest#*|}"
-  pi_mutant="$TMP_ROOT/pi-readiness-$rule.sh"
-  cp -- "$SCRIPTS_DIR/lib/lane-state.sh" "$pi_mutant"
-  case "$rule" in
-    disabled) mutate_file "$pi_mutant" '|| { grep -Eq -- "$PI_COMPACT_HEADER_RE"' '|| { false && grep -Eq -- "$PI_COMPACT_HEADER_RE"' ;;
-    header) mutate_file "$pi_mutant" 'grep -Eq -- "$PI_COMPACT_HEADER_RE" <<<"$1" &&' 'true &&' ;;
-    editor) mutate_file "$pi_mutant" '&& grep -Eq -- "$PI_COMPACT_EDITOR_RE" <<<"$1";' '&& true;' ;;
-  esac
-  pi_screen="$(screen_for "$screen")"
-  pi_up="$(
-    source "$pi_mutant"
-    if pane_harness_up "$pi_screen"; then printf yes; else printf no; fi
-  )"
-  assert_eq "$pi_up" "$want" "control: Pi readiness $rule changes the $screen answer"
-done
+up=no
+! pane_working "$(screen_for pi_current)" || up=yes
+assert_eq "$up" no 'current Pi readiness does not assert turn activity'
+PI_CURRENT_MUTANT="$(mutant_scripts pi-current lib/lane-state.sh)" || exit 1
+mutate_file "$PI_CURRENT_MUTANT/lib/lane-state.sh" '|| { grep -Eq -- "$PI_CURRENT_TITLE_RE"' '|| { false && grep -Eq -- "$PI_CURRENT_TITLE_RE"'
+pi_up="$(export LC_ALL=C; source "$PI_CURRENT_MUTANT/lib/lane-state.sh"; if pane_harness_up "$(screen_for pi_current_idle_empty_bar_no_dashboard)"; then printf yes; else printf no; fi)"
+pi_current_red="$(FAIL=0; assert_eq "$pi_up" yes control >/dev/null; printf '%s' "$FAIL")"
+assert_eq "$pi_current_red" 1 'control: removing current Pi readiness rejects the idle empty-bar screen'
 
 # A scan that fails is not an answer: exit 2 and `unjudged`, never a verdict a
 # caller could act on, and never the `idle` the session read claimed. The grep
