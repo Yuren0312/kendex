@@ -65,6 +65,8 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - Version releases build a selected merged commit through the reviewed main workflow. Release signing and AUR publication use the main-only environment.
 - The stable release procedure requires the Jarvis session or owner to move the release's major tag and verify its target after publication, so consumer refresh uses that release. A tag that already names a newer release stays there.
 
+- Verification of bot instructions succeeds with an empty owned-file report when the repository has no `[bot-instructions]` table and no stranded bot files. A stranded bot file still fails the orphan check.
+
 ## [1.17.0] - 2026-10-11
 
 ### Added
@@ -77,11 +79,17 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 
 - Consumer CI installs the release selected by its refresh caller. The refresh engine and verifier use the same version while a newer release waits for the major tag move.
 
+### Fixed
+
+- Keep refresh pull requests in the render class when their only manifest change increases the top-level schema by one, including schema-only refreshes after head verification. Other manifest edits still require configuration review.
+
 ## [1.16.0] - 2026-10-11
 
 ### Added
 
 - Skills can declare `dependencies.agents` in `SKILL.md` to install and render required agents on selected harnesses that support them at the install scope. Package previews show required agents and their install state. Unsupported tools get a warning while the skill installs. Refresh updates the list, and removal with a sweep keeps agents also added by name.
+
+- Repositories can use `HARNESS_CI_STANDARD_PATHS` to require standard review for high-risk paths, even for a small change.
 
 ### Fixed
 
@@ -99,9 +107,12 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 
 - `kendex update` prints the release notes link after it installs.
 - Older supported personal and project manifests are rewritten to the current schema on apply, refresh, install and any write. Comments, layout and line endings stay in place. CLI apply, refresh, install and update, and app apply and editor save, show a note for each migrated file with the schema change and the changelog link. Other writes also migrate the file and may show no note. Read-only commands and plan preview leave the file unchanged.
+
 ### Fixed
 
 - Refuse project refreshes from marked lanes after they change directory into the main checkout; `--lane-refresh` still permits refresh lanes.
+
+- Reduce settings-load shell work when the parent exports many variables. Parent values keep their precedence over project files.
 
 - Consumer refresh pull requests carry the root manifest schema edit before refresh when the engine's schema is one above the committed value.
 
@@ -146,6 +157,8 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - Read and edit single-line TOML literal settings in the desktop app, keeping backslashes and valid quote delimiters. Private credential file selection also accepts these settings.
 - Settings pickers distinguish literal backslashes and double quotes from whitespace and empty values.
 
+- Consumer refresh accepts single-line TOML literal strings in project settings. Its settings readers preserve backslashes as text so a valid literal no longer blocks settings reads.
+
 - Environment data errors report the exception type without printing input values. Failed adoption reads terminate explicitly.
 
 ### Changed
@@ -173,6 +186,10 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - Pi refresh prompts distinguish installs from updates and identify project or user packages. Declining a scope leaves it unchanged, keeps earlier project results, and permits later user updates. Duplicate-package notices explain why Pi cannot start and let you choose which copy to keep.
 - Plans, removal messages, verification remedies and editor saves in source-catalog projects name `kendex-local.toml`, where the project's declarations are stored. Existing custom hooks keep their recorded source identity when refreshed, changed or disabled.
 
+- With `codex = false` in a configured `[bot-instructions.bots]` table, verification reports an `orphan` finding for each marked `## Code Review Rules` section of `AGENTS.md`, however many such headings there are. A marked section under a second heading no longer goes unreported.
+
+- A manifest with no `[bot-instructions]` table no longer hides marked bot files or `AGENTS.md` regions from verification. They produce `orphan` findings under any number of `## Code Review Rules` headings. The checker refuses as `unconfigured` only when none remains and reports `bot-instructions: renders=none`.
+
 - Prove refreshes in partial clones, identify a missing source commit with its fetch remedy, and verify adopted refresh callers against their pinned released template.
 
 ## [1.12.2] - 2026-10-08
@@ -184,6 +201,8 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - Keep installed dependency paths in the generated-file inventory and commit offer when an add leaves a pending installation-method change unapplied.
 - Adding a package keeps unrelated installed packages and shared dependency files unchanged. It keeps their file records for verification and commit ownership. It refuses dependency version conflicts across coding tools before writing, with the conflicting package and both source commits. It also refuses an install position occupied by another retained package. The first project Pi output style also keeps global Pi instructions.
 - Refresh, Updates and Library reuse each catalog snapshot's receipt validation within one operation instead of hashing the full catalog for each package.
+
+- The checker can report verified regular output files for refresh classification, including disabled installations, and refuses output links.
 
 - Refreshes that only regenerate Copilot instructions can classify as rendered changes after the trusted checker verifies them.
 
@@ -202,10 +221,6 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - The session-start drift report now gives each section's item count with one example, then one outcome line, and the next step where a refresh applies. It no longer shows a package check that the next background refresh repeats, and it shows no git commands, commit hashes or git error output. `kendex check --verbose` and `--json` keep those details, and `kendex updates --verbose` shows the technical cause under each warning. `kendex check` no longer says "all clear" while a check still waits on that refresh, and comparisons saved by an older kendex are made again after the upgrade.
 
 - Consumer refresh CI publishes the measured change class and skips product jobs after render proof. New generated files reach that proof through a prerequisite-only candidate. CI installs the latest released engine instead of a fixed older build.
-
-### Removed
-
-- The `skill-load-check` and `skill-load-record` hooks are retired and leave the `workflow` bundle. Edits and Linear commands are no longer held until a transcript shows a skill loaded, and a session is no longer refused when the load rule, the transcript or the payload cannot be read. `kendex refresh --prune` removes both hooks and their entries; `KENDEX_SKILL_LOAD_RULES` and `KENDEX_SKILL_LOAD_HOOK` are no longer read.
 
 ### Fixed
 
@@ -252,6 +267,10 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - Pi package updates report unresolved sources and unreadable manifests as not evaluated, update other packages, and exit with an error.
 - Verification names scoped refresh actions for stale packages and missing recorded commits. JSON keeps version 1 with optional action metadata. Base revision failures carry no refresh action.
 
+- Stop stamping a package version into the generated-file marker, so two changes to the package no longer conflict on every marker line; a refresh rewrites only that line.
+
+- Classify unowned and partially owned render paths as measured standard changes so consumers run full checks.
+
 - A consumer refresh run stuck waiting on the `kendex` environment gate no longer stops every later refresh: the next run force-cancels one that has waited past 30 minutes, re-reading each run just before the cancel and skipping one no longer waiting. The new release job takes the `actions: write` permission.
 
 - Publish refresh pull requests when new generated files accompany unowned bot instructions. Failed reads still stop publication.
@@ -269,6 +288,10 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - `kendex add`, `apply` and `remove` with `--allow-repo-effects` and `--commit`, `--push` or `--pull-request` now set up a package that holds the commit and commit its render in the same run.
 - `kendex remove --kind KIND` removes only the item of that kind, leaving a same-named item of another kind installed.
 
+- A `:queue` lane in `.github/ci-lanes.conf` skips matching pull requests and runs in the merge queue they go to, once they and the default branch carry a kendex refresh reading it.
+
+- `HARNESS_CI_QUEUE_SELECTOR` names a repository command whose listed merge-group jobs make a change queue-only, so it merges through the queue rather than the admin route.
+
 ### Changed
 
 - A `kendex.toml` still declaring `[hooks.doc-drift-check]` refreshes and applies: the hook stays installed with one notice line opening `doc-drift-check: `, and `kendex refresh --prune` removes it.
@@ -281,17 +304,12 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 
 - The consumer refresh passes --prune when the installed kendex offers it, so items the catalog retired leave the consumer in the refresh pull request.
 
-### Removed
-
-- The `doc-drift-check` hook is retired. `kendex remove doc-drift-check --scope project --sweep` removes its entry and files in one change; a rolling refresh sweeps a hand-deleted entry.
-
 ### Fixed
 
 - Catalog CI also refreshes an install of the caller's base catalog: dropping or renaming a package that catalog shipped now fails until a released kendex retires it; keep a stub.
 - `kendex add` and `kendex apply` run without a terminal now exit 3 when a package you named, a member of a bundle or collection you named, or a package one of those requires, is skipped on conflict, such as files kendex did not write in its place or a package no tool can render, and name each such package on a `skipped-on-conflict=` line. A package held back only by your own edits, one its catalog retired, or a copy a retired bundle keeps, leaves the exit as it was. The rest of the install is still written: `kendex apply --replace-unmanaged` installs a skipped package when every conflict is files it can replace, and each conflict line names the way out for the rest.
 - `kendex verify` and `kendex refresh` no longer count a `__pycache__` or `.pytest_cache` folder in an installed skill as an edit.
 - `install.sh --version main-build-N-A-SHA` installs that main build from its own feed, not a missing `v`-prefixed tag, and records its command on the main channel.
-- kendex 1.10.1 refreshes again with `[hooks.doc-drift-check]` declared; the hook runs no check. `kendex remove doc-drift-check --scope project --sweep` removes the entry and its files.
 - The rolling kendex refresh pull request removes the unedited files of a declaration deleted from kendex.toml by hand, so `kendex verify` passes on it.
 - `kendex remove` holds every package it does not name at the catalog commit `.kendex-lock.json` records, so removing one package no longer re-renders the rest at the newest catalog.
 - `kendex refresh` fails on a declared bundle its catalog no longer offers and keeps its members and what they require; a catalog can retire a bundle under `[retired.bundles]`.
@@ -301,6 +319,8 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - The retired-item notice, verify's left-over remedy and the session drift report's removal for an item gone from its source or left without a kendex.toml name the item's kind, so they no longer take a same-named item of another kind; the notice and verify name `--global` for a personal-setup item, and verify names only the removal for an edited left-over that refresh holds.
 - `kendex verify` fails a retired item kept installed when its files, or a Pi package's, were deleted or edited by hand, and says to remove it by name or refresh with `--prune`; before, it passed while the tool still registered the missing hook. A plain `kendex refresh` still passes on it, whatever its kind.
 - A retired hook kept installed no longer runs alone beside a requiring hook that refresh withholds: where its installed copy requires that hook, both go together, and removing either one by name takes the other. A withheld requirer you edited stays as an edit conflict, with the retired hook it runs with, until the retired hook is removed by name; and `kendex verify` names the withholding and its fix instead of `kendex apply records it`.
+
+- harness-ci's change classifier no longer classes a diff under `docs/plans/` as trivial at any size; a docs-only diff past `HARNESS_CI_TRIVIAL_MAX_LINES` measures like any other.
 
 - A consumer refresh pull request that changes the bot-instructions package now carries its render, so the consumer's bot-instructions check passes.
 
@@ -315,18 +335,22 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 ### Changed
 
 - Gemini projects' install record gains a `shims` entry. A `kendex verify` pinned to an earlier build fails the record row until the pin moves to this release.
+
 ### Fixed
 
 - Commit and restore keep your own keys in `.gemini/settings.json`. Dropping Gemini removes its `context.fileName` entry where a project has no `.git` of its own and after a broken file is fixed.
 - `kendex verify` fails the record row when `.kendex-lock.json` no longer carries the Gemini shim kendex keeps, or still carries one kendex no longer keeps; the next apply writes the record again.
+
 ## [1.10.0] - 2026-10-05
 
 ### Added
 
 - `kendex add --setting KEY=VALUE` writes a declared project setting into `kendex.settings.toml`; a key the file already assigns keeps its value.
+
 ### Changed
 
 - A consumer refresh pull request of any change class now arms auto-merge and merges once its required approval, thread resolution and checks pass. Before, only `render` armed.
+
 ## [1.9.0] - 2026-10-04
 
 ### Fixed
@@ -369,19 +393,23 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - On Codex, kendex now registers `SubagentStop` and `SessionEnd` hooks for every agent in `hooks.json`; before, a custom hook on these events was advisory prose and a package hook installed nothing.
 - On Copilot, the doc-drift-check, reviewer-stop-check, session-start-row and session-end-row hooks now install and run.
 - Model classes resolve through the CLI and Pi. Unknown access or capacity keeps the native default. Exact pins survive rendering; project class overrides apply to global agents.
+
 ### Changed
 
-- The kendex-refresh and harness-ci CI templates run on the `CI_RUNNER_2V` variable (organization or repository) when it is set, and on `ubuntu-latest` otherwise.
+- The kendex-refresh template runs on the `CI_RUNNER_2V` variable (organization or repository) when it is set, and on `ubuntu-latest` otherwise.
+
 ### Fixed
 
 - Non-render consumer refresh pull requests name the overseer or a maintainer as the merger through the merge queue after review and CI pass.
 - review-gate: a consumer refresh no longer fails `Argument list too long` on a busy refresh pull request; `refresh-reviews.sh` gives jq the thread and comment documents on stdin.
 - A non-render consumer refresh whose rolling pull request is already queued, merged or closed defers and exits 0 instead of failing the scheduled run.
+
 ## [1.6.0] - 2026-10-03
 
 ### Added
 
 - The kendex refresh pull request, or the run summary when no render changed, lists each committed setting that pins Fable or Astra under Deprecated models, as a warning.
+- harness-ci: with `HARNESS_CI_QUEUE_PATHS` unset, every change stays queue-only and the classifier prints one warning to set it in `[env]` to the repository's CI inputs, or empty for none.
 - Release checks refuse, from 1.0, a patch version bump whose release holds an Added or Breaking entry and a minor bump whose release holds a Breaking entry, naming the first such entry.
 - `kendex verify` names each hook whose `harnesses` pin keeps it off a default tool or names one it excludes; agent and skill adoption and the drift-check install write no pin equal to the default.
 
@@ -391,11 +419,13 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - A finding kendex accepts in its own packages stays accepted after an edit elsewhere in its file, including one that moves its line; an edit to the line itself still shows the finding again.
 - A consumer refresh whose only refused path is a retired rendered file now opens its pull request for review instead of stopping; removing a shared hook, MCP server or plugin entry still stops.
 - `kendex verify --base` no longer reports a hook, MCP server or plugin registry as hand-edited after one of its hooks, servers or plugins is retired.
+
 ## [1.5.1] - 2026-10-02
 
 ### Fixed
 
 - Since 1.5.0, verify names `kendex source refresh` when a source mirror lacks a recorded commit, including stale render rows; the 1.5.0 notes missed it.
+
 ## [1.5.0] - 2026-10-02
 
 ### Upgrading
@@ -409,6 +439,7 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - List and toggle Copilot's built-in MCP servers per scope. Enable or disable installed packages from the CLI with `kendex enable` and `kendex disable`.
 - Set KENDEX_REAL_HOME to an absolute path for a portable home on Linux, macOS and Windows, including global toggle and verify operations.
 - Install one output style per scope in Claude Code and Pi. Show safety findings, preserve user selections and unowned Pi blocks, and repair owned Pi edits with named discard.
+
 ### Changed
 
 - Consumer refresh reports the exact engine version in its rolling pull request or current-run summary. The review-gate writer installs the latest release from its immutable installer commit.
@@ -418,7 +449,9 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 
 - Shared CLI package commands accept output-style. Their kind help and unknown-kind choices include output-style while keeping existing aliases.
 - List Copilot's built-in servers and switch them on or off per scope. Enable or disable any installed package from the CLI.
-- Git hook checks no longer emit a stray Broken pipe error when a helper program has changed.
+- Hook headers can limit companion requirements with `requires-on`.
+
+- Branch checks no longer treat documentation or changelog files as an extra source subsystem. Their added lines still count toward the small size limit.
 - Consumer refresh preserves edited renders and stops before workflow adoption or publication instead of discarding the edits.
 - Consumer refresh preserves hand-edited workflows and accepts exact historical shipped workflows even without an adoption record.
 - Windows add and subscription commands use the catalog directory name for native local paths instead of including the parent directories.
@@ -438,9 +471,11 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 
 - Project-scope `refresh`, `apply` without `--plan`, and `updates --apply` refuse writes in marked lane worktrees, including Windows worktrees. Refresh lanes can pass `--lane-refresh` to proceed.
 - Major release checks require a named Breaking entry for the app and Pi packages; all release channels use one version and migration standard.
+
 ### Changed
 
 - The install lock lists rendered agent, command and hook files, not shared settings or registries. Apply and refresh keep declared Pi packages when clearing old file inventory.
+
 ### Removed
 
 - **Breaking:** GitHub approvals and thread resolution replace the custom review status. Remove the retired status from required checks before consumer refresh removes its workflow.
@@ -452,12 +487,11 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - Catalog CI checks references after installation, including hooks and scripts.
 
 - Project refresh, apply and package updates refuse writes to a marked lane from a nested Git checkout unless you pass `--lane-refresh`.
-- Consumer refresh uses the latest released kendex with read-only API authentication. Catalog CI checks declared hook delivery and honors caller advisory policy.
+- Consumer refresh uses the latest released kendex with read-only API authentication.
+
 - Preserve authored legacy agent labels in in-place skills while updating labels in managed instructions and rendered copies.
-- Local completion checks catch document growth near byte limits before push, measured against the branch point.
 - Consumer refresh accepts legacy catalog agent names, keeps local agent names and customizations, updates agent labels, and reports affected settings. Compatibility remains through 1.4.x.
 - Copilot hook updates replace older commands for the same script instead of running both. Hooks for other scripts stay unchanged.
-- The Pi extension manager keeps scoped toggles after project moves, saves settings only after instruction scripts pass, caches search data, and bounds npm version requests.
 - Refresh removes recorded agents no longer declared in the selected scope, so agent renames do not need a separate remove before verification.
 - Refresh reports each Pi package that only needs npm install as a notice naming `kendex update-pi`. These notices no longer fail refresh. Other Pi drift still fails.
 - Review-gate workflows use the released CLI and an installer pinned to the release commit.
@@ -475,6 +509,8 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - The review-gate consumer refresh and writer templates pin the kendex v1.2.0 release and fetch its installer at the commit v1.2.0 names.
 - Skill renders, `kendex check --catalog`, the package preview and `kendex diff` leave out top-level `tests/`, `evals/` and `DEVELOPMENT.md`; the next refresh deletes old rendered copies.
 - `kendex verify` warns, and exits 0, where a project ignores a path an installed agent declares as tracked output; `--strict` still fails the run on it.
+- **Breaking:** harness-ci reads every change as queue-only until the base commit's `[env]` sets `HARNESS_CI_QUEUE_PATHS`; set it empty for none.
+
 ### Fixed
 
 - A catalog hook's preToolUse refusal on GitHub Copilot now shows the model its reason, not just `hook exited with code 2`. Run `kendex apply` in each project and `kendex apply --global` to update.
@@ -496,7 +532,6 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 ### Security
 
 - The desktop app's interface build and test tools no longer carry the published security advisories against vitest, js-yaml and undici. The shipped app is unchanged.
-- Pi's tool renderer no longer freezes on Git diff headers with unterminated quoted paths and repeated backslashes.
 
 ## [1.2.0] - 2026-09-28
 
@@ -510,9 +545,11 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 ### Changed
 
 - The review-gate consumer refresh and writer templates pin the kendex v1.1.0 release instead of a main build.
+
 ### Fixed
 
 - A `repo-effects` declaration carrying a key this kendex does not read, from a newer catalog or a typo, now reads and its disclosure names the key; `kendex refresh` no longer fails over it.
+- A path the size check counts as a test, by its built-in rule or `ORCH_SIZE_TEST_PATHS`, is no longer its own subsystem, so a script beside such a fixture keeps `micro` or `small`.
 - The review-gate consumer refresh and writer templates pin kendex main-build-299, whose repo-effects reader accepts the current catalog; main-build-261 refused every consumer refresh.
 - `kendex check` no longer writes `.kendex-lock.json` off the default branch; a matching render there is reported as not in the install record.
 - `kendex verify` counts failed shim, arming, record, inventory and adopted workflow rows on its closing line; a stale copy's row names both hashes and the adoption step.
@@ -523,7 +560,8 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 ### Added
 
 - `kendex harness-paths` prints, as JSON, every project path kendex's harness adapters read and whether each harness reads it as a root, a catalog, a registry or an instruction file.
-- The Customize tab takes your email address as `KENDEX_USER_EMAIL`, and the linear package assigns each unassigned issue it starts to the Linear user with that address.
+- The Customize tab takes your email address as `KENDEX_USER_EMAIL`.
+
 - Verify checks adopted workflow copies against their declared package templates and records template hashes in the generated-file inventory.
 - Refresh installed kendex packages through a scheduled GitHub workflow that keeps one rolling pull request and uses an app token for auto-merge.
 
@@ -545,6 +583,7 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 ### Fixed
 
 - A hook whose `env` table sets `PATH` now starts its script: `bash` is found under the launching `PATH` first, and under the declared one only when the launching one has none.
+- orch: an edit to `resolve-base-branch` or `lib/kendex-env.sh`, which the micro-tier measurement resolves its range and settings through, is refused the narrow classes.
 - A refresh no longer offers a commit the pre-commit check will refuse over stale bot-instructions files; it offers their setup or leaving them as diffs, and still offers a commit that check passes.
 - `kendex apply` keeps a hook, agent or command moved to a catalog that refuses or skips it on a tool, and reports the conflict and why, instead of trashing it.
 - An edited hook companion that another hook still requires now names applying with edits discarded as its remedy, so following it no longer withholds that hook on every tool.
@@ -584,12 +623,14 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 ### Removed
 
 - The Windows `.msi` is no longer built or published; the NSIS setup `.exe` is the Windows download.
+
 ### Fixed
 
 - The safety scan no longer flags a switch a shell script only names in a comment or printed message; kendex's guards scan clean, and a run closes on `safety: clean` or `not fully checked on safety`.
+- Companions are judged as the plan writes them: a wrapper is withheld where its declared judge is not; a rebind reports the conflict; a companion that only removed wrappers need goes too.
 - A Pi package counts as one package across every name it has shipped under, so `update-pi` now blocks a cross-scope duplicate where one scope names it currently and the other by an earlier name.
 - `kendex verify` holds every recorded source and set to a fresh read: an entry that differs, or one it cannot read fresh, fails the record row until an apply or a source refresh puts it right.
-- The worktree hook allows add and other one-project writes where the project owns a manifest, reads no redirection target or word after `--` as an option, and refuses `env -C` or `sudo -D` like `cd`.
+- Version 10 recovery works across retries and outside Git, updates renders, retires old hook registrations, keeps hand edits, ignores the recovery backup, and shows exact steps in the desktop.
 - No git call kendex makes runs the `core.fsmonitor` command a repository names in its own config; a catalog checkout kendex reads cannot run code through it.
 - The installed audit reads every adapter's view of one skill tree as the row that wrote it, and a hand copy elsewhere as nobody's, so an accepted finding is set aside only where kendex wrote.
 - A plan no longer starts a git process per source file when no file has CRLF line endings: `kendex refresh` of the kendex repository drops from about 90 s to about 5 s.
@@ -597,7 +638,7 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - Every desktop action that moves a copy into the trash now brings the trash within its bounds, as the CLI does, so an app-only install no longer keeps every removed copy for good.
 - A render leaves an in-place skill source directory unchanged, and reports a missing link as a refresh instead of offering to take over the source.
 - The session drift report names each package whose source comparison is missing or outdated, gives the age of that comparison, and ends with a refresh command for the reported scope.
-- A `worktree push` that rebased and was then refused by a pre-push hook keeps that rewrite's force-with-lease authorization, so the retry publishes instead of stranding the branch.
+- `kendex check` reads the current manifest only, groups missing installs by package, shows every row when run by hand, and prints the command for each repair it supports.
 - The desktop app in the Arch `kendex` and `kendex-git` packages opens its interface; it showed a connection error for `localhost:5273`.
 - The Linux `.deb` and `.rpm` carry a description, a Development menu category and a git dependency; the Arch `kendex-bin` package carries the license file.
 - `kendex --version` from the Arch `kendex-git` and `kendex-cli-git` packages shows the built commit, and the Linux `.deb` names a maintainer with an address.
@@ -646,6 +687,7 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - The Updates page says when it last reached your sources — "Last checked 3h ago" under the title and beside "Everything is up to date" — so a standing read offline no longer passes for a fresh check.
 - The commit offer names the declaration it cannot commit. Where an action changed your `kendex.toml`, the offer says the commit leaves that file out and asks you to commit it yourself.
 - Project cards and project views carry a Review changes line when kendex has written files there that are not committed. It opens one page to read the changes, commit them, or put them back.
+
 - A catalog package's page and the install picker name what it requires and offer its optional dependencies; My Library says which package a dependency arrived with.
 - Antigravity hooks: a hook installs into `hooks.json` under its own name at either scope, with its matcher in Antigravity's tool names, and the scan reads the registry back.
 - Antigravity CLI (`agy`) is a supported harness: agents and skills install at both scopes, MCP servers and plugins are shown read-only, and hooks are not yet supported.
@@ -696,6 +738,10 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 
 - The version number restarts at 1.0.0 after the vstack 5.x line. A 5.x install on the release channel, the Homebrew formula or cask, or install.sh is offered no update and is reinstalled fresh.
 - The Arch packages carry an epoch, so pacman upgrades a 5.x machine in place; the rolling main channel orders by build number, so a 5.x main build is still offered the newer one.
+- **Breaking:** skills resolve settings as env > `.env.local` > `.kendex/settings.toml` > `kendex.settings.toml` > default, `[env]` only; a lingering `.env` is ignored, so move it to `.env.local`.
+- **Breaking:** settings values are single-line double-quoted strings with no
+  `"` or `\`; any other shape, a duplicate key, or an unparseable table header
+  fails the load. Rewrite an offending value.
 - **Breaking:** kendex no longer reads the pre-2.0 mutable clone in the source cache. Nothing has written that layout since 2.0; a scope whose only copy is there reads Pending until a refresh.
 - **Breaking:** a `core.hooksPath` naming a directory answers "could not determine" from `kendex guard check`; the stand-down prints where git says it is set, then says to clear it there and arm.
 - **Breaking:** hooks are armed only when the marker is in both hook files, both are executable and `core.hooksPath` is unset. `guard install` stands down under any value. New: `kendex guard check`.
@@ -733,6 +779,7 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - Commit checks moved into the git pre-commit hook, which also runs rust-fmt,
   rust-clippy, and biome; kendex's harness hook refuses `--no-verify` and
   hook-skipping git config.
+- **Breaking:** `KENDEX_PRE_COMMIT_RUST_CLIPPY` is gone. Set `enabled = false` under `[guards.rust-clippy]` in `kendex.settings.toml`; a custom command moves to `KENDEX_GUARD_PRE_COMMIT_LOCAL`.
 - The safety check reads every file to its last byte (it stopped at 512 KB or 200 files), so large packages can show findings that were always there; unreadable ones report "Not fully checked".
 - Safety scores say what they are: automated checks, not reviews —
   beside every score, dot, and the About tab's wording.
@@ -749,9 +796,12 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - Adding a project says only that it was added. The start-of-session note for agents is offered on the project's card in plain words, with its state shown there.
 - The offer to commit follows the action you just took: it names what that action changed, appears only where that action wrote, and can commit only that work rather than everything waiting.
 - The project card's start-of-session note is now Package checks: a factual state read per coding tool, an info button explaining the check, and a confirmation listing every file the setup writes.
+- Multi-paragraph review-rule additions render as nested bullets in AGENTS.md. Other bot files retain their paragraph format.
+- **Breaking:** move review-bot settings to `[bot-instructions]` in the effective manifest. Prefix each child table with `bot-instructions.`. Remove the separate bot configuration file and re-render.
 - A git older than 2.41 is refused with one sentence: what this host's git answered, that kendex needs git 2.41 or newer to write a checkout, and to install a newer git.
 - `kendex report` stamps the source commit and rendered hash the lock recorded for the reported asset into the issue marker, so triage can date a report; an undated asset stamps `unlocked`.
 - **Breaking:** the updater signing key rotated. An install of an earlier build cannot verify releases signed with the new key — reinstall once from kendex.ai.
+- kendex skill scripts load project settings without forking a subshell per line: reading the 310-line `kendex.settings.toml` in this repo gets about 12x faster.
 - A changed entry of a `kendex.toml` list keeps any key kendex does not model only while the entries around it fix which slot was its own; two changes side by side do not, and the key goes.
 - An update, a version switch and a Follow source flip each say one thing: the tool whose copy went to the trash, else the tool whose copy was left as it is, else that the action landed.
 - Forking an edited rendered agent now keeps that rendering's body text instead of translating its harness vocabulary back to the catalog's wording.
@@ -797,6 +847,11 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - An MCP file another program left empty is no longer a problem where the scope that writes it declares and records no server. One that will not parse or read, or lacks a managed server, still is.
 - The desktop app sorts what it shows into problems, decisions, notices and updates. Problems and the footer hold only what needs action; Home's notices and updates can be dismissed.
 - A failed scan or update check, missing installed files and an unreadable project folder show red on every screen, and a decision waiting on you shows orange.
+- bot-instructions: `[bot-instructions.repo] code_review_path` names the rendered doctrine file, which must sit directly under `.github/instructions/`.
+- Verification reports drift when a marked `AGENTS.md` Code Review Rules region holds more than its directive line.
+
+- bot-instructions: `.github/copilot-instructions.md` points at `.github/instructions/code-review.md` rather than restating five blocks, and CodeRabbit reads it through `code_guidelines`.
+- bot-instructions: the review doctrine renders to one file per repository, `.github/instructions/code-review.md` by default, and the `AGENTS.md` § Code Review Rules region is one line pointing at it.
 - **Breaking:** the install record is version 11. Commit `.kendex-lock.json`; machine fields move to `.cache/kendex/lock-local.json`. Move a version 10 project lock to `.kendex-lock.v10.json`, then run `kendex apply`; renders matching that old record are updated, while every mismatch remains a conflict.
 - An older record is refused by name, never upgraded in place.
 - A clone or a cleared cache must run `kendex apply` before forking an agent that requires skills.
@@ -827,20 +882,23 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - A forked item's frontmatter `name` line is rewritten whole, so a trailing comment on that line does not survive the copy.
 - A conflict listing no longer offers `kendex apply --replace-unmanaged` where the plan shows an item the sweep would refuse on. Each item's own way out is unchanged.
 - `--replace-unmanaged` refuses the whole run when an item it swept up has a conflict replacing cannot settle, naming each blocked item and what blocks it. Nothing is planned or written.
-- Pi now enforces the kendex hooks: `pi-hooks` spawns the rendered `.pi/kendex/hooks/*.sh` scripts instead of its own copies, so Claude, Codex and Pi run the same bytes.
 - `kendex check` relays growth-guards' own commit-hook verdict when it has one, and only where `.git/hooks` holds an install's helper. kendex reads no hook file; the stranded-shim report is gone.
 - A Mine folder whose GitHub remote is spelled with `www.`, mixed case or a trailing slash now resolves as the repository it is, so it can be submitted like any other.
 - **Breaking:** a hook selector spelling `planner` now gates every `role: planner` agent, and no rename rewrites it. Renaming a roleless `planner` agent drops its gate, so declare the role first.
 - **Breaking:** the visible-pane default follows `role: planner`, not the name, so an agent named `planner` with no role now renders in the background. Declare the role.
 - **Breaking:** Claude, Pi and OpenCode withhold the question tool by `role: planner`, not by the name `planner`, so a rename changes no tool. Declare the role on a `planner` agent that has none.
 - The `kendex` command an installer records is identified by its path alone, and Update now no longer refuses a command that changed under the card: it installs and says what became of it.
+- harness-ci's `harness-only` reads the manifest header shape kendex writes, and carves every skill path when a manifest says `in-place` on a line it cannot tie to a name.
 - A four-space-indented ``` at the top level no longer protects the text below it: markdown reads that indent as a code block whose one line is the backticks, not as an open fence.
 - Text inside a raw HTML block is left as authored, tool references included. A blank line ends a `<div>` or `<details>`; `<pre>`, `<script>` and `<!-- -->` end at their own closing marker.
 - Hook and rendering notices start with stable reason keys, escaped values and the source of hook exclusions, followed by their English explanation.
+- Kendex commits compile changed Rust crates and check changed UI code. Full tests, documentation and cross-target checks run at development completion and in CI; submit reuses the same-commit result.
 - Where packages ship one key with different defaults and your `kendex.settings.toml` already sets it, the note says your line is what your scripts read, not a default none of them reads.
 - **Breaking:** a settings template may write nothing after a value but `# required`. A trailing comment now fails `kendex marketplace check` — move it into the comment block above the key.
 - `kendex refresh` writes nothing into `kendex.settings.toml`. An `add` seeds the arriving skill's `# required` keys; a save from the app writes the key it names. A key you delete stays deleted.
+- **Breaking:** `changelog-entries --collate` folds the changelog fragments in at release, replacing the removed `changelog-collate` tool and the `--list` output it read.
 - `kendex apply` manages a marked `.gitignore` block for the `tmp/` folder, install ledger, and cache in Git projects.
+
 ### Removed
 
 - **Breaking:** vstack-era installs are not migrated. Install fresh and remove by hand the `vstack-hooks` directory (or `kendex-hooks`, from an earlier 5.x), its `core.hooksPath` and the v1 settings.
@@ -869,6 +927,7 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - A pi `hooks/` or `hooks.json` beside a scope root is unmanaged: kendex reads, writes, scans, lists and removes nothing there, `kendex remove` included. Yours to look at and move aside.
 - The `auto-update-check` setting. No toggle exposed it, so hand-editing it to false was the only way to set it, and that no longer stops the check; the key is ignored now rather than refused.
 - **Breaking:** `kendex marketplace browse --community` is gone; it only reported that the community directory is not built yet. Browse a subscription by name instead.
+
 ### Fixed
 
 - A blocked declaration now names every position its take-over empties. A
@@ -884,19 +943,16 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - `kendex report --upstream` takes a GitHub repo spelled any way — shorthand,
   https URL or `git@` — and files against it when your lock records the asset
   from that repo.
-- `worktree cleanup` and `worktree remove` prove a merge two ways and no other: ancestry into the default branch, or the pull request whose head commit is the branch tip. Every keep names its reason.
 - `kendex remove`, and any CLI apply, refresh or unsubscribe that drops a
   package, runs its declared uninstaller before the files go, so dropping
   `growth-guards` disarms the commit hooks.
 - A refresh cuts opencode.json's `kendex-hook-` `instructions` rows to what it renders now, so a row kendex wrote leaves with its render. Other rows are untouched; pre-rename rows go by hand once.
 - Removing a skill whose harness copies are only partly present now finishes. A copy already gone, or a link whose target was, failed the move to the trash and rolled the removal back on every retry.
+- harness-ci's `harness-only` reads manifests at the selected head and answers `false` for a diff touching an in-place skill or `.agents/hooks` script: project source no longer stands CI lanes down.
 - The Library's From column says "Your own" for a skill adopted in place; it read as a marketplace with no repository. The Mine import inventory reads such a skill's bytes from the tree it sits in.
 - `kendex fork` refuses an item that is already yours — `local`, or a skill
   adopted `in-place`, whose tree of record a fork would quietly demote to a
   render of a hidden copy.
-- The `block-bare-cd` hook refuses a bare `cd` with no path. It changes to
-  `$HOME` for every later tool call, the move the hook exists to stop, and
-  only `cd <path>` was caught before.
 - `kendex refresh` says when this clone's `info/exclude` ignores `.agents`, as it did for `.gitignore`, from any linked worktree too. That rule hides the tree from git status, so nothing commits it.
 - The lock records each skill's tree and links. **Breaking:** redo an install an older kendex made by hand: refresh, remove that scope's lock file and the trees and links kendex wrote, then apply.
 - `guard` verbs run from a linked worktree find the package under the same
@@ -1011,6 +1067,7 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - The commit offer after a refresh no longer reports a rebase in progress on a checkout holding only a leftover `REBASE_HEAD`, and its line names the rebase directory it found.
 - `kendex check` no longer records a hook, MCP server or plugin whose settings entry was removed, broken or moved from under it after the deep pass proved it, so `kendex apply` does not put it back.
 - Report and library ownership work without a readable lock. Verification keeps record errors visible, and record-existing recovery preserves matching renders even when CI metadata is absent.
+- CI derives generated files from the kendex writer inventory, so carrier extension source and unrecorded code always run product checks.
 - Pi updates preserve source ownership under the scope writer lock, and verification checks recorded package bytes for drift.
 - Count packages, not installations, on the Harnesses and Projects kind badges, so a badge's number is the number of rows in the Library view its click opens.
 - Cite a planned install's safety findings at the catalog file the bytes came from, not at a destination nothing has written yet; the line comes too, where the install is a verbatim copy.
@@ -1029,8 +1086,6 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - The account now says so when the failure is on your machine — a refused credential lock, a full disk, a second kendex holding it. It used to read as "Offline", blaming a directory nothing had asked.
 - An update, discard, fork or install-beside whose apply fails re-reads the machine like one that landed, so Home and the audit stop counting copies its uninstallers removed.
 - The Library's From column and a marketplace's Installed in column keep the newest read of where each copy came from, so an older read answering late no longer puts a pre-install answer back.
-- The orch round that cuts an oversized branch can be recorded and accepted: `dev-round-write --cut` skips only the over-limit refusal, and acceptance refuses a cut that left the branch over the cap.
-- `worktree` run from outside a git repository now names that directory and the checkout to run from, instead of exiting 128 with no output.
 - A failed install, subscribe, repository change, source toggle, unsubscribe, editor save or audit action re-reads the machine like one that landed, so Home and the audit stop counting removed copies.
 - Three sourced kendex libraries build their first line or error detail in-shell, so a value past the pipe buffer cannot abort the sourcing script.
 - `kendex apply` keeps what a catalog installed when nothing declares it now and the catalog will not read, is gone, or is off — one declared by name included — and the plan names that catalog.
@@ -1038,7 +1093,6 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - Catalog checks report set members the catalog does not offer and fail the check with the set and member names.
 - A `[bundles]` table, set body, member list or description written in a shape the reader will not read is that catalog's breakage instead of sets and members that silently go missing.
 - Saving in the editor, installing a package, applying a repository effect, or checking your submissions now shows why when the app cannot reach its engine, instead of quietly going idle.
-- A Pi hook on `PostToolUse`, `Stop`, `TaskCompleted` or `SessionStart` runs: kendex registered it and reported it enforced while the pi-hooks carrier dispatched tool calls alone.
 - A project hook for Codex, Gemini, Copilot, Pi or Antigravity finds its script when it runs, so it works in a project with no git repository or below the git top level. Pi needs pi-hooks 0.10.0.
 - A curated set's tool picker opens before any member is ticked, offering every tool the set could install to, and Install all is held back when that picker is emptied by hand.
 - Installing into a project from a personal marketplace whose alias the project already uses for a different repository is refused instead of silently rebinding the project's subscription.
@@ -1048,7 +1102,6 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - A hook's advisory instruction file (OpenCode, Cursor) renders one paragraph per line with blank lines between, so a fresh install passes the md-format lane.
 - A person's edit to a Pi agent's `effort` key survives a fork instead of reverting to the publisher's value.
 - A Pi agent whose model inherits the session now renders its effort as an `effort` key, which `pi-agents-tmux` passes to the child as `--thinking`; before, the effort was dropped with the model id.
-- `open-terminal --help` states the default mode (tmux inside tmux, a GUI terminal outside), `--ghostty` inside tmux warns, and GUI terminals no longer inherit `TMUX` or `TMUX_PANE`.
 - Hold the marketplace Install buttons back when narrowing the tools on offer leaves nothing picked, rather than installing to no tool and reporting success; a hidden tool returns with its offer.
 - Agents install for Antigravity at the global root alone, the one `agy` reads: a project declaration now says Antigravity cannot hold one there rather than writing a file nothing reads.
 - Adding a project says "Adding project…" while the write is out, refuses a second press, and closes as soon as the project is registered rather than waiting for the whole machine to be read.
@@ -1162,10 +1215,12 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - `kendex verify` and `kendex check` now answer inside a git worktree, and `kendex refresh` there works on the worktree: a lock copied in from the main checkout reads against the tree it sits in.
 - A version switch or Follow change that fails now re-reads the package. It could leave the old version on screen as settled, over a manifest the failed attempt had already moved.
 - Names and paths off a catalog or a scanned folder reach the terminal as their own characters wherever the CLI prints them. `kendex show --file` and `--readme` still print a file as its own lines.
+- On Bash 3.2, `tools/guard` no longer aborts or misspells a path.
+
+- Every shell suite but linear's runs on macOS `/bin/bash` 3.2 in CI, where the Bash 4 constructs the text scan cannot see fail.
 - `kendex.toml` is edited in place. Adding, forking, adopting and detaching change the keys they name, so the comments, blank lines and key order you wrote stay where you put them.
 - The Copilot mark now takes its harness colour in the app, instead of rendering black.
 - Importing a skill or agent under a new name writes that name into the copy's own declaration instead of landing a package named something else, and refuses where the file carries no frontmatter.
-- Pi now runs every `PreToolUse` hook kendex installs for it, custom ones included, not three built-in guards. Needs pi-hooks 0.9.0: `pi install npm:@vanillagreen/pi-hooks`.
 - `refresh` and `apply` write back the install record a scope declaring only Pi extensions lost. **Breaking:** `verify` exits non-zero on a scope that declares items and has no install record.
 - A tool reference between backticks in two different table cells is now reworded for the reader's harness. The cells are separate blocks, so markdown never quoted it, but it used to pass through.
 - A rendered agent body keeps every byte of a code sample that sits in an indented block or in a backtick span closing on a later line; the prose rewrite used to edit tool names inside both.
@@ -1226,6 +1281,7 @@ Each change lands as a fragment under `changelog.d/`, per [changelog.d/README.md
 - The update card no longer offers `sudo kendex update` for a `kendex` command it cannot write: the installer instead, or the download page where there is none. Neither is held to the release key.
 - A run with root privilege writes no `kendex` record file, so a `sudoers` policy keeping `HOME` cannot point a root write at a path the invoking account owns. The next unprivileged run records it.
 - Arming git hooks for one kendex project in a repository no longer lets a second project in that same repository run its own commit guards under that consent.
+
 Releases before 1.0.0 (the vstack-era numbering up to 5.0.1) are not listed here; their history is in git.
 
 [Unreleased]: https://github.com/vanillagreencom/kendex/compare/v1.19.0..HEAD
