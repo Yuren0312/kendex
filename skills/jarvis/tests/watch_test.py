@@ -35,6 +35,13 @@ class Producer(unittest.TestCase):
         self.root = Path(self.scratch.name).resolve()
         self.bin = self.root / "bin"
         self.bin.mkdir()
+        self.packages = self.root / "producer"
+        for name in ("jarvis", "mailbox"):
+            shutil.copytree(REPO / "skills" / name / "scripts", self.packages / name / "scripts")
+        for name in ("orch", "slack"):
+            self.packages.joinpath(name).symlink_to(REPO / "skills" / name, target_is_directory=True)
+        self.scripts = self.packages / "jarvis/scripts"
+        self.mail_command = self.packages / "mailbox/scripts/lane-mail"
         self.home = self.project("home")
         self.peer = self.project("peer")
         self.registry = self.root / "registry"
@@ -45,7 +52,7 @@ class Producer(unittest.TestCase):
         self.env.update(PATH=str(self.bin)+os.pathsep+os.environ["PATH"], HOME=str(self.root),
                         REGISTRY=str(self.registry), PYTHONDONTWRITEBYTECODE="1")
         self.executable("kendex", '#!/bin/sh\ncat "$REGISTRY"\n')
-        self.module = load()
+        self.module = load(self.scripts / "lib/watch.py")
         self.settings = dict(JARVIS_CONTROL_HOST="", JARVIS_LOG_DIR=str(self.root / "log"), JARVIS_WAKE_SETTLE_SECS="15")
 
     def project(self, name):
@@ -80,13 +87,13 @@ class Producer(unittest.TestCase):
     def mail(self, root, verb, text, *options):
         payload = self.root / "message"
         payload.write_text(text)
-        result = self.command([root / ".agents/skills/mailbox/scripts/lane-mail", verb,
+        result = self.command([REPO / "skills/mailbox/scripts/lane-mail", verb,
                                "--item", "overseer", "--file", payload, *options], root)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
     def read_pass(self, cursor=None):
-        result = self.command([BASH, SCRIPTS / "vm-watch.sh", "--home", self.home,
+        result = self.command([BASH, self.scripts / "vm-watch.sh", "--home", self.home,
                                "--cursor", json.dumps(cursor or {})])
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = result.stdout.split("\n")[:-1]
@@ -94,6 +101,10 @@ class Producer(unittest.TestCase):
 
     def watch(self):
         return self.module.Watch(self.home, BASH, self.settings)
+
+    def intercept_mail(self, body):
+        self.mail_command.write_text('#!/bin/sh\n' + body + '\nexec ' + shlex.quote(BASH) + ' ' +
+            shlex.quote(str(REPO / "skills/mailbox/scripts/lane-mail")) + ' "$@"\n')
 
     def append(self, watch, content):
         watch.append(content + 'cursor: {"side":"local","roots":{}}\n')
@@ -166,29 +177,25 @@ class Producer(unittest.TestCase):
         # Fail the existing command after a new row. Its root cursor and the
         # unread message must survive, while another root still proceeds.
         self.mail(self.peer, "notice", "retry me", "--to", "owner")
-        installed = self.peer / ".agents/skills/mailbox/scripts"
-        installed.unlink()
-        installed.mkdir()
-        installed.joinpath("lib").symlink_to(REPO / "skills/mailbox/scripts/lib", target_is_directory=True)
-        script = installed / "lane-mail"
-        script.write_text('#!/bin/sh\necho "Traceback /jarvis-pass-$$/watch.py" >&2\nexit 1\n')
-        script.chmod(0o755)
+        self.intercept_mail('if [ "$PWD" = '+shlex.quote(str(self.peer))+' ]; then\n'
+                            'echo "Traceback /jarvis-pass-$$/watch.py" >&2\nexit 1\nfi')
         self.mail(self.home, "notice", "other root runs", "--to", "owner")
         output, failed = self.read_pass(cursor)
+        self.assertEqual(failed[str(self.peer)]["to-lane"], cursor[str(self.peer)]["to-lane"])
         self.assertEqual(failed[str(self.peer)]["to-overseer"], cursor[str(self.peer)]["to-overseer"])
         self.assertIn("other root runs", output)
         repeated, same = self.read_pass(failed)
         self.assertNotIn("EVENT root-unreachable", repeated)
         self.assertEqual(same, failed)
         for refusal in ("root-unresolved", "events-unreadable"):
-            script.write_text('#!/bin/sh\necho "lane-mail: '+refusal+'=target" >&2\nexit 1\n')
+            self.intercept_mail('if [ "$PWD" = '+shlex.quote(str(self.peer))+' ]; then\n'
+                                'echo "lane-mail: '+refusal+'=target" >&2\nexit 1\nfi')
             changed, same = self.read_pass(same)
             self.assertIn("EVENT root-unreachable", changed)
             repeated, stable = self.read_pass(same)
             self.assertNotIn("EVENT root-unreachable", repeated)
             self.assertEqual(stable, same)
-        script.unlink()
-        script.symlink_to(REPO / "skills/mailbox/scripts/lane-mail")
+        shutil.copyfile(REPO / "skills/mailbox/scripts/lane-mail", self.mail_command)
         output, _ = self.read_pass(failed)
         self.assertIn("retry me", output)
 
@@ -199,6 +206,63 @@ class Producer(unittest.TestCase):
         self.assertIn("EVENT overseer-unread repo=peer unread=1", output)
         output, _ = self.read_pass(cursor)
         self.assertNotIn("EVENT overseer-unread", output)
+
+    def test_producer_helpers_keep_target_data(self):
+        self.mail(self.home, "notice", "home target data", "--to", "owner")
+        ask = self.mail(self.peer, "ask", "peer target data", "--to", "owner", "--options", "yes,no", "--recommend", "yes")
+        ask_id = ask.stdout.split("id=", 1)[1].split()[0]
+        self.mail(self.peer, "send", "peer answer data", "--re", ask_id)
+        self.mail(self.peer, "send", "unread target directive", "--directive")
+        self.executable("date", '#!/bin/sh\necho 9999999999\n')
+        self.home.joinpath("kendex.settings.toml").write_text('[env]\nJARVIS_WAKE_SETTLE_SECS = "0"\n')
+        for root in (self.home, self.peer):
+            shutil.rmtree(root / ".agents")
+        for installed in ("absent", "refusing"):
+            with self.subTest(installed=installed), patch.dict(os.environ, self.env, clear=True), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                if installed == "refusing":
+                    for root in (self.home, self.peer):
+                        for skill, files in (("mailbox", ("lane-mail", "lib/kendex-env.sh", "lib/common-root.sh")),
+                                            ("orch", ("workflow-state", "lib/lane-context.sh", "lib/overseer-launch.sh"))):
+                            for file in files:
+                                path = root / ".agents/skills" / skill / "scripts" / file
+                                path.parent.mkdir(parents=True, exist_ok=True)
+                                path.write_text('exit 93\n')
+                                path.chmod(0o755)
+                self.assertEqual(self.module.config(BASH, self.home)["JARVIS_WAKE_SETTLE_SECS"], "0")
+                output, cursor = self.read_pass()
+                self.assertIn("home target data", output)
+                self.assertIn("peer target data", output)
+                self.assertIn("peer answer data", output)
+                self.assertIn("EVENT overseer-unread repo=peer unread=1", output)
+                for root in (self.home, self.peer):
+                    self.assertNotIn("cause", cursor[str(root)])
+                    seen = root / "tmp/lane-mail/overseer/to-overseer.seen"
+                    self.assertEqual(int(seen.read_text()), cursor[str(root)]["to-overseer"]["count"])
+                self.settings["JARVIS_WAKE_SETTLE_SECS"] = "0"
+                watch = self.watch()
+                self.append(watch, "EVENT mail\nproducer delivery " + installed + "\n")
+                watch.batch(0)
+                self.assertEqual(self.inbox()[-1]["text"], "EVENT mail\nproducer delivery " + installed)
+
+    def test_receipt_failure_rolls_back_both_cursors(self):
+        self.mail(self.peer, "notice", "initial", "--to", "owner")
+        _, prior = self.read_pass()
+        self.mail(self.peer, "notice", "next owner event", "--to", "owner")
+        self.mail(self.peer, "send", "next lane event", "--directive")
+        self.intercept_mail('if [ "$PWD" = '+shlex.quote(str(self.peer))+' ] && [ "$1" = drain ]; then\nexit 1\nfi')
+        output, failed = self.read_pass(prior)
+        for box in ("to-lane", "to-overseer"):
+            self.assertEqual(failed[str(self.peer)][box], prior[str(self.peer)][box])
+        self.assertNotIn("next owner event", output)
+        seen = self.peer / "tmp/lane-mail/overseer/to-overseer.seen"
+        self.assertGreater(int(seen.read_text()), prior[str(self.peer)]["to-overseer"]["count"])
+        self.assertEqual(failed[str(self.peer)]["cause"]["key"][0], "mailbox-receipts")
+        shutil.copyfile(REPO / "skills/mailbox/scripts/lane-mail", self.mail_command)
+        output, recovered = self.read_pass(failed)
+        self.assertIn("next owner event", output)
+        for box in ("to-lane", "to-overseer"):
+            self.assertGreater(recovered[str(self.peer)][box]["count"], prior[str(self.peer)][box]["count"])
 
     def test_root_paths_are_distinct_cursor_keys(self):
         # Real registry + mailbox table: equal names and equal cross-host paths.
@@ -429,17 +493,11 @@ class Producer(unittest.TestCase):
         with patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(io.StringIO()):
             watch = self.watch()
             self.append(watch, "EVENT mail repo=peer file=to-lane\nretained\n")
-            script = self.home / ".agents/skills/mailbox/scripts"
-            script.unlink()
-            script.mkdir()
-            script.joinpath("lib").symlink_to(REPO / "skills/mailbox/scripts/lib", target_is_directory=True)
-            script.joinpath("lane-mail").write_text('#!/bin/sh\nexit 1\n')
-            script.joinpath("lane-mail").chmod(0o755)
+            self.intercept_mail('exit 1')
             watch.batch(0)
             saved = json.loads(watch.path.read_text())["pending"]
             self.assertIn("retained", saved["body"])
-            script.joinpath("lane-mail").unlink()
-            script.joinpath("lane-mail").symlink_to(REPO / "skills/mailbox/scripts/lane-mail")
+            shutil.copyfile(REPO / "skills/mailbox/scripts/lane-mail", self.mail_command)
             self.watch().batch(1)
             self.assertEqual(len(self.inbox()), 1)
 
@@ -503,6 +561,7 @@ class Producer(unittest.TestCase):
         self.executable("ssh", '#!/bin/sh\nprintf "%s\\n" "$1" >> "$SSH_LOG"\ncd "$REMOTE_ROOT" || exit\nexec '+BASH+' -s\n')
         self.env.update(SSH_LOG=str(self.root / "ssh.log"), REMOTE_ROOT=str(self.peer))
         self.mail(self.peer, "notice", "remote owner", "--to", "owner")
+        shutil.rmtree(self.peer / ".agents")
         with patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(io.StringIO()):
             watch = self.watch()
             watch.tick(0, watch.acquire(0))
@@ -513,6 +572,8 @@ class Producer(unittest.TestCase):
             self.assertEqual((self.root / "ssh.log").read_text().splitlines(), ["host.example"])
             self.assertIn("remote owner", watch.log.read_text())
             self.assertIn("host", watch.cursors)
+            self.assertNotIn("cause", watch.cursors["host"][str(self.peer)])
+            self.assertGreater(watch.cursors["host"][str(self.peer)]["to-overseer"]["count"], 0)
             self.executable("ssh", '#!/bin/sh\necho "Traceback /jarvis-pass-$$/watch.py" >&2\nexit 1\n')
             watch.accept(watch.acquire(2))
             size = watch.log.stat().st_size
@@ -618,6 +679,67 @@ class Producer(unittest.TestCase):
                 watch.tick(0, watch.acquire(0))
                 self.assertIn("delivery after "+type(error).__name__, self.inbox()[-1]["text"])
 
+    def test_dependency_failure_denies_presence_with_cause(self):
+        orch = self.packages / "orch"
+        orch.unlink()
+        env_reader = orch / "scripts/lib/kendex-env.sh"
+        env_reader.parent.mkdir(parents=True)
+        env_reader.symlink_to(REPO / "skills/orch/scripts/lib/kendex-env.sh")
+        expected = ["presence-live", "refusal", "dependency"]
+        original_run = self.module.run
+        mailbox_env = self.packages / "mailbox/scripts/lib/kendex-env.sh"
+        mailbox_env_bytes = mailbox_env.read_bytes()
+        self.executable("ssh", '#!/bin/sh\nexec '+shlex.quote(BASH)+' -s\n')
+        self.settings["JARVIS_CONTROL_HOST"] = "fixture"
+        # Probe replies are clock inputs. The failure itself comes from the
+        # shipped helper against the incomplete private producer installation.
+        stages = (("mailbox-initial", 1), ("initial", 1), ("discovery", 2), ("target-entry", 3),
+                  ("before-touch", 4), ("settings-recovery", 4),
+                  ("touch-recovery", 5), ("operation-recovery", 2))
+        for side in ("local", "host"):
+            for stage, fail_at in stages:
+                with self.subTest(side=side, stage=stage), patch.dict(os.environ, self.env, clear=True), \
+                        patch.object(self.module, "epoch", return_value=0), contextlib.redirect_stdout(io.StringIO()):
+                    mailbox_env.write_bytes(mailbox_env_bytes)
+                    if stage == "mailbox-initial":
+                        mailbox_env.unlink()
+                    for root in (self.home, self.peer):
+                        hold = root / "hold"
+                        if hold.exists():
+                            hold.unlink()
+                        settings = ('SLACK_JARVIS_SESSION_FILE = "missing/hold"' if stage == "touch-recovery"
+                                    else 'SLACK_JARVIS_SESSION_FILE = "hold"')
+                        if stage == "settings-recovery":
+                            settings += '\nSLACK_JARVIS_SESSION_MAX_AGE = "bad"'
+                        root.joinpath("kendex.settings.toml").write_text('[env]\n'+settings+'\n')
+                    self.executable("kendex", '#!/bin/sh\n'+('exit 2\n' if side == "local" and stage == "operation-recovery"
+                                                            else 'cat "$REGISTRY"\n'))
+                    self.executable("ssh", '#!/bin/sh\n'+('exit 2\n' if side == "host" and stage == "operation-recovery"
+                                                         else 'exec '+shlex.quote(BASH)+' -s\n'))
+                    calls = 0
+                    def probe(args, *positional, **keywords):
+                        nonlocal calls
+                        if list(map(str, args[:3])) == [BASH, str(self.scripts / "lib/jarvis-env.sh"), "live"]:
+                            calls += 1
+                            if calls < fail_at:
+                                return subprocess.CompletedProcess(args, 0, "1970-01-01T00:00:00Z\n", "")
+                            if calls > fail_at:
+                                return subprocess.CompletedProcess(args, 1, "", "")
+                        return original_run(args, *positional, **keywords)
+                    self.settings["JARVIS_LOG_DIR"] = str(self.root / (side+"-"+stage))
+                    watch = self.watch()
+                    with patch.object(self.module, "run", side_effect=probe):
+                        results = watch.presence(side)
+                    failed = [cause for _, status, cause in results if status == "failed"]
+                    self.assertTrue(failed, results)
+                    self.assertEqual([cause["key"] for cause in failed], [expected])
+                    self.assertGreaterEqual(calls, fail_at)
+                    self.assertFalse(any(root.joinpath("hold").exists() for root in (self.home, self.peer)))
+                    watch.accept_presence(side, results)
+                    self.assertIn("EVENT presence-renew-failed", watch.log.read_text())
+                    recorded = watch.state["presence_failures"][side]
+                    self.assertEqual([cause["key"] for cause in recorded.values()], [expected])
+
     def test_log_checkpoint_skips_unchanged_and_processed_bytes(self):
         self.settings["JARVIS_WAKE_SETTLE_SECS"] = "0"
         with patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(io.StringIO()):
@@ -692,6 +814,7 @@ class Producer(unittest.TestCase):
             path = Path(folder) / "watch.py"
             path.write_text(mutant)
             self.module = load(path)
+            self.module.LIB = self.scripts / "lib"
             with self.assertRaises(AssertionError):
                 self.test_fixed_settle_and_five_event_feed()
         # Drop only the supplied target at the changed boundary. The same
@@ -708,9 +831,45 @@ class Producer(unittest.TestCase):
             case.setUp()
             try:
                 case.module = load(path)
-                case.module.LIB = SCRIPTS / "lib"
+                case.module.LIB = case.scripts / "lib"
                 with self.assertRaisesRegex(AssertionError, "presence origin"):
                     case.test_priority_cap_boundaries_and_timeout()
+            finally:
+                case.doCleanups()
+        with tempfile.TemporaryDirectory() as folder:
+            source = (SCRIPTS / "lib/watch.py").read_text()
+            old = 'mail = LIB.parents[2] / "mailbox/scripts/lane-mail"'
+            self.assertEqual(source.count(old), 1)
+            mutant = source.replace(old, 'mail = home / ".agents/skills/mailbox/scripts/lane-mail"')
+            self.assertNotEqual(source, mutant)
+            path = Path(folder) / "watch.py"
+            path.write_text(mutant)
+            case = Producer(methodName="test_producer_helpers_keep_target_data")
+            case.setUp()
+            try:
+                case.module = load(path)
+                case.module.LIB = case.scripts / "lib"
+                # read_pass starts the shipped child; mutate its private copy too.
+                case.scripts.joinpath("lib/watch.py").write_text(mutant)
+                with self.assertRaises(AssertionError):
+                    case.test_producer_helpers_keep_target_data()
+            finally:
+                case.doCleanups()
+        with tempfile.TemporaryDirectory() as folder:
+            source = (SCRIPTS / "lib/watch.py").read_text()
+            old = 'if error.record["key"][1:] == ["refusal", "dependency"]:\n                raise error'
+            self.assertEqual(source.count(old), 1)
+            mutant = source.replace(old, old.replace("raise error", "return False"))
+            self.assertNotEqual(source, mutant)
+            path = Path(folder) / "watch.py"
+            path.write_text(mutant)
+            case = Producer(methodName="test_dependency_failure_denies_presence_with_cause")
+            case.setUp()
+            try:
+                case.module = load(path)
+                case.module.LIB = case.scripts / "lib"
+                with self.assertRaises(AssertionError):
+                    case.test_dependency_failure_denies_presence_with_cause()
             finally:
                 case.doCleanups()
 
