@@ -232,3 +232,11 @@ Queue empty, or the user stops it. A queue empty under a standing `idle` ruling 
 ```
 
 Single passes, and Stop, whose watch is already stopped, run `prune` with no `--keep`.
+
+After these reads, reports and retention steps, prepare the complete headerless body in a separate ignored scratch file under [communication-modes.md § Handoff](../references/communication-modes.md#handoff). At Stop and succession, write the snapshot without a pane or launch choice:
+
+```bash
+.agents/skills/orch/scripts/oversee-succeed --write-only --handoff-body [BODY] --handoff [HANDOFF_PATH]
+```
+
+Require this write to succeed before completing preparation. On failure, stop preparation and report the cause. Claim a current installed snapshot or record it for manual recovery only after the write succeeds. At succession, then return to [oversee-events.md § Judgement rules](../references/oversee-events.md#judgement-rules), Hand off a lane, for its plain succession call and refusal handling. The installed snapshot is ready even when succession is disabled or no account qualifies.
