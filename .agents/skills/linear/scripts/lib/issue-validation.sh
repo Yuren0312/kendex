@@ -5,8 +5,10 @@ set -euo pipefail
 # Expected completion state(s) for an issue, keyed by its ROLE in the validation.
 #
 #   bundle-child  A sub-issue processed under its parent session as part of a
-#                 bundle. It is marked Done per-sub-issue while the parent
-#                 session aggregates it, so it must be "Done".
+#                 single-PR bundle. A started state passes when the shared
+#                 parser proves that only post-merge checks remain.
+#   container-child  A separate PR unit. It must finish Done before its
+#                    container can close.
 #
 #   session-root  The managed top-level issue of a worktree session (a single
 #                 delegation / decomposition child worked directly). Whether or
@@ -21,11 +23,15 @@ set -euo pipefail
 #                 the container role gates on state_type instead), so this
 #                 helper emits nothing for it.
 #
-# Emits one accepted state per line.
+# Named completion states. Bundle phase acceptance also uses the state type.
 completion_expected_states() {
 	local role="${1:-session-root}"
 
 	if [[ "$role" == "bundle-child" ]]; then
+		printf 'Done\n'
+		return 0
+	fi
+	if [[ "$role" == "container-child" ]]; then
 		printf 'Done\n'
 		return 0
 	fi
@@ -42,7 +48,11 @@ completion_expected_states() {
 completion_state_matches() {
 	local state="${1:-}"
 	local role="${2:-session-root}"
+	local state_type="${3:-}"
 	local expected
+	if [[ "$role" == "bundle-child" && "$state_type" == started && "$state" != Verifying ]]; then
+		return 0
+	fi
 
 	while IFS= read -r expected; do
 		[[ -n "$expected" ]] || continue
@@ -56,7 +66,7 @@ completion_state_matches() {
 
 # Build the completion-validation result JSON for one issue.
 #
-# Args: issue_id state parent_id has_summary [role] [state_type]
+# Args: issue_id state parent_id has_summary [role] [state_type] [description]
 #
 # The distinguishing "role" is supplied explicitly by the caller (positional
 # target => session-root; bundle-expanded child => bundle-child; positional
@@ -83,6 +93,7 @@ build_completion_validation_result() {
 	local has_summary="$4"
 	local role="${5:-session-root}"
 	local state_type="${6:-}"
+	local description="${7:-}" checklist
 	local state_ok="false"
 	local ok="false"
 
@@ -92,8 +103,12 @@ build_completion_validation_result() {
 			ok="true"
 		fi
 	else
-		if completion_state_matches "$state" "$role"; then
+		if completion_state_matches "$state" "$role" "$state_type"; then
 			state_ok="true"
+		fi
+		if [[ "$role" == "bundle-child" && "$state_ok" == true ]]; then
+			checklist=$(done_when_parse "$description" '[]') || return 1
+			state_ok=$(jq -r --arg state "$state" '.completion_state == (if $state == "Done" then "Done" else "Verifying" end)' <<<"$checklist") || return 1
 		fi
 
 		if [[ "$state_ok" == "true" && "$has_summary" == "true" ]]; then

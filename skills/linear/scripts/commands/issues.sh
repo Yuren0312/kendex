@@ -217,8 +217,10 @@ Complete Options:
   --summary <text>       Post a summary comment, then apply the checklist state
   --summary-file <path>  Read the summary from a file (preferred for markdown)
   --post-merge-at <UTC>  Use the merged PR's mergedAt (YYYY-MM-DDTHH:MM:SSZ).
-                        Refuse open branch-provable boxes. Set Verifying when
-                        a post-merge box remains open, otherwise Done.
+                        Refuse open branch-provable boxes. Set Verifying after
+                        merge when a post-merge box remains open, otherwise Done.
+                        Without this option, open post-merge boxes keep the
+                        current started state; any other current state refuses.
                         Each Post-merge box names reading, Where, Why after
                         merge, Trigger and Deadline on one line. A missing
                         Trigger means merge. Trigger accepts merge, a UTC time
@@ -229,8 +231,8 @@ Complete Options:
                         item merged, that release must contain its latest
                         merge commit. Other deadlines use UTC.
                         Every completion reads the checklist, with or without
-                        this option. Open branch boxes refuse. Open post-merge
-                        boxes keep the item Verifying. Ticked boxes require a
+                        this option. Open branch boxes refuse. Post-merge boxes
+                        follow the phase above. Ticked boxes require a
                         nonblank Evidence: line indented directly below them.
   --done-when-met <all|N[,N...]>
                          Tick the "## Done when" checklist boxes the caller
@@ -255,9 +257,11 @@ Validate-Completion:
   in "In Progress" or "In Review" — "Done" fails state_ok because managed
   session roots stay pre-merge until PR merge. This pre-merge state rule applies
   ONLY to the session root, not to expanded bundle children.
-  Bundle children expanded via --include-children-of are expected in "Done":
-  every completed child IS included and validates as Done/pass (a still-pending
-  child fails state_ok). Canceled children are excluded from the expansion —
+  Bundle children expanded via --include-children-of pass in Done, or a started
+  state other than Verifying
+  when the shared checklist parser proves only post-merge checks remain and
+  every checked box has evidence. Open branch work fails state_ok.
+  Canceled children are excluded from the expansion:
   abandoned work can never be "Done" and is not a pending gap. Each validated
   issue must also have a comment containing "Completion Summary" or
   "Bundle Complete", without regard to letter case.
@@ -265,7 +269,7 @@ Validate-Completion:
   whose children are each worked as their own PR unit, with the container
   closing after its holder proves the shared outcome. The container's state passes for any live state (canceled
   fails closed) and needs no pre-posted summary: `issues complete --summary`
-  posts it at completion time. The expanded children still gate as above, so
+  posts it at completion time. Its expanded children must all be Done, so
   all_ok answers "may this container complete now?". The container checklist
   must have every box checked with its Evidence line. No merge time is needed.
   The flag fails closed:
@@ -273,7 +277,7 @@ Validate-Completion:
   same issue, and errors (exit 1) when the bundle has no non-canceled
   children — a leaf cannot validate as a container. A child of a container
   validates alone as its own session root. Use it only for containers;
-  explicit single-PR bundles keep the default children-Done-first contract.
+  explicit single-PR bundles use the default bundle-child contract above.
   A container without a branch outcome box refuses. Its holder adds the box
   when reading its source. Ordinary items without a checklist can complete.
 
@@ -667,7 +671,7 @@ bulk_update_issues() {
     local from_stdin="false"
     local update_args=()
     local attach_paths=()
-    local description="" description_set="false"
+    local description="" description_set="false" state=""
 
     # Separate issue IDs from update options
     while [[ $# -gt 0 ]]; do
@@ -681,6 +685,7 @@ bulk_update_issues() {
             # (--attach re-uploads per issue: Linear assets are issue-agnostic
             # but each issue gets its own embed/attachment)
             update_args+=("$1" "$2")
+            [[ "$1" != --state && "$1" != --status ]] || state="$2"
             [[ "$1" != --attach ]] || attach_paths+=("$2")
             if [[ "$1" == --description ]]; then
                 description="$2"
@@ -692,6 +697,7 @@ bulk_update_issues() {
             # Support --key=value syntax (AI agents often use this)
             local _key="${1%%=*}" _val="${1#*=}"
             update_args+=("$_key" "$_val")
+            [[ "$_key" != --state && "$_key" != --status ]] || state="$_val"
             [[ "$_key" != --attach ]] || attach_paths+=("$_val")
             if [[ "$_key" == --description ]]; then
                 description="$_val"
@@ -740,6 +746,23 @@ bulk_update_issues() {
     fi
     [[ "$description_set" != "true" ]] || require_issue_header_shape "$description" || return 1
     linear_guard_issue_team bulk-update "${identifiers[@]}" || return 1
+
+    # A later refusal must not leave earlier issues Done or assets uploaded.
+    if [ -n "$state" ]; then
+        local preflight_failed=0 issue_result effective_description
+        for id in "${identifiers[@]}"; do
+            if ! issue_result=$(get_issue "$id" --format=raw); then
+                preflight_failed=1
+                continue
+            fi
+            effective_description="$description"
+            if [ "$description_set" != true ]; then
+                effective_description=$(jq -r '.issue.description // ""' <<<"$issue_result") || return 1
+            fi
+            resolve_issue_update_state "$issue_result" "$state" "$effective_description" >/dev/null || preflight_failed=1
+        done
+        [ "$preflight_failed" = 0 ] || return 1
+    fi
 
     # Process each issue
     local results=()
@@ -1567,6 +1590,35 @@ create_issue() {
     fi
 }
 
+# Both update routes use the description that will be written. Completion can
+# therefore tick verified boxes and set Done in one mutation, without a bypass.
+# FLT-1168 reached update from Verifying with an open post-merge box.
+resolve_issue_update_state() {
+    local issue_result="$1" state="$2" description="$3"
+    local issue_id team_id resolved parsed open_boxes state_type
+    issue_id=$(jq -r '.issue.identifier' <<<"$issue_result") || return 1
+    team_id=$(jq -r '.issue.team.id // empty' <<<"$issue_result") || return 1
+    if [ -z "$team_id" ]; then
+        jq -cn --arg issue "$issue_id" '{error: ("Issue team id missing: " + $issue)}' >&2
+        return 1
+    fi
+    resolved=$(resolve_state_id "$state" "$team_id" raw) || return 1
+    parsed=$(done_when_parse "$description" '[]') || return 1
+    open_boxes=$(jq -c '[.boxes[] | select(.checked | not) | .number]' <<<"$parsed") || return 1
+    if [ "$open_boxes" != '[]' ]; then
+        state_type=$(jq -r '.type // empty' <<<"$resolved") || return 1
+        if [ -z "$state_type" ]; then
+            printf 'linear: refused=state-type-unavailable issue=%s state=%s\n' "$issue_id" "$state" >&2
+            return 1
+        fi
+        if [ "$state_type" = completed ]; then
+            printf 'linear: refused=done-when-open issue=%s open_boxes=%s fix=issues complete\n' "$issue_id" "$open_boxes" >&2
+            return 1
+        fi
+    fi
+    jq -r '.id' <<<"$resolved"
+}
+
 update_issue() {
     local issue_id="$1"
     shift
@@ -1788,6 +1840,15 @@ update_issue() {
     local issue_project_id
     issue_project_id=$(echo "$issue_result" | jq -r '.issue.project.id // empty')
 
+    local state_id="" effective_description="$description"
+    if [ -n "$state" ]; then
+        if [ "$description_set" != true ]; then
+            effective_description=$(jq -r '.issue.description // ""' <<<"$issue_result") || return 1
+        fi
+        state_id=$(resolve_issue_update_state "$issue_result" "$state" "$effective_description") || return 1
+        input_parts+=("\"stateId\": \"$state_id\"")
+    fi
+
     # Same rule as the label resolution below, applied to the pure argument
     # check: a combination that can only be refused must be refused before any
     # upload, or the refusal strands the uploaded asset in Linear storage.
@@ -1932,20 +1993,6 @@ update_issue() {
         fi
         linear_require_pattern --sort-order "$sort_order" '^-?[0-9]+(\.[0-9]+)?$' "a number" || return 1
         input_parts+=("\"sortOrder\": $sort_order")
-    fi
-
-    # Handle state (fail fast with available states on miss)
-    if [ -n "$state" ]; then
-        if [ -z "$team_id" ]; then
-            jq -cn --arg issue "$issue_id" '{error: ("Issue team id missing: " + $issue)}' >&2
-            return 1
-        fi
-        local state_id
-        state_id=$(resolve_state_id "$state" "$team_id")
-        if [ -z "$state_id" ]; then
-            return 1
-        fi
-        input_parts+=("\"stateId\": \"$state_id\"")
     fi
 
     # --labels REPLACES the issue's label set, so a name that does not become an
@@ -3214,6 +3261,14 @@ complete_issue() {
         jq -c '{error: "post-merge-checklist", errors, unmet_branch_boxes, missing_evidence_boxes, missing_outcome_box, remedy: .outcome_remedy}' <<<"$tick" >&2
         return 1
     fi
+    # Checklist proof does not establish a merge. Keep the development phase
+    # until the existing post-merge route supplies its merge timestamp.
+    if [[ "$completion_state" == Verifying && -z "$post_merge_at" ]]; then
+        completion_state=$(jq -er '.issue.state | select(.type == "started") | .name | strings | select(length > 0)' <<<"$issue_result") || {
+            jq -cn --arg id "$issue_id" '{error: "completion-phase", id: $id, fix: "issues complete --post-merge-at"}' >&2
+            return 1
+        }
+    fi
     if [ -n "$met_json" ]; then
         done_when_checked=$(jq '.ticked' <<<"$tick") || return 1
     fi
@@ -3355,9 +3410,8 @@ validate_completion() {
     fi
 
     # If --include-children-of specified, fetch the bundle and expand its
-    # children as bundle-child validation targets. Per the documented bundle
-    # contract each child is expected to be "Done", so COMPLETED children must
-    # be INCLUDED (they are exactly what validates as Done) — not dropped.
+    # Completed children must remain in the validation set. A single-PR child
+    # can also carry verified branch work into post-merge verification.
     # Only CANCELED children are excluded: abandoned work can never be "Done",
     # is not a pending gap, and including it would permanently fail any bundle
     # that legitimately canceled a sub-issue. This mirrors the `children
@@ -3365,7 +3419,7 @@ validate_completion() {
     # from still-pending work.
     if [ -n "$include_children_of" ]; then
         local bundle
-        if ! bundle=$(get_issue "$include_children_of" --with-bundle); then
+        if ! bundle=$(get_issue "$include_children_of" --with-bundle --format=safe); then
             echo "{\"error\": \"Failed to fetch bundle for: $include_children_of\"}" >&2
             return 1
         fi
@@ -3390,7 +3444,11 @@ validate_completion() {
         child_ids=$(echo "$bundle" | jq -r '[.children[] | select(.state_type != "canceled") | .id] | .[]' 2>/dev/null)
         for child_id in $child_ids; do
             issue_ids+=("$child_id")
-            roles+=("bundle-child")
+            if [ "$container_mode" = true ]; then
+                roles+=("container-child")
+            else
+                roles+=("bundle-child")
+            fi
         done
     fi
 
@@ -3411,7 +3469,7 @@ validate_completion() {
         local role="${roles[$i]}"
         # Get issue state
         local issue
-        issue=$(get_issue "$issue_id") || return 1
+        issue=$(get_issue "$issue_id" --format=safe) || return 1
         local state
         state=$(echo "$issue" | jq -r '.state // ""')
         local state_type
@@ -3427,11 +3485,11 @@ validate_completion() {
         has_summary=$(echo "$comments" | jq 'any(.[]; .body | test("Completion Summary|Bundle Complete"; "i"))')
 
         local result description
-        result=$(build_completion_validation_result "$issue_id" "$state" "$parent_id" "$has_summary" "$role" "$state_type")
+        description=$(jq -r '(.description // "") + "."' <<<"$issue") || return 1
+        result=$(build_completion_validation_result "$issue_id" "$state" "$parent_id" "$has_summary" "$role" "$state_type" "${description%.}") || return 1
 
         if [ "$role" = "container" ]; then
             local checklist
-            description=$(jq -r '(.description // "") + "."' <<<"$issue") || return 1
             checklist=$(done_when_parse "${description%.}" '[]' '' '{}' container) || return 1
             result=$(jq -cn --argjson result "$result" --argjson checklist "$checklist" '
                 $result + ($checklist | {errors, unmet_branch_boxes, missing_evidence_boxes, missing_outcome_box})

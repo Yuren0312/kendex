@@ -316,7 +316,9 @@ One `--qa-label` per § 8 signal, none if nothing triggered. One `--label` per e
 
 Every single round appends `--summary-file tmp/completion-summary-[ISSUE_ID].md`; GitHub and ad-hoc rounds also append `--no-summary`. Bundled rounds add `--bundled` and one `--item` per sub-issue — § 11.
 
-**Issue state.** A bundled Linear sub-issue is marked Done (`linear.sh issues update [ISSUE_ID] --state "Done"`) and aggregated by the parent session in § 11. The worktree's top-level managed issue is NOT — it stays In Progress or In Review until the PR merges. GitHub and ad-hoc issues close through the PR body or merge, never here.
+**Issue state.** A bundled Linear sub-issue is completed (`linear.sh issues complete [ISSUE_ID] --done-when-met [MET_BOXES] --evidence-file [EVIDENCE_FILE]`) and aggregated by the parent session in § 11. Prepare the verified box selections and evidence file under `tmp/` per the linear skill's `issues complete` contract. The worktree's top-level managed issue stays In Progress or In Review until the PR merges. GitHub and ad-hoc issues close through the PR body or merge, never here.
+
+Carry a child with proved branch work and open post-merge checks into the parent summary in its current started state. The parent follows orch's submit-pr and merge-pr child handoff. Post-merge completion supplies the shared PR's merge time before moving the child to Verifying.
 
 **If single**, return now:
 

@@ -50,6 +50,12 @@ emit() { printf '%s___HTTP_CODE___200' "$1"; }
 single_issue() {
   local id="$1" sname="$2" stype="$3" parent="$4" parent_json="null" branch
   local description=null
+  if [[ ( "$id" == CC-912 || "$id" == CC-942 ) && -n "${CHILD_CHECKLIST_FILE:-}" ]]; then
+    description="$(jq -Rs . "$CHILD_CHECKLIST_FILE")"
+    sname="${CHILD_STATE:-In Progress}"
+    stype=started
+    [[ "$sname" != Done ]] || stype=completed
+  fi
   if [[ "$id" == CC-930 || "$id" == CC-940 ]]; then
     description='"## Done when\n- [x] Shared outcome\n  Evidence: holder read passed"'
   fi
@@ -67,6 +73,11 @@ single_issue() {
 # Args: identifier state_name state_type parent_identifier
 bundle_child() {
   local id="$1" sname="$2" stype="$3" parent="$4"
+  if [[ ( "$id" == CC-912 || "$id" == CC-942 ) && -n "${CHILD_CHECKLIST_FILE:-}" ]]; then
+    sname="${CHILD_STATE:-In Progress}"
+    stype=started
+    [[ "$sname" != Done ]] || stype=completed
+  fi
   printf '{"id":"uuid-%s","identifier":"%s","title":"%s","description":null,"state":{"name":"%s","type":"%s"},"assignee":null,"labels":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},"priority":3,"estimate":null,"parent":{"identifier":"%s"},"relations":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},"inverseRelations":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},"children":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}' \
     "$id" "$id" "$id" "$sname" "$stype" "$parent"
 }
@@ -105,6 +116,7 @@ elif [[ "$query" == *"ListComments"* ]]; then
   # parents (CC-930/CC-940) have none: their summary is posted by `issues
   # complete` at completion time, after validation.
   case "$vid" in
+  CC-912) if [[ "${CHILD_SUMMARY:-true}" == true ]]; then comments_with_summary; else comments_empty; fi ;;
   CC-922 | CC-930 | CC-940) comments_empty ;;
   CC-950) comments_with_summary 'Completion summary' ;;
   CC-951) comments_with_summary 'bUNDLE cOMPLETE' ;;
@@ -136,13 +148,11 @@ fi
 SH
 chmod +x "$TMP_ROOT/bin/curl"
 
-# The scenarios below assert on the safe-format result objects, so the
-# invocation names the format it asserts on instead of inheriting the host
-# project's setting.
+# The child table also exercises the supported compact display preference.
 run_validate() {
   PATH="$TMP_ROOT/bin:$PATH" \
     LINEAR_API_KEY_OVERRIDE=test-token \
-    LINEAR_FORMAT=safe \
+    LINEAR_FORMAT="${RUN_FORMAT:-safe}" \
     "$BASH" "$TMP_ROOT/.agents/skills/linear/scripts/linear.sh" \
     issues validate-completion "$@"
 }
@@ -244,3 +254,35 @@ open|## Done when\n- [ ] Shared outcome at source|false|[1]|[]|false
 missing-evidence|## Done when\n- [x] Shared outcome at source|false|[]|[1]|false
 proved|## Done when\n- [x] Shared outcome at source\n  Evidence: holder read passed|true|[]|[]|false
 ROWS
+
+# A template-produced child can finish its branch work before its shared PR
+# merges. The parent accepts only qualified started children at that phase.
+export CHILD_CHECKLIST_FILE="$TMP_ROOT/child.md"
+while IFS='|' read -r name format state description expected; do
+  printf '%b' "$description" >"$CHILD_CHECKLIST_FILE"
+  out="$(RUN_FORMAT="$format" CHILD_STATE="$state" run_validate CC-910 --include-children-of CC-910)"
+  check "$name child controls bundle acceptance" "$out" ".all_ok == $expected and (.results[] | select(.id == \"CC-912\") | .state == \"$state\" and .state_ok == $expected and .ok == $expected)"
+  if [[ "$state" != Done ]]; then
+    out="$(RUN_FORMAT="$format" CHILD_STATE="$state" run_validate CC-940 --include-children-of CC-940 --container)"
+    check "$name started child keeps container open" "$out" '.all_ok == false and (.results[] | select(.id == "CC-942") | .state_ok == false and .ok == false)'
+  fi
+done <<'ROWS'
+qualified|safe|In Progress|## Done when\n- [x] branch proof\n  Evidence: branch test passed\n- [ ] Post-merge: Read health; Where: service; Why after merge: deployed release; Trigger: release owner/repo v*; Deadline: +24h|true
+review|safe|In Review|## Done when\n- [x] branch proof\n  Evidence: branch test passed\n- [ ] Post-merge: Read health; Where: service; Why after merge: deployed release; Trigger: release owner/repo v*; Deadline: +24h|true
+custom-started|safe|In QA|## Done when\n- [x] branch proof\n  Evidence: branch test passed\n- [ ] Post-merge: Read health; Where: service; Why after merge: deployed release; Trigger: release owner/repo v*; Deadline: +24h|true
+open-branch|safe|In Progress|## Done when\n- [ ] branch proof\n- [ ] Post-merge: Read health; Where: service; Why after merge: deployed release; Trigger: release owner/repo v*; Deadline: +24h|false
+missing-evidence|safe|In Progress|## Done when\n- [x] branch proof\n- [ ] Post-merge: Read health; Where: service; Why after merge: deployed release; Trigger: release owner/repo v*; Deadline: +24h|false
+invalid-post|safe|In Progress|## Done when\n- [x] branch proof\n  Evidence: branch test passed\n- [ ] Post-merge: health|false
+empty|safe|In Progress|No checklist|false
+early-verifying|safe|Verifying|## Done when\n- [x] branch proof\n  Evidence: branch test passed\n- [ ] Post-merge: Read health; Where: service; Why after merge: deployed release; Trigger: release owner/repo v*; Deadline: +24h|false
+done-open-branch|safe|Done|## Done when\n- [ ] branch proof|false
+done-missing-evidence|safe|Done|## Done when\n- [x] branch proof|false
+compact-qualified|compact|In Progress|## Done when\n- [x] branch proof\n  Evidence: branch test passed\n- [ ] Post-merge: Read health; Where: service; Why after merge: deployed release; Trigger: release owner/repo v*; Deadline: +24h|true
+compact-done-open-branch|compact|Done|## Done when\n- [ ] branch proof|false
+compact-done-missing-evidence|compact|Done|## Done when\n- [x] branch proof|false
+ROWS
+printf '%b' '## Done when\n- [x] branch proof\n  Evidence: branch test passed\n- [ ] Post-merge: Read health; Where: service; Why after merge: deployed release; Trigger: release owner/repo v*; Deadline: +24h' >"$CHILD_CHECKLIST_FILE"
+out="$(CHILD_SUMMARY=false run_validate CC-910 --include-children-of CC-910)"
+check "started child still needs its summary" "$out" '.all_ok == false and (.results[] | select(.id == "CC-912") | .state_ok == true and .has_summary == false and .ok == false)'
+out="$(CHILD_STATE=Verifying run_validate CC-912)"
+check "Verifying remains invalid for a session root" "$out" '.all_ok == false and .results[0].state_ok == false'
