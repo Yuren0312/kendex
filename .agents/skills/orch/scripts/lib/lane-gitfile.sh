@@ -41,11 +41,20 @@ lane_gitfile_common_dir() { # GITFILE_CONTENT
 # lane_host_fetch LANE_HOST_CLI ITEM PATH DEST ERRF: read PATH into DEST from
 # the cached batch reply, or through `lane-host cat --item ITEM PATH` for a
 # single read. Returns 0 read, 1 not there, 2 failed, 4 dispatcher cap refusal.
+# An empty LANE_HOST_CLI reads local files with the same result statuses.
 # Cached missing-file rows need no probe. A single-read exit 2 can also be a
 # dispatcher refusal, so only a successful `touch` confirms absence
 # (schemas/lane-host.md). A failed read leaves no DEST; ERRF holds the cause.
 lane_host_fetch() {
   local rc=0
+  if [[ -z "$1" ]]; then
+    [[ -e "$3" || -L "$3" ]] || { rm -f -- "$4"; return 1; }
+    if ! cat -- "$3" >"$4" 2>"$5"; then
+      rm -f -- "$4"
+      return 2
+    fi
+    return 0
+  fi
   if [[ -n "${LANE_HOST_READ_DIR:-}" ]]; then
     source "$LANE_GITFILE_LIB/lane-host-read.sh" || return 2
     lane_host_cached_read "$LANE_HOST_READ_DIR" "$2" "$3" "$4" "$5" || rc=$?
@@ -124,9 +133,9 @@ lane_hosted_state_path() {
 # --no-private-env` reads another checkout's. The private env file is shell
 # the lane sources and this machine never runs, so only a literal
 # `ORCH_STATE_DIR=VALUE`, `export` before it allowed, is read from it; any
-# other line naming the key leaves the directory unread. 0 read; 2 a read
-# failed or a file did not parse, SCRATCH/state.err saying why; 4 lane-host
-# refused a call at its cap.
+# other line naming the key leaves the directory unread. An empty LANE_HOST_CLI
+# selects local files through lane_host_fetch. 0 read; 2 a read failed or a file
+# did not parse, SCRATCH/state.err saying why; 4 lane-host refused a call at its cap.
 LANE_HOSTED_STATE_DIR=""
 LANE_PRIVATE_STATE_RE='^[[:space:]]*(export[[:space:]]+)?ORCH_STATE_DIR=("[^"$`\\]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]"'"'"'$`\&<>();|]*)[[:space:]]*$'
 lane_hosted_state_dir() {
@@ -260,7 +269,7 @@ lane_state_rounds() { # STATE_JSON [ERRF]
   IFS=$'\t' read -r LANE_REVIEW_ROUNDS LANE_FIX_RECEIPTS LANE_VALIDATION_RUNS LANE_RESTACKS LANE_REPEATED_CLASS_ROUNDS <<<"$counts"
 }
 
-# lane_item_state WORKFLOW_STATE LANE_HOST_CLI STATE_DIR ITEM HOST ROOT SCRATCH [ARCHIVE] [STATE_KEY]
+# lane_item_state WORKFLOW_STATE LANE_HOST_CLI STATE_DIR ITEM HOST ROOT SCRATCH [ARCHIVE] [STATE_KEY] [STRICT]
 # ITEM identifies the launched lane for every host request. STATE_KEY defaults
 # to ITEM and selects only the workflow-state file, including older archives
 # without a recorded member. A PR-key fallback keeps the host's item identity.
@@ -282,14 +291,32 @@ lane_state_rounds() { # STATE_JSON [ERRF]
 # machine can read. 0 read, the state possibly
 # empty; 2 the read failed, SCRATCH/state.err saying why; 4 lane-host refused
 # the provider call at its per-home cap (lane-host-busy), SCRATCH/state.err
-# carrying its line.
+# carrying its line. STRICT=true binds the read to ROOT, with no caller-checkout
+# fallback. LANE_ITEM_STATE_REASON then identifies absent or unbound local roots
+# and hosts with files=none for the public lanes facts result.
 LANE_ITEM_STATE=""
 lane_item_state() {
   local path files rc=0 state_key="${9:-$4}"
-  LANE_ITEM_STATE=""
+  LANE_ITEM_STATE="" LANE_ITEM_STATE_REASON=""
+  if [[ "${10:-false}" == true && -z "$6" ]]; then
+    LANE_ITEM_STATE_REASON=root-unbound
+    return 2
+  fi
   if [[ -z "$5" ]]; then
     if [[ -n "$6" && -d "$6" ]]; then
-      path="$(cd -- "$6" && "$1" path "$state_key" 2>"$7/state.err")" || return 2
+      if [[ "${10:-false}" == true ]]; then
+        lane_hosted_state_dir "" "$4" "$6" "$7" || return $?
+        path="$(cd -- "$6" && "$1" --state-dir "$LANE_HOSTED_STATE_DIR" --no-private-env path "$state_key" 2>"$7/state.err")" || return 2
+      else
+        path="$(cd -- "$6" && "$1" path "$state_key" 2>"$7/state.err")" || return 2
+      fi
+    elif [[ "${10:-false}" == true ]]; then
+      if [[ -e "$6" || -L "$6" ]]; then
+        LANE_ITEM_STATE_REASON=root-unread
+        return 2
+      fi
+      LANE_ITEM_STATE_REASON=root-gone
+      return 0
     else
       path="$("$1" path "$state_key" 2>"$7/state.err")" || return 2
     fi
@@ -299,7 +326,10 @@ lane_item_state() {
   fi
   lane_capabilities_read "$2" "$5" 2>"$7/state.err" || return 2
   lane_capability files files
-  [[ "$files" != none ]] || return 0
+  if [[ "$files" == none ]]; then
+    LANE_ITEM_STATE_REASON=files-none
+    return 0
+  fi
   ORCH_LANE_HOST="$5" lane_hosted_item_state "$2" "$4" "$6" "$7" "$state_key" || rc=$?
   [[ "$rc" -eq 0 && "$LANE_HOSTED_GONE" == 1 && -n "${8:-}" ]] || return "$rc"
   lane_archived_state "$state_key" "$8" "$7" "$6"
