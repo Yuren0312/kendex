@@ -57,6 +57,19 @@ fi
 exec "$REAL_RM" "$@"
 STUB
 chmod +x "$TMP_ROOT/bin/rm"
+# The lane clock is the run's epoch plus elapsed seconds, which no stub can
+# move, so a second spent after a record is stamped puts the judge one second
+# past the record's own time.
+REAL_MV="$(command -v mv)"
+cat > "$TMP_ROOT/bin/mv" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$CACHE_WRITE_CROSS" == 1 ]]; then
+  case "${!#}" in */usage/*.json) sleep 1 ;; esac
+fi
+exec "$REAL_MV" "$@"
+STUB
+chmod +x "$TMP_ROOT/bin/mv"
 # The UTC day is the one clock the retirement policy reads; FAKE_TODAY moves it
 # for one run so a case can have a retirement date arrive.
 REAL_DATE="$(command -v date)"
@@ -78,7 +91,7 @@ cache_run() { # STATE POLICY COMMAND...
   shift 2
   (cd "$TMP_ROOT/repo" && env -i GIT_CEILING_DIRECTORIES="$GIT_CEILING_DIRECTORIES" PATH="$TMP_ROOT/bin:$PATH" HOME="$H" \
     REAL_JQ="$REAL_JQ" CREDENTIAL_LOG="$TMP_ROOT/credentials" CACHE_READ_LOG="$TMP_ROOT/cache-reads" \
-    REAL_RM="$REAL_RM" CACHE_RM_FAIL="${CACHE_RM_FAIL:-0}" \
+    REAL_RM="$REAL_RM" CACHE_RM_FAIL="${CACHE_RM_FAIL:-0}" REAL_MV="$REAL_MV" CACHE_WRITE_CROSS="${CACHE_WRITE_CROSS:-0}" \
     REAL_DATE="$REAL_DATE" FAKE_TODAY="${FAKE_TODAY:-}" FAKE_NOW="${FAKE_NOW:-}" \
     LANES_HOME="$H" ORCH_LANE_DIRS="$H/.claude:$H/.eclaude" \
     ORCH_LANES_FETCH_CMD="$TMP_ROOT/fetch" FIXTURE_DIR="$FIXTURE_DIR" \
@@ -545,9 +558,11 @@ assert_eq "$rc" 0 'control: swallowing deletion failure makes the refusal assert
 LANES="$ORIGINAL_LANES"
 CACHE_RM_FAIL=0
 pick_cache_case() { # ROW
-  local row="$1" state="$TMP_ROOT/pick-cache-$1" record fetched expected policy
+  local row="$1" state="$TMP_ROOT/pick-cache-$1" record fetched expected policy cross=0
   policy='ORCH_LANE_HOST=local ORCH_LANES_USAGE_TTL=300'
-  FAKE_NOW=1792140000 cache_run "$state" "$policy" pick --lane "$H/.claude/" --harness claude --for-overseer --json > "$TMP_ROOT/out"
+  rm -rf -- "${state:?}"
+  [[ "$row" != fetched ]] || cross=1
+  CACHE_WRITE_CROSS="$cross" FAKE_NOW=1792140000 cache_run "$state" "$policy" pick --lane "$H/.claude/" --harness claude --for-overseer --json > "$TMP_ROOT/out"
   record="$(compgen -G "$state/usage/claude-*.json")"
   fetched="$(jq -r '.fetched_at' "$record")"
   expected=$((fetched + 300))
@@ -562,6 +577,17 @@ pick_cache_case() { # ROW
       jq --argjson at "$expected" '.usage.five_hour.resets_at = ($at | todate) | del(.normalized)' "$record" > "$record.tmp"
       mv -- "$record.tmp" "$record"
       FAKE_NOW=1792140001 cache_run "$state" "$policy" pick --lane "$H/.claude" --harness claude --for-overseer --json > "$TMP_ROOT/out" ;;
+    refused)
+      # store_usage_refusal's form: the kept figure under its own older stamp,
+      # beside an expired refusal stamped later.
+      local kept_at=$((fetched - 30))
+      expected=$((kept_at + 300))
+      jq --argjson kept "$kept_at" --argjson at "$fetched" \
+        '.usage_fetched_at = $kept | .fetched_at = $at | del(.normalized)
+         | .refusal = {endpoint: "usage", status: "rate_limited", code: "429", detail: "HTTP 429", expires_at: ($at - 1)}' \
+        "$record" > "$record.tmp"
+      mv -- "$record.tmp" "$record"
+      FAKE_NOW=1792140001 cache_run "$state" "$policy" pick --lane "$H/.claude" --harness claude --for-overseer --json > "$TMP_ROOT/out" ;;
     no-credentials)
       mv -- "$H/.claude/.credentials.json" "$H/.claude/.credentials.held"
       FAKE_NOW=1792140001 cache_run "$state" "$policy" pick --lane "$H/.claude" --harness claude --for-overseer --json > "$TMP_ROOT/out" || [[ $? == 5 ]]
@@ -572,12 +598,18 @@ pick_cache_case() { # ROW
   assert_eq "$(jq -r '.usage_cache | [.path, .served_until] | @tsv' "$TMP_ROOT/out")" \
     "$(printf '%s\t%s' "$record" "$expected")" "pick cache $row names its measured file and serve bound"
 }
-for row in fetched cached wider reset no-credentials; do pick_cache_case "$row"; done
+for row in fetched cached wider reset refused no-credentials; do pick_cache_case "$row"; done
 control_dir="$(mutant_scripts pick-cache-control lanes)" || exit 1
 mutate_file "$control_dir/lanes" '.usage_cache = (if $cache != ""' '.usage_cache = (if false and $cache != ""'
 control_rc=0
 ( FAIL=0; LANES="$control_dir/lanes"; pick_cache_case fetched; [[ "$FAIL" == 0 ]] ) > "$TMP_ROOT/pick-cache-control.log" 2>&1 || control_rc=$?
 assert_eq "$control_rc" 1 'control: a missing local record reference fails the fetched row'
+control_dir="$(mutant_scripts pick-cache-clock-control lanes)" || exit 1
+mutate_file "$control_dir/lanes" 'cache_path="$USAGE_CACHE_FILE" cache_at="$at"' \
+  'lane_now; cache_path="$USAGE_CACHE_FILE" cache_at="$LANE_NOW"'
+control_rc=0
+( FAIL=0; LANES="$control_dir/lanes"; pick_cache_case fetched; [[ "$FAIL" == 0 ]] ) > "$TMP_ROOT/pick-cache-clock-control.log" 2>&1 || control_rc=$?
+assert_eq "$control_rc" 1 'control: a serve bound read off the judge clock fails the fetched row'
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
