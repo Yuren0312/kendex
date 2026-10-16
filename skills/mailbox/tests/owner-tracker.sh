@@ -2,6 +2,7 @@
 # Surface: owner ask tracker writer and outcome projection.
 # Inputs: skills/mailbox/scripts/**, skills/slack/scripts/**, skills/orch/references/secret-value.ere,
 # skills/mailbox/tests/lib/owner-tracker.py,
+# skills/mailbox/tests/lib/owner-tracker-close.py,
 # skills/orch/tests/lib/assertions.sh, skills/orch/tests/lib/growth-state.sh.
 set -euo pipefail
 unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE
@@ -37,8 +38,21 @@ assert_eq "$(jq '.terminal' <<<"$FACTS")" true 'each tracker result appends its 
 assert_eq "$(jq '.projection' <<<"$FACTS")" true 'readers fold terminal outcomes without replay or private events'
 assert_eq "$(jq '.delivery' <<<"$FACTS")" true 'the real relay holds pending asks then posts the selected form once'
 assert_eq "$(jq '.bound' <<<"$FACTS")" true 'a missing outcome releases at the fixed bound and preserves later delivery'
+CLOSE_FACTS="$(python3 "$ROOT/skills/mailbox/tests/lib/owner-tracker-close.py" \
+  "${MAILBOX_UNDER_TEST:-$ROOT/skills/mailbox}" "$TMP_ROOT" "$BASH")"
+assert_eq "$(jq '.unposted' <<<"$CLOSE_FACTS")" true 'failed tracker writes preserve description and labels after close'
+assert_eq "$(jq '.notice' <<<"$CLOSE_FACTS")" true 'failed tracker writes retain their failure notice'
+assert_eq "$(jq '.posted' <<<"$CLOSE_FACTS")" true 'posted tracker asks release only their description and labels'
+assert_eq "$(jq '.edited' <<<"$CLOSE_FACTS")" true 'close preserves an action line changed after posting'
+assert_eq "$(jq '.retained_error' <<<"$CLOSE_FACTS")" true 'a refused label retains tracker error bytes after close'
+assert_eq "$(jq '.comments' <<<"$CLOSE_FACTS")" true 'only successful tracker posts leave a question comment'
+assert_eq "$(jq '.rollback_owned' <<<"$CLOSE_FACTS")" true 'failed comments restore the exact description the ask replaced'
+assert_eq "$(jq '.rollback_unowned' <<<"$CLOSE_FACTS")" true 'rollback preserves a later description and reports lost ownership'
+assert_eq "$(jq '.rollback_notice' <<<"$CLOSE_FACTS")" true 'failed rollback reports its cause and retains the comment error'
+assert_eq "$(jq '.comment_refused' <<<"$CLOSE_FACTS")" true 'refused comment acknowledgements stay unposted and retain the response'
+assert_eq "$(jq '.rollback_labels' <<<"$CLOSE_FACTS")" true 'rollback removes only the added owner label from fresh labels'
 if [[ -z "${MAILBOX_UNDER_TEST:-}" ]]; then
-  for rule in pending failed bound private-failed; do
+  for rule in pending failed bound private-failed unposted exact-action retained-error rollback-owner comment-refused rollback-label; do
     mkdir -p "$TMP_ROOT/control-$rule"
     cp -R "$ROOT/skills/mailbox/scripts" "$TMP_ROOT/control-$rule/scripts"
     if [[ "$rule" == pending ]]; then
@@ -53,11 +67,38 @@ if [[ -z "${MAILBOX_UNDER_TEST:-}" ]]; then
         'and (release_at is None or time.time() < release_at)' \
         'and (release_at is None or True or time.time() < release_at)'
       assertion='a missing outcome releases at the fixed bound and preserves later delivery'
-    else
+    elif [[ "$rule" == private-failed ]]; then
       mutate_file "$TMP_ROOT/control-$rule/scripts/lib/mailbox-append.sh" \
         'select(.kind != "tracker-posted" and .kind != "tracker-failed")' \
         'select(.kind != "tracker-posted")'
       assertion='readers fold terminal outcomes without replay or private events'
+    elif [[ "$rule" == unposted ]]; then
+      mutate_file "$TMP_ROOT/control-$rule/scripts/lib/mailbox-append.sh" \
+        '[[ "$posted" == true ]] || return 0' '[[ "$posted" == true ]] || :'
+      assertion='failed tracker writes preserve description and labels after close'
+    elif [[ "$rule" == exact-action ]]; then
+      mutate_file "$TMP_ROOT/control-$rule/scripts/lib/mailbox-append.sh" \
+        'if startswith($prefix) then' 'if startswith("**") then'
+      mutate_file "$TMP_ROOT/control-$rule/scripts/lib/mailbox-append.sh" \
+        'ltrimstr($prefix) as $body' 'owner_action_body as $body'
+      assertion='close preserves an action line changed after posting'
+    elif [[ "$rule" == retained-error ]]; then
+      mutate_file "$TMP_ROOT/control-$rule/scripts/lib/mailbox-append.sh" \
+        'owner_tracker_unwritten "$issue" "$OWNER_TRACKER_CAUSE" "$work/tracker.err"' \
+        'owner_tracker_unwritten "$issue" "$OWNER_TRACKER_CAUSE"'
+      assertion='a refused label retains tracker error bytes after close'
+    elif [[ "$rule" == rollback-owner ]]; then
+      mutate_file "$TMP_ROOT/control-$rule/scripts/lib/mailbox-append.sh" \
+        '[[ "$owns_description" == true ]] || {' '[[ "$owns_description" == true ]] || true || {'
+      assertion='rollback preserves a later description and reports lost ownership'
+    elif [[ "$rule" == comment-refused ]]; then
+      mutate_file "$TMP_ROOT/control-$rule/scripts/lib/mailbox-append.sh" \
+        "if jq -e '.success == true'" "if : jq -e '.success == true'"
+      assertion='refused comment acknowledgements stay unposted and retain the response'
+    else
+      mutate_file "$TMP_ROOT/control-$rule/scripts/lib/mailbox-append.sh" \
+        'if [[ "$added_label" == true ]]; then' 'if false && [[ "$added_label" == true ]]; then'
+      assertion='rollback removes only the added owner label from fresh labels'
     fi
     control_rc=0
     MAILBOX_UNDER_TEST="$TMP_ROOT/control-$rule" "$BASH" "$ROOT/skills/mailbox/tests/owner-tracker.sh" \

@@ -202,7 +202,15 @@ owner_tracker_settings() { # MAILBOX SCRIPT DIRECTORY [ASK TO CLOSE]
   [[ "$configured" -eq 1 ]]
 }
 
-owner_tracker_unwritten() { # ISSUE CAUSE
+owner_tracker_unwritten() { # ISSUE CAUSE [ERROR FILE]
+  local evidence=""
+  if [[ -n "${3:-}" ]]; then
+    if evidence="$(mktemp "$BOX/tracker-error.XXXXXX")" && cat -- "$3" >"$evidence"; then
+      printf 'lane-mail: tracker-unwritten issue=%s cause=%s error-file=%s\n' "$1" "$2" "$evidence" >&2
+      return 0
+    fi
+    printf 'lane-mail: tracker-error-unretained issue=%s cause=write\n' "$1" >&2
+  fi
   printf 'lane-mail: tracker-unwritten issue=%s cause=%s\n' "$1" "$2" >&2
 }
 
@@ -243,7 +251,9 @@ owner_tracker_labels() { # ITEM JSON ADD|REMOVE [CLOSING LABEL] [REMAINING POSTE
 }
 
 owner_tracker_ask() { # TRACKER ENVELOPE WORK DIRECTORY
-  local tracker="$1" envelope="$2" work="$3" issue labels current owner description
+  local tracker="$1" envelope="$2" work="$3" issue labels current owner description latest owns_description original_description
+  local added_label rollback_labels comment_error
+  local rollback_label_args=()
   OWNER_TRACKER_POSTED=0
   OWNER_TRACKER_CAUSE=prepare
   issue="$(jq -r '.issue' <<<"$envelope")" || return 1
@@ -259,12 +269,10 @@ owner_tracker_ask() { # TRACKER ENVELOPE WORK DIRECTORY
     OWNER_TRACKER_CAUSE=labels-read; owner_tracker_unwritten "$issue" "$OWNER_TRACKER_CAUSE"; return 0;
   }
   labels="$(owner_tracker_labels "$current" ADD)" || return 1
+  added_label="$(jq -r --arg label "$OWNER_TRACKER_LABEL" '.labels | index($label) == null' <<<"$current")" || return 1
   description="$(jq -r --argjson owner "$owner" --argjson ask "$envelope" "$OWNER_ACTION_JQ"'
     (.description // "") | owner_action_line($owner.name; $ask.do) + "."' <<<"$current")" || return 1
   description="${description%.}"
-  "$tracker" issues update "$issue" --labels "$labels" --description "$description" >"$work/tracker.out" 2>"$work/tracker.err" || {
-    OWNER_TRACKER_CAUSE=label; owner_tracker_unwritten "$issue" "$OWNER_TRACKER_CAUSE"; return 0;
-  }
   jq -r '.text, "", ("Options: " + (.options | join(", "))),
     (if .reserved == true then "No default. This action waits for your approval. Due " + .deadline
       else "Recommendation: " + .recommend + ". At " + .deadline + " it stands unless you answer." end),
@@ -272,14 +280,50 @@ owner_tracker_ask() { # TRACKER ENVELOPE WORK DIRECTORY
     ("ask=" + .id),
     "Reply with one comment: ok, yes or done to approve; anything else is a change request."' \
     <<<"$envelope" >"$work/tracker-comment" || return 1
-  "$tracker" comments create "$issue" --body-file "$work/tracker-comment" >"$work/tracker.out" 2>"$work/tracker.err" || {
-    OWNER_TRACKER_CAUSE=comment; owner_tracker_unwritten "$issue" "$OWNER_TRACKER_CAUSE"; return 0;
+  "$tracker" issues update "$issue" --labels "$labels" --description "$description" >"$work/tracker.out" 2>"$work/tracker.err" || {
+    OWNER_TRACKER_CAUSE=label; owner_tracker_unwritten "$issue" "$OWNER_TRACKER_CAUSE" "$work/tracker.err"; return 0;
   }
-  OWNER_TRACKER_POSTED=1
+  comment_error="$work/tracker-comment.err"
+  if "$tracker" comments create "$issue" --body-file "$work/tracker-comment" >"$work/tracker.out" 2>"$work/tracker-comment.err"; then
+    if jq -e '.success == true' "$work/tracker.out" >/dev/null 2>"$work/tracker-comment.err"; then
+      OWNER_TRACKER_POSTED=1
+      return 0
+    fi
+    comment_error="$work/tracker.out"
+  fi
+  OWNER_TRACKER_CAUSE=comment
+  owner_tracker_unwritten "$issue" comment "$comment_error"
+  latest="$("$tracker" issues get "$issue" --format=safe 2>"$work/tracker-rollback.err")" || {
+    owner_tracker_unwritten "$issue" rollback-read "$work/tracker-rollback.err"; return 0;
+  }
+  # Restore only while the fresh read still contains this ask's exact write.
+  owns_description="$(jq -r --arg written "$description" '(.description // "") == $written' \
+    <<<"$latest" 2>"$work/tracker-rollback.err")" || {
+    owner_tracker_unwritten "$issue" rollback-read "$work/tracker-rollback.err"; return 0;
+  }
+  [[ "$owns_description" == true ]] || {
+    owner_tracker_unwritten "$issue" rollback-unowned; return 0;
+  }
+  original_description="$(jq -r '(.description // "") + "."' <<<"$current")" || return 1
+  original_description="${original_description%.}"
+  if [[ "$added_label" == true ]]; then
+    rollback_labels="$(owner_tracker_labels "$latest" REMOVE "$OWNER_TRACKER_LABEL" 2>"$work/tracker-rollback.err")" || {
+      owner_tracker_unwritten "$issue" rollback-read "$work/tracker-rollback.err"; return 0;
+    }
+    rollback_label_args=(--clear-labels)
+    [[ -z "$rollback_labels" ]] || rollback_label_args=(--labels "$rollback_labels")
+  fi
+  "$tracker" issues update "$issue" --description "$original_description" ${rollback_label_args[@]+"${rollback_label_args[@]}"} \
+    >"$work/tracker-rollback.out" 2>"$work/tracker-rollback.err" ||
+    owner_tracker_unwritten "$issue" rollback-update "$work/tracker-rollback.err"
+  return 0
 }
 
 owner_tracker_close() { # TRACKER ASK CLOSE_ID WORK DIRECTORY
-  local tracker="$1" ask="$2" close="$3" work="$4" issue labels ask_id current description remaining closing_label
+  local tracker="$1" ask="$2" close="$3" work="$4" issue labels ask_id current description remaining closing_label posted
+  # An item reference alone does not grant ownership of its tracker contents.
+  posted="$(jq -r '.tracker_posted == true' <<<"$ask")" || return 1
+  [[ "$posted" == true ]] || return 0
   issue="$(jq -r '.issue // empty' <<<"$ask")" || return 1
   [[ -n "$issue" ]] || return 0
   closing_label="$(jq -r --arg configured "$OWNER_TRACKER_LABEL" "$OWNER_TRACKER_JQ"'
@@ -315,13 +359,18 @@ owner_tracker_close() { # TRACKER ASK CLOSE_ID WORK DIRECTORY
   local owner_args=(--clear-assignee)
   if [[ "$remaining" != '[]' ]]; then
     owner_args=()
-    description="$(jq -r --argjson asks "$remaining" "$OWNER_ACTION_JQ"'
-      ($asks | last) as $ask |
-      .assignee as $name | (.description // "")
-      | (if ($ask.do // "") != "" then owner_action_line($name; $ask.do) else owner_action_body end) + "."' <<<"$current")" || return 1
-  else
-    description="$(jq -r "$OWNER_ACTION_JQ"' (.description // "") | owner_action_body + "."' <<<"$current")" || return 1
   fi
+  # Keep a line another ask or a later edit owns, even if its format matches.
+  description="$(jq -r --argjson closed "$ask" --argjson asks "$remaining" "$OWNER_ACTION_JQ"'
+    .assignee as $name | (.description // "")
+    | if ($closed.do // "") != "" then
+        ("" | owner_action_line($name; $closed.do)) as $prefix
+        | if startswith($prefix) then
+            ltrimstr($prefix) as $body | ($asks | last) as $next
+            | if ($next.do // "") != "" then ("" | owner_action_line($name; $next.do)) + $body else $body end
+          else . end
+      else . end
+    | . + "."' <<<"$current")" || return 1
   description="${description%.}"
   local label_args=(--clear-labels)
   [[ -z "$labels" ]] || label_args=(--labels "$labels")
