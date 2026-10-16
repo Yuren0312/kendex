@@ -4,21 +4,30 @@
 # each workflow ranked by when it last executed, tiebroken by run id, falling
 # back to run id alone while a run is pending or undated; run-less checks
 # deduped by name on startedAt; an aggregate status pointing at a superseded
-# run held EXPECTED) and which run ids head_runs then names. That no caller
+# run held EXPECTED, a required workflow's bound run kept beside the ranked
+# pick) and which run ids head_runs then names; then what classify_checks_rollup
+# reports over that scope for the bound runs. That no caller
 # carries its own copy of the function or of the jq taxonomy is tools/guard's
 # lane, not a row here.
 #
-# A row is `label|checks|scoped|runs`:
+# A row is `label|checks|scoped|runs[|req]`:
 #   checks  a fixture name (see checks_of): the head's checks as gh renders them
 #   scoped  every check the scoping keeps, in its order, as
 #           `<name>:<state>:<run id or ->` joined by `,`
 #   runs    head_runs over the scoped list, joined by `,`; `-` when empty
+#   req     a requirement fixture name (see req_of), the evidence
+#           required_contexts hands the scoping; absent means none ([])
+#
+# The must-fail control at the bottom runs the bound row against a copy of the
+# lib with the binding cut (lib/mutant-copy.sh).
 set -euo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$TEST_DIR/../../.." && pwd)"
 # shellcheck source=../scripts/lib/ci-run-correlation.sh
 source "$REPO_ROOT/skills/github/scripts/lib/ci-run-correlation.sh"
+# shellcheck source=lib/mutant-copy.sh
+source "$TEST_DIR/lib/mutant-copy.sh"
 PASS=0
 FAIL=0
 
@@ -65,28 +74,51 @@ checks_of() {
     status-job-link) printf '[{"name":"build","state":"SUCCESS","bucket":"pass","workflow":"CI","startedAt":"2026-07-26T10:00:00Z","link":"%s/100/job/1"},{"name":"build","state":"SUCCESS","bucket":"pass","workflow":"CI","startedAt":"2026-07-26T10:30:00Z","link":"%s/200/job/2"},{"name":"CI Required","state":"SUCCESS","bucket":"pass","workflow":"","startedAt":"2026-07-26T10:01:00Z","link":"%s/100/job/9"}]' "$R" "$R" "$R" ;;
     # a run-less check beside a run-linked one
     runless-beside-job) printf '[{"name":"build","state":"SUCCESS","bucket":"pass","workflow":"CI","startedAt":"2026-07-26T10:00:00Z","link":"%s/100/job/1"},{"name":"external","state":"SUCCESS","bucket":"pass","workflow":"","startedAt":"2026-07-26T10:05:00Z","link":""}]' "$R" ;;
+    # one required workflow run twice on the head: the higher id, which the
+    # requirement binds, executed before the lower one
+    two-runs) printf '[{"name":"request","state":"SUCCESS","bucket":"pass","workflow":"Request","startedAt":"2026-07-26T10:00:00Z","link":"%s/200/job/2"},{"name":"request","state":"SUCCESS","bucket":"pass","workflow":"Request","startedAt":"2026-07-26T10:05:00Z","link":"%s/100/job/1"}]' "$R" "$R" ;;
+    # the same two runs, the later unbound one having failed
+    two-runs-later-failed) printf '[{"name":"request","state":"SUCCESS","bucket":"pass","workflow":"Request","startedAt":"2026-07-26T10:00:00Z","link":"%s/200/job/2"},{"name":"request","state":"FAILURE","bucket":"fail","workflow":"Request","startedAt":"2026-07-26T10:05:00Z","link":"%s/100/job/1"}]' "$R" "$R" ;;
+    # the two runs beside an aggregate status linking the bound run
+    two-runs-bound-status) printf '[{"name":"request","state":"SUCCESS","bucket":"pass","workflow":"Request","startedAt":"2026-07-26T10:00:00Z","link":"%s/200/job/2"},{"name":"request","state":"SUCCESS","bucket":"pass","workflow":"Request","startedAt":"2026-07-26T10:05:00Z","link":"%s/100/job/1"},{"name":"CI Required","state":"SUCCESS","bucket":"pass","workflow":"","link":"%s/200"}]' "$R" "$R" "$R" ;;
+    # the same two runs, the bound one having failed
+    two-runs-bound-failed) printf '[{"name":"request","state":"FAILURE","bucket":"fail","workflow":"Request","startedAt":"2026-07-26T10:00:00Z","link":"%s/200/job/2"},{"name":"request","state":"SUCCESS","bucket":"pass","workflow":"Request","startedAt":"2026-07-26T10:05:00Z","link":"%s/100/job/1"}]' "$R" "$R" ;;
     *) echo "UNKNOWN-CHECKS: $1" >&2; exit 2 ;;
+  esac
+}
+
+# required_contexts' evidence shapes: ready binds runs with their check links
+# (ready-200-all under the all_checks fallback, where every check blocks),
+# failed names failed_runs, unreadable binds nothing.
+req_of() {
+  case "$1" in
+    none) printf '[]' ;;
+    ready-200) printf '{"state":"ready","contexts":[],"workflows":[{"definition":{"repository_id":1,"path":".github/workflows/request.yml"},"consumer":{"repository_id":1,"head":"h"},"runs":[{"id":200,"suite_id":2,"checks":[{"name":"request","link":"%s/200/job/2"}]}]}],"all_checks":false}' "$R" ;;
+    ready-200-all) req_of ready-200 | jq -c '.all_checks = true' ;;
+    failed-200) printf '{"state":"failed","contexts":[],"failed_runs":[200]}' ;;
+    unreadable) printf '{"state":"unreadable","contexts":[]}' ;;
+    *) echo "UNKNOWN-REQ: $1" >&2; exit 2 ;;
   esac
 }
 
 run() {
   local out
-  out="$(checks_of "$1" | scope_current_run)"
+  out="$(checks_of "$1" | scope_current_run "$(req_of "${2:-none}")")"
   printf 'scoped=%s runs=%s' \
     "$(jq -r '[.[] | .name + ":" + .state + ":" + (((.link // "") | capture("/runs/(?<r>[0-9]+)")? | .r) // "-")] | join(",")' <<<"$out")" \
     "$(jq -r "$CI_RUN_JQ_DEFS"'head_runs | if length == 0 then "-" else join(",") end' <<<"$out")"
 }
 
 run_table() {
-  local title="$1" rows="$2" label checks scoped runs got row field before=$((PASS + FAIL))
+  local title="$1" rows="$2" label checks scoped runs req got row field before=$((PASS + FAIL))
   echo "=== $title ==="
   while IFS= read -r row; do
     [[ "$row" != "" ]] || continue
-    IFS='|' read -r label checks scoped runs <<<"$row"
+    IFS='|' read -r label checks scoped runs req <<<"$row"
     for field in "$label" "$checks" "$scoped" "$runs"; do
       [[ "$field" != "" ]] || { printf 'a row with an empty field asserts nothing: %s\n' "$row" >&2; exit 1; }
     done
-    got="$(run "$checks")"
+    got="$(run "$checks" "${req:-none}")"
     # A rendering aid for writing rows; the run is refused after the loop.
     if [[ "${GITHUB_TABLE_PROBE:-}" == 1 ]]; then
       printf '%s => %s\n' "$label" "$got"
@@ -112,7 +144,34 @@ a status linking a run of its own names it beside the workflow's|status-run|buil
 the only run of a workflow being an all-skipped no-op still scopes to it|all-skipped|build:SKIPPED:100|100
 a status linking a job of a superseded run is not an aggregate and is never held|status-job-link|build:SUCCESS:200,CI Required:SUCCESS:100|100,200
 a run-less check is kept after the run's own, never ahead of it|runless-beside-job|build:SUCCESS:100,external:SUCCESS:-|100
+a required workflow's green bound run keeps its job though another run of it executed later|two-runs|request:SUCCESS:200,request:SUCCESS:100|100,200|ready-200
+a required workflow's failed bound run stays in scope and holds the wait|two-runs-bound-failed|request:FAILURE:200,request:SUCCESS:100|100,200|failed-200
+a later unbound run's red check stays in scope beside the bound run|two-runs-later-failed|request:SUCCESS:200,request:FAILURE:100|100,200|ready-200-all
+an aggregate linking the bound run is current, never held behind the later pick|two-runs-bound-status|request:SUCCESS:200,request:SUCCESS:100,CI Required:SUCCESS:200|100,200|ready-200
+unreadable evidence binds no run: the workflow ranks by execution time|two-runs|request:SUCCESS:100|100|unreadable
 "
+
+# classify_checks_rollup passes its evidence to the scoping: the bound job is
+# found by link, and a later run's red check blocks under all_checks.
+classify() { # CHECKS REQ
+  checks_of "$1" | classify_checks_rollup "$(req_of "$2")" \
+    | jq -r '"pending=\(.pending) failed=\(.failed) optional=\(.optional_failed) request_runs=\([.checks[] | select(.name == "request") | .link | capture("/runs/(?<r>[0-9]+)").r] | join(","))"'
+}
+echo "=== the rollup classification ==="
+assert_eq "$(classify two-runs ready-200)" "pending= failed= optional= request_runs=200,100" \
+  "the bound job satisfies its requirement though another run of it executed later"
+assert_eq "$(classify two-runs-later-failed ready-200-all)" "pending= failed=request (FAILURE) optional= request_runs=200,100" \
+  "under the all_checks fallback a later unbound run's red check blocks"
+
+echo "=== must-fail control ==="
+TMP_ROOT="$(mktemp -d)" || { echo "ci-run-correlation.test: scratch=mktemp-failed" >&2; exit 1; }
+trap 'rm -rf -- "${TMP_ROOT:?}"' EXIT
+mutant=$(mutant_copy_edit "$TMP_ROOT/unbound" \
+  '            (map(select(.runid | IN($bound[])))) as $bound_runs' \
+  '            [] as $bound_runs' lib/ci-run-correlation.sh)
+# shellcheck source=/dev/null
+assert_eq "$(source "$mutant"; run two-runs ready-200)" "scoped=request:SUCCESS:100 runs=100" \
+  "must-fail: with the binding cut, the later unbound run hides the bound job"
 
 printf '\npass: %d   fail: %d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
