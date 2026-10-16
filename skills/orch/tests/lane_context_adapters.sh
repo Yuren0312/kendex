@@ -79,7 +79,7 @@ T="$TMP_ROOT/t"; mkdir -p "$T"
   jq -nc '{type:"assistant",message:{model:"<synthetic>",usage:{input_tokens:0,cache_read_input_tokens:0,cache_creation_input_tokens:0}}}'; } > "$T/claude-synthetic"
 claude_line claude-sonnet-5 400000 > "$T/claude-sonnet"
 claude_line claude-haiku-4-5-20251001 150000 > "$T/claude-haiku"
-claude_line claude-sonnet-4-6 150000 > "$T/claude-unknown"
+claude_line MyProviderModel 150000 > "$T/claude-unknown"
 jq -nc '{type:"assistant",message:{model:"claude-opus-5-5",usage:{prompt_tokens:5}}}' > "$T/claude-unread"
 jq -nc '{type:"user",message:{content:"hi"}}' > "$T/none"
 { codex_context gpt-6-astra; codex_count 1000 258400; codex_count 232560 258400; } > "$T/codex-last"
@@ -100,9 +100,9 @@ done <<'ROWS'
 claude-last|claude||rc=0 1000|1000000|claude-opus-5-5
 claude-partial|claude||rc=0 1000|1000000|claude-opus-5-5
 claude-synthetic|claude||rc=0 700000|1000000|claude-fable-5-1
-claude-sonnet|claude||rc=0 400000|1000000|claude-sonnet-5
+claude-sonnet|claude||rc=0 400000|200000|claude-sonnet-5
 claude-haiku|claude||rc=0 150000|200000|claude-haiku-4-5-20251001
-claude-unknown|claude||rc=0 150000||claude-sonnet-4-6
+claude-unknown|claude||rc=0 150000|200000|MyProviderModel
 claude-unread|claude||rc=0 unread
 none|claude||rc=0
 codex-last|codex||rc=0 232560|258400|gpt-6-astra
@@ -116,72 +116,97 @@ pi-claude-spelled|pi|200000|rc=0 unread
 claude-last|opencode||rc=3
 ROWS
 
-echo "=== the claude window table names a model only where its window is established ==="
+echo "=== Claude families and native aliases need no version pins ==="
 echo "=== resolved Claude launch identity ==="
-while IFS='|' read -r model pin want mode; do
-  got="$(env -u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_FABLE_MODEL \
-    ANTHROPIC_DEFAULT_SONNET_MODEL="$pin" "$BASH" -euo pipefail -c \
-    '. "$1"; lane_adapter_claude_model_id "$2" "$3"' _ "$LIB" "$model" "${mode:-resolved}")"
+while IFS='|' read -r model pin want mode recorded; do
+  got="$(env ANTHROPIC_DEFAULT_OPUS_MODEL="$pin" ANTHROPIC_DEFAULT_FABLE_MODEL="$pin" \
+    ANTHROPIC_DEFAULT_SONNET_MODEL="$pin" ANTHROPIC_DEFAULT_HAIKU_MODEL="$pin" "$BASH" -euo pipefail -c \
+    '. "$1"; lane_adapter_claude_model_id "$2" "$3" "$4"' _ "$LIB" "$model" "${mode:-resolved}" "$recorded")"
   assert_eq "$got" "$want" "${mode:-resolved} identity $model pin=$pin"
 done <<'ROWS'
 fable-5-1||claude-fable-5-1
 claude-fable-5-1||claude-fable-5-1
 claude-fable-5-1[1m]||claude-fable-5-1
 claude-opus-4-8-20261001||claude-opus-4-8-20261001
-sonnet||claude-sonnet-5-5
-sonnet|claude-sonnet-4-6|claude-sonnet-4-6
-sonnet[1m]|claude-sonnet-4-6|claude-sonnet-4-6
-fable||claude-fable-5-1
+sonnet||
+sonnet|claude-sonnet-4-6|
+sonnet[1m]|claude-sonnet-4-6|
+fable||
 best||
 default||
-opus||claude-opus-5-5
-sonnet|claude-sonnet-4-6||recorded
-fable|||recorded
+opus||
+sonnet|claude-sonnet-4-6|sonnet|recorded
+sonnet|claude-sonnet-4-6|sonnet|launch
+sonnet[1m]|claude-sonnet-4-6|sonnet[1m]|launch
+opus|claude-opus-5-5|opus|launch
+fable|claude-fable-5-5|fable|launch
+haiku|claude-haiku-5-5|haiku|launch
+fable||fable|recorded
+opus[1m]||opus|recorded
+haiku||haiku|recorded
 fable-5-1||claude-fable-5-1|recorded
 claude-opus-4-8-20261001||claude-opus-4-8-20261001|recorded
+claude-sonnet-4-6|claude-sonnet-5-5|sonnet|resolved|sonnet
+claude-opus-4-8||opus|resolved|opus[1m]
+claude-fable-5-1||fable|resolved|fable
+claude-haiku-5-5||haiku|resolved|haiku
+claude-opus-4-8||claude-opus-4-8|resolved|sonnet
+claude-opus-4-8||claude-opus-4-8|resolved|claude-opus-4-6
 opusplan||opusplan|launch
 MyProviderModel||MyProviderModel|launch
 fable-5-1[1m]||claude-fable-5-1|launch
 ROWS
-while IFS='|' read -r selector value model pin want; do
-  got="$(env "$selector=$value" ANTHROPIC_DEFAULT_FABLE_MODEL="$pin" "$BASH" -euo pipefail -c \
-    '. "$1"; lane_adapter_claude_model_id "$2" resolved' _ "$LIB" "$model")"
-  assert_eq "$got" "$want" "provider identity $selector=$value model=$model"
-done <<'ROWS'
-CLAUDE_CODE_USE_BEDROCK|1|fable||
-CLAUDE_CODE_USE_VERTEX|true|fable||
-CLAUDE_CODE_USE_FOUNDRY|on|fable||
-CLAUDE_CODE_USE_MANTLE|yes|fable||
-CLAUDE_CODE_USE_ANTHROPIC_AWS|1|fable||
-CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST|1|fable||
-ANTHROPIC_BASE_URL|https://gateway.example|fable||
-CLAUDE_CODE_USE_BEDROCK|false|fable||claude-fable-5-1
-CLAUDE_CODE_USE_BEDROCK|1|fable|claude-fable-5|claude-fable-5
-ROWS
 # `model|window|id`: a model, its window, and the id a launch writes for it.
-# claude-sonnet-4-6 runs 200K or, as its [1m] variant, 1M under one id,
-# claude-sonnet-5-1 is a model no row has evidence for, and a bare sonnet or
-# haiku is whatever a pin makes it; all stay unnamed.
+# Version fields do not change a family's handoff budget. Claude receives
+# native aliases and applies its own family overrides.
 while IFS='|' read -r model want id; do
   assert_eq "$(bash -c 'set -euo pipefail; source "$1"; lane_adapter_claude_window "$2"; lane_adapter_claude_model_id "$2"' _ "$LIB" "$model" | tr '\n' '|')" \
     "${want:+$want|}${id:-$model}|" "claude window of $model: ${want:-none}, written as ${id:-$model}"
 done <<'ROWS'
-fable|1000000|claude-fable-5-1
+fable|1000000
 opus[1m]|1000000
 claude-opus-5-5|1000000
-sonnet||claude-sonnet-5-5
-Sonnet||claude-sonnet-5-5
-claude-sonnet-5|1000000
-claude-sonnet-5-5|1000000
-haiku||claude-haiku-4-5
+sonnet|200000
+Sonnet|200000|sonnet
+claude-sonnet-5|200000
+claude-sonnet-5-5|200000
+haiku|200000
 claude-haiku-4-5|200000
 claude-haiku-4-5-20251001|200000
-claude-sonnet-4-6|
-claude-sonnet-4-5|
-claude-sonnet-5-1|
-sonnet[1m]|
-haiku[1m]|
-|
+claude-haiku-5-5|200000
+claude-sonnet-9-9|200000
+claude-sonnet-4-6|200000
+claude-sonnet-4-5|200000
+claude-sonnet-5-1|200000
+sonnet[1m]|200000
+haiku[1m]|200000
+MyProviderModel|200000|myprovidermodel
+|200000
+ROWS
+
+echo "=== dry launch keeps compaction off for new models ==="
+# Exercise the production gate and command builder in one shell. The second
+# build must not repeat the notice the first build emitted.
+while IFS='|' read -r model window notices; do
+  got="$("$BASH" -euo pipefail -c '
+    source "${1%/*}/lane-launch.sh"
+    launch_choice_lead_settings claude --model "$2"
+    launch_choice_lead_settings --question-off claude --model "$2"
+    printf "%s|%s|%s\n" "$LAUNCH_CHOICE_COMPACTION" "$(lane_adapter_claude_window "$2")" "${LAUNCH_CHOICE_KEPT[*]}"
+  ' _ "$LIB" "$model" 2>"$TMP_ROOT/launch.err")"
+  assert_eq "${got%%|*}" on "dry launch $model disables compaction"
+  remaining="${got#*|}"
+  assert_eq "${remaining%%|*}" "$window" "dry launch $model uses its budget"
+  assert_contains "${remaining#*|}" '--settings={"env":{"DISABLE_AUTO_COMPACT":"1"}}' "dry launch $model carries compaction settings"
+  assert_eq "$(grep -c '^claude-window-default model=' "$TMP_ROOT/launch.err" || true)" "$notices" "dry launch $model notice count"
+  if [[ "$notices" == 1 ]]; then
+    assert_eq "$(cat "$TMP_ROOT/launch.err")" "claude-window-default model=$model window=$window" "dry launch $model notice fields"
+  fi
+done <<'ROWS'
+claude-sonnet-9-9|200000|0
+claude-haiku-5-5|200000|0
+claude-opus-5-5|1000000|0
+claude-lyra-9-9|200000|1
 ROWS
 
 echo "=== effective compaction settings preserve unresolved token use ==="
@@ -219,24 +244,33 @@ pi|{"compaction":{"enabled":true}}|
 pi|{"compaction":{"enabled":false}}|200000
 ROWS
 
-# Every harness reaches the common judge through its adapter. The due row is
-# strictly before the verified point; Claude reaches the independent cap first.
-while IFS='|' read -r harness tokens expected; do
+# Every harness reaches the common judge through its adapter. Sonnet's mark
+# must fit a supported 200K session even when its alias selects a larger one.
+while IFS='|' read -r harness model tokens expected full; do
   case "$harness" in
-    claude) claude_line claude-opus-5-5 "$tokens" > "$T/before-point" ;;
-    codex) { codex_context gpt-6-astra; codex_count "$tokens" 258400; } > "$T/before-point" ;;
-    pi) pi_line m "$tokens" > "$T/before-point" ;;
+    claude) claude_line "$model" "$tokens" > "$T/before-point" ;;
+    codex) { codex_context "$model"; codex_count "$tokens" 258400; } > "$T/before-point" ;;
+    pi) pi_line "$model" "$tokens" > "$T/before-point" ;;
   esac
   answer=$(reading "$LIB" "$harness" 200000 < "$T/before-point")
   point=${answer#*|}; point=${point%%|*}
-  assert_eq "$(due "$LIB" "$tokens" "$point" 90)" "rc=0 $expected" "$harness before-point $tokens is $expected"
+  assert_eq "$(due "$LIB" "$tokens" "$point" 90)" "rc=0 $expected" "$harness $model before-point $tokens is $expected"
+  rc=0
+  "$BASH" -euo pipefail -c 'source "$1"; lane_context_window_full "$2" "$3" "$4"' _ "$LIB" "$tokens" "$point" "$harness" || rc=$?
+  assert_eq "$rc" "$full" "$harness $model full-window status at $tokens"
 done <<'ROWS'
-claude|399999|room
-claude|400000|due
-codex|232560|room
-codex|232561|due
-pi|180000|room
-pi|180001|due
+claude|claude-opus-5-5|399999|room|1
+claude|claude-opus-5-5|400000|due|1
+claude|sonnet|180000|room|1
+claude|sonnet|180001|due|1
+claude|claude-sonnet-4-5-20250929|190000|due|1
+claude|claude-sonnet-4-6|190000|due|1
+claude|claude-sonnet-9-9|190000|due|1
+claude|claude-sonnet-4-5-20250929|200000|due|0
+codex|gpt-6-astra|232560|room|1
+codex|gpt-6-astra|232561|due|1
+pi|m|180000|room|1
+pi|m|180001|due|1
 ROWS
 
 echo "=== the one judge answers at a share of the reading's own window ==="
@@ -515,9 +549,9 @@ if [[ -z "${LIB_UNDER_TEST:-}" ]]; then
   }
   control copilot-share lane-context.sh 'LANE_CONTEXT_COPILOT_COMPACTION_PCT=80' 'LANE_CONTEXT_COPILOT_COMPACTION_PCT=100' \
     'copilot {"session_id":"s1","cwd":"/w","current_tokens":150000'
-  control model-override adapters/claude.sh 'model=${ANTHROPIC_DEFAULT_SONNET_MODEL:-}; fallback=claude-sonnet-5-5' 'model=""; fallback=claude-sonnet-5-5' \
-    'resolved identity sonnet pin=claude-sonnet-4-6'
-  control version-identity adapters/claude.sh 'printf '\''%s\n'\'' "$model"' 'printf '\''%s\n'\'' "${model%-20261001}"' \
+  control native-alias adapters/claude.sh '[[ "${2:-}" != launch ]] || model=${1:-}' 'model=${ANTHROPIC_DEFAULT_SONNET_MODEL:-$model}' \
+    'launch identity sonnet pin=claude-sonnet-4-6'
+  control version-identity adapters/claude.sh '  printf '\''%s\n'\'' "${model}"' '  printf '\''%s\n'\'' "${model%-20261001}"' \
     'resolved identity claude-opus-4-8-20261001 pin='
   control unresolved-model adapters/claude.sh '      *) model="" ;;' '      *) : ;;' \
     'resolved identity best pin='
@@ -525,10 +559,8 @@ if [[ -z "${LIB_UNDER_TEST:-}" ]]; then
     'resolved identity fable-5-1 pin='
   control capacity-spelling adapters/claude.sh 'case "${2:-}" in launch | resolved | recorded) model=${model%\[1m\]} ;; esac' ':' \
     'resolved identity claude-fable-5-1[1m] pin='
-  control recorded-alias adapters/claude.sh 'if [[ "${2:-}" == recorded ]]; then' 'if false; then' \
+  control recorded-alias adapters/claude.sh 'if [[ "${2:-}" != resolved ]]; then' 'if false; then' \
     'recorded identity sonnet pin=claude-sonnet-4-6'
-  control provider-alias adapters/claude.sh '"$provider_unknown" == false' 'true' \
-    'provider identity CLAUDE_CODE_USE_VERTEX=true model=fable'
   control copilot-floor lane-context.sh '(.token_limit * $pct / 100 | floor | tostring)' '(.token_limit * $pct / 100 | ceil | tostring)' \
     'copilot {"session_id":"s1","cwd":"/w","current_tokens":0'
   control copilot-zero-limit lane-context.sh ' or .token_limit == 0 then' ' then' \
@@ -555,10 +587,14 @@ if [[ -z "${LIB_UNDER_TEST:-}" ]]; then
     'codex reads codex-last as'
   control codex-evidence adapters/codex.sh 'then $window else "" end;' 'then $window else $window end;' \
     'codex configuration  gives point unresolved'
-  control claude-model-id adapters/claude.sh '    sonnet) model=' '    sonnetx) model=' \
-    'claude window of sonnet: none, written as claude-sonnet-5-5'
-  control claude-window-substring adapters/claude.sh '      ${pair%=*}) printf' '      *${pair%=*}*) printf' \
-    'claude window of claude-sonnet-5-1: none'
+  control claude-family adapters/claude.sh '*sonnet*=200000' '*sonnet*=1000000' \
+    'claude sonnet before-point 180001 is due'
+  control claude-default adapters/claude.sh 'LANE_ADAPTER_CLAUDE_DEFAULT_WINDOW=200000' 'LANE_ADAPTER_CLAUDE_DEFAULT_WINDOW=1000000' \
+    'dry launch claude-lyra-9-9 uses its budget'
+  control claude-new-model-launch adapters/claude.sh '  printf '\''%s\n'\'' "$LANE_ADAPTER_CLAUDE_DEFAULT_WINDOW"' '  return 0' \
+    'dry launch claude-lyra-9-9 disables compaction'
+  control claude-notice adapters/claude.sh 'LANE_ADAPTER_CLAUDE_WINDOW_NOTICED=true' ':' \
+    'dry launch claude-lyra-9-9 notice count'
   control claude-evidence adapters/claude.sh '[ "${DISABLE_AUTO_COMPACT:-}" = 1 ]' '[ "${DISABLE_AUTO_COMPACT:-}" = 0 ]' \
     'claude configuration 0 gives point unresolved'
   control strict-mark lane-context.sh '-gt $(($2 * pct))' '-ge $(($2 * pct))' \

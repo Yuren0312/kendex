@@ -414,6 +414,18 @@ table \
   "--lane auto takes the account with the most room for the model being passed|$CHOICE_CMD|--harness claude --lane auto KEN-64|rc=0 cmd_lane=claude walled=none" \
   "--lane auto moves off the account whose window for that model is walled|cmd=true --model=fable --effort=high|--harness claude --lane auto KEN-65|rc=0 cmd_lane=eclaude walled=none"
 
+table \
+  "raw attached capacity flags refuse a named account at its family wall|cmd=true --model=fable[1m] --effort=high|--harness claude --lane $H/.claude KEN-60|rc=1 launched=nolog walled=lane=$H/.claude,model=fable[1m],pct=95,bucket=model,projected-headroom=5" \
+  "raw space capacity flags refuse a relaunch at the same wall|cmd=true --model fable[1m] --effort high|--harness claude --relaunch --lane $H/.claude KEN-61|rc=1 launched=nolog walled=lane=$H/.claude,model=fable[1m],pct=95,bucket=model,projected-headroom=5" \
+  "a capacity launch picks another account and keeps its executable selector|cmd=true --model=fable[1m] --effort=high|--harness claude --lane auto KEN-65|rc=0 cmd_lane=eclaude cmd_model=fable[1m] walled=none"
+pi_control ctl-model-capacity lib/lane-model.sh \
+  '($model | sub("\\[1[mM]\\]$"; "") | lane_norm) as $m' '($model | lane_norm) as $m' \
+  'cmd=true --model=fable[1m] --effort=high' --harness claude --lane auto KEN-65
+control_rc=0
+( FAIL=0; assert_eq "$(observe 'rc=0 cmd_lane=eclaude cmd_model=fable[1m]')" 'rc=0 cmd_lane=eclaude cmd_model=fable[1m]' 'capacity account selection'; [[ "$FAIL" == 0 ]] ) \
+  > "$TMP_ROOT/model-capacity-control.log" || control_rc=$?
+assert_eq "$RC:$control_rc" '0:1' 'the raw-flag assertion rejects selecting the account at its family wall'
+
 # The named lane is judged on the projection `lanes pick` drops a lane on: its
 # 5-hour window at 60 with room, but the one lane already live on it charged
 # 50 an hour, which projects 110. The second row is the inverse, the same lane
@@ -428,12 +440,12 @@ table \
 claude_usage 10 20 94 'Fable 5.1' > "$FIXTURE_DIR/.claude.json"
 NAMED_PREFERENCE='ORCH_LANE_PREFERENCE=claude:fable:high,claude:opus:high;cmd=claude;ORCH_LANE_BURN_PCT_PER_HOUR=50'
 table \
-  "a preference resolves a named alias before its pick|$NAMED_PREFERENCE;ORCH_LANE_ALIASES=claude=work;cwd=$COLLIDE|--harness claude --lane work KEN-1643|rc=0 launched=1 cmd_lane=claude cmd_model=claude-fable-5-1" \
-  "a preference skips the model its live claim projects past the wall|$NAMED_PREFERENCE;prep=claude_claim|--harness claude --lane $H/.claude KEN-1644|rc=0 launched=1 cmd_lane=claude cmd_model=claude-opus-5-5" \
+  "a preference resolves a named alias before its pick|$NAMED_PREFERENCE;ORCH_LANE_ALIASES=claude=work;cwd=$COLLIDE|--harness claude --lane work KEN-1643|rc=0 launched=1 cmd_lane=claude cmd_model=fable" \
+  "a preference skips the model its live claim projects past the wall|$NAMED_PREFERENCE;prep=claude_claim|--harness claude --lane $H/.claude KEN-1644|rc=0 launched=1 cmd_lane=claude cmd_model=opus" \
   "a preference checks an excluded alias before a same-named directory|$NAMED_PREFERENCE;ORCH_LANE_ALIASES=claude=work;ORCH_LANE_EXCLUDE=claude;cwd=$COLLIDE|--harness claude --lane work KEN-1645|rc=1 launched=nolog refused=lane=work"
 pi_control ctl-preference-projected open-terminal 'preference_pick_args=(--lane "$lane_dir" --projected)' 'preference_pick_args=(--lane "$lane_dir")' \
   "$NAMED_PREFERENCE;prep=claude_claim" --harness claude --lane "$H/.claude" KEN-1644
-assert_eq "$(observe "rc=0 launched=1 cmd_model=claude-fable-5-1")" "rc=0 launched=1 cmd_model=claude-fable-5-1" \
+assert_eq "$(observe "rc=0 launched=1 cmd_model=fable")" "rc=0 launched=1 cmd_model=fable" \
   "control: without projected use the preference launches the walled first model"
 claude_usage 10 20 95 'Fable 5.1' > "$FIXTURE_DIR/.claude.json"
 
