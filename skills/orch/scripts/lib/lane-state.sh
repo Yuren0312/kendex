@@ -55,6 +55,9 @@ WORKING_RE='to interrupt|to run in background|↓ [0-9][0-9.]*[kKmM]? tokens|Jum
 # A dialog waiting on an answer: the selected numbered row, drawn with each
 # harness's marker, and Claude Code's question and key hints.
 LANE_ASKING_RE='(❯|›) [0-9]+\. |Do you want to|Enter to select|Esc to cancel'
+# Codex's optional model-switch reminder blocks input without asking about
+# the work. Its account/config APIs cannot report a running terminal's dialog.
+RATE_LIMIT_SWITCH_RE='^[[:space:]]*Switch to .+ for lower credit usage[?][[:space:]]*$'
 # The account is spent. Claude Code opens the banner with "You've hit your
 # <bucket> limit" / "You've reached your…" and points at /usage-credits; Codex
 # prints "Usage limit reached" and its out-of-credits wording. `.` stands in
@@ -989,6 +992,16 @@ lane_pane_capture() { # OUT_VAR MODE HOST ITEM PANE [history]
 # The judge.
 # ---------------------------------------------------------------------------
 
+# Consumers ask for a property instead of copying the judge's state list.
+# Unknown or unreadable observations grant neither live nor dialog permission.
+lane_state_is() { # STATE live|dialog
+  case "$1" in
+    asking|rate-limit-switch) [[ "$2" == live || "$2" == dialog ]] ;;
+    working|idle|walled) [[ "$2" == live ]] ;;
+    *) return 1 ;;
+  esac
+}
+
 # lane_state OUT_VAR WINDOW CMD PID SCREEN [SESSION] [ACCOUNT] [ROWS] [HOSTED_ITEM] [HARNESS] [SOURCE]
 # SOURCE carries LANE_PANE_SOURCE from the shared capture owner. A failed
 # provider observation cannot establish exit, even when the process confirms it.
@@ -1000,6 +1013,7 @@ lane_pane_capture() { # OUT_VAR MODE HOST ITEM PANE [history]
 #             shells
 #   walled    the current turn reports a failed login, or a usage wall
 #             that no ACCOUNT reading says has lifted
+#   rate-limit-switch  Codex's optional lower-credit model reminder is up
 #   asking    a dialog is up and waiting on an answer
 #   idle      the harness is at its input prompt with nothing in flight
 #   working   a turn is in flight
@@ -1149,7 +1163,16 @@ lane_state() {
       *) printf -v "$_ls_out" unjudged; return 0 ;;
     esac
   fi
-  if grep -Eq -- "$LANE_ASKING_RE" <<<"$_ls_slice"; then printf -v "$_ls_out" asking; return 0; fi
+  if grep -Eq -- "$LANE_ASKING_RE" <<<"$_ls_slice"; then
+    # A selected row also matches LANE_ASKING_RE, so the reminder is read only
+    # on a pane already asking; every other lane pays no process for it.
+    if grep -Eq -- "$RATE_LIMIT_SWITCH_RE" <<<"$_ls_slice" && grep -Eq -- "$DIALOG_ROW_RE" <<<"$_ls_slice"; then
+      printf -v "$_ls_out" rate-limit-switch
+    else
+      printf -v "$_ls_out" asking
+    fi
+    return 0
+  fi
   if pane_working "$_ls_slice"; then printf -v "$_ls_out" working; return 0; fi
   # The supplied process read, whole, before any rung that could answer `idle`.
   # Anything but `idle` here answers by itself: `busy` is a turn the screen has
