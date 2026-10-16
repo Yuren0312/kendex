@@ -126,7 +126,15 @@ Record this tier after either state route. Direct publication uses it to retain 
    git -C [WT_PATH] commit -m "[PREFIX]([ISSUE_ID]): [DESCRIPTION]"
    ```
 
-   A successful commit with escape condition 3 recorded escapes now. Any other successful commit continues to § 3. A repository-rule refusal escapes as condition 4 with the staged edit still present; § Escape transfers that exact state.
+   A successful commit with escape condition 3 recorded escapes now. Any other successful commit continues to step 6. A repository-rule refusal escapes as condition 4 with the staged edit still present; § Escape transfers that exact state.
+
+6. **Post the completion summary**. **Skip if** `TRACKER` is GitHub. This tier runs no dev round, so this comment is the item's only Completion Summary, and `container-close` refuses a container whose child has none. Write `[WT_PATH]/tmp/completion-summary-[ISSUE_ID].md` under a `## Completion Summary` heading: the commit `git -C [WT_PATH] log -1 --oneline` prints, one line per committed path saying what changed, and the commit chain as what checked it. Post it at once, as the standard tier's dev-implement.md § 9 does, so it is on the item before any lane lands the change:
+
+   ```bash
+   .agents/skills/linear/scripts/linear.sh comments create [ISSUE_ID] --body-file [WT_PATH]/tmp/completion-summary-[ISSUE_ID].md
+   ```
+
+   A rate-limited post is held under the linear skill's `patterns/workflow-actions.md` § Quota Holds. Continue to § 3.
 
 ## 3. Push And Open The PR
 
