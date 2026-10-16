@@ -111,6 +111,7 @@ ot_message() { # REASON FIELD=VALUE...
     brief-undelivered) text='The brief is still undelivered. Attach to the session and start it manually.' ;;
     terminal-missing) text='Set TERMINAL to an installed terminal or install xdg-terminal-exec.' ;;
     terminal-fallback) text='The requested terminal is unavailable. The selected terminal will open the lane.' ;;
+    live-display-dropped) text='The lane record declares the owner'"'"'s live display, and this relaunch does not pass --live-display: the lane runs without the display and its record drops the declaration. Relaunch with --live-display to keep it.' ;;
     terminal-opened) text='The GUI terminal launch was started.' ;;
     issue-invalid) text='The issue identifier does not match the configured pattern.' ;;
     issue-canonical-failed) text='The git-context helper could not canonicalize the issue identifier. Nothing was created.' ;;
@@ -707,6 +708,22 @@ Options:
                     A parked record keeps its slot under --state-dir's fleet
                     cap, so this relaunch replaces the lane it holds and is
                     never refused as cap-reached.
+  --live-display    Keep WAYLAND_DISPLAY, DISPLAY and
+                    HYPRLAND_INSTANCE_SIGNATURE for the lane, which every
+                    other launch clears from the lane's process with the
+                    launching session's identity. What clearing them does
+                    and does not cover is the LANE_LAUNCH_SCRUB comment in
+                    lib/lane-launch.sh. Pass it only for an item whose
+                    brief declares that need; a lane that needs any screen
+                    runs its own nested display. Recorded as
+                    live_display true in the lane record under --state-dir.
+                    A Claude, Codex or Copilot --wake keeps them where that
+                    record holds it; a Pi wake reaches the session the launch
+                    started. An automatic recovery relaunch repeats the
+                    option; a manual relaunch without it clears them, drops
+                    the declaration and prints live-display-dropped. A GUI
+                    terminal keeps them to open its window, and the lane's
+                    shell inside it clears them.
   --wake            Wake an idle lane in its existing worktree: resume its
                     newest matching Claude, Codex or Copilot session in print
                     mode, a Copilot one as the value of -p, or
@@ -799,7 +816,8 @@ record names host and kind claude-cloud, its session id and the item's
 window, whose pane runs the session's local client, its mail_root the local
 worktree), mail_root, surface, model, session_id, session_since
 (the time this launch or relaunch read before its terminal opened), allow_all
-(whether a copilot command grants --allow-all or --yolo), and recovery,
+(whether a copilot command grants --allow-all or --yolo), live_display
+(true on a --live-display launch, absent otherwise), and recovery,
 whose private choices lib/lane-relaunch.sh uses for automatic same-harness
 recovery. Legacy records without those choices require a manual relaunch.
 The record also carries launched_at,
