@@ -217,14 +217,23 @@ if [[ -z "$LANE_HOST" ]]; then
   [[ "$host_rc" -eq 0 ]] || { ot_message host-resolve-failed "exit=$host_rc" >&2; exit 1; }
 fi
 preference_host="$LANE_HOST"
-# Prints the record `lanes pick --json` judged the lane on; pick_record_env
-# reads the launch prefix from it.
+# Prints the `lanes pick --json` record for pick_record_env.
+# Returns the helper's status, or local status 6 when a successful API-credit
+# pick conflicts with the requested harness pool.
 pick_auto_lane() {
-  local model_args=() state_env=()
+  local model_args=() state_env=() pick_harness="$LANE_HARNESS" record rc=0
+  # An explicit auto pool cannot substitute plan room for Pi API credit.
+  # Preference entries already name the harness whose model they spend.
+  if [[ "$PREFERENCE_ACTIVE" != true && "$(lane_pick_pool "$LAUNCH_HARNESS" "$LAUNCH_MODEL")" == api-credit ]]; then
+    pick_harness="$LAUNCH_HARNESS"
+  fi
   [[ -z "$LAUNCH_MODEL" ]] || model_args=(--model "$LAUNCH_MODEL")
   [[ "$FLEET" != true ]] || state_env=("ORCH_STATE_DIR=$STATE_DIR")
-  env ${state_env[@]+"${state_env[@]}"} ORCH_LANE_HOST="$LANE_HOST" "$LANES_CLI" pick --harness "$LANE_HARNESS" \
-    ${LANE_PCT_ARGS[@]+"${LANE_PCT_ARGS[@]}"} ${model_args[@]+"${model_args[@]}"} "$@" --json
+  record="$(env ${state_env[@]+"${state_env[@]}"} ORCH_LANE_HOST="$LANE_HOST" "$LANES_CLI" pick --harness "$pick_harness" \
+    ${LANE_PCT_ARGS[@]+"${LANE_PCT_ARGS[@]}"} ${model_args[@]+"${model_args[@]}"} "$@" --json)" || rc=$?
+  printf '%s\n' "$record"
+  [[ "$rc" -eq 0 ]] || return "$rc"
+  [[ "$pick_harness" == "$LANE_HARNESS" ]] || return 6
 }
 # The prefix `lanes pick` prints without --json, through the same
 # lib/lane-launch.sh mapping on the same harness, account and model.
@@ -618,8 +627,7 @@ LANE_SPEC_HARNESS=""
 #
 # --harness wins where both are given: the harness command is built for THAT
 # flag, so it is the harness that will read the model word out of the launch
-# text. The pick keeps following the spec it was handed, which is a different
-# question — which account to open on — and is asked where that branch is.
+# text. The pick follows the spec where it names the pool the model spends.
 #
 # Empty only where NOTHING in the argv names a harness: a named config dir or
 # alias with no --harness. Such a launch carries its own argv in --cmd, no row
@@ -1005,30 +1013,26 @@ pi_lane_root_apply() {
   fi
   [[ "$PI_GATE_DEFERRED" != true ]] || pi_local_gate
 }
-# The refusal for an `auto` pick `lanes` answered with RC, the fields after it
-# appended, by the account lane_pick_harness says the launch spends. Every one
-# stops the launch, and each names what answers it: 3 is no candidate with
-# room, which for the Copilot pool is every pool read at or above the
-# threshold, a pool the lane host read reopening at its binding_resets_at and a
-# stated one moving only when the owner restates it; 5 is a Pi pick where no
-# read measured any pool, a read to repair as the `fix=` line `lanes` printed
-# above says, or one on a provider nothing measures; anything else is lanes
-# failing, a failed accounts read that a retry can answer among them.
+# Prints a refusal for pick_auto_lane's RC and RECORD, appending FIELDs.
+# Statuses 3 and 5 are account refusals. Status 6 is the local API-credit
+# pool mismatch. Other statuses are helper failures. The caller stops the launch.
 auto_pick_refusal() { # RC RECORD [FIELD...]
   local rc="$1" record="$2" grant_refused
   shift 2
-  if [[ "$(lane_pick_pool "$LANE_HARNESS" "$LAUNCH_MODEL")" == api-credit ]]; then
+  if [[ "$(lane_pick_pool "$LANE_HARNESS" "$LAUNCH_MODEL")" == api-credit \
+     || "$(lane_pick_pool "$LAUNCH_HARNESS" "$LAUNCH_MODEL")" == api-credit ]]; then
     if [[ "$rc" -eq 3 ]]; then
       grant_refused="$(jq -r 'any(.refusals[]; .refusal.cause == "api-credit")' <<<"$record")" \
         || { ot_message lane-resolution-failed step=pick-record "$@" >&2; return; }
       if [[ "$grant_refused" == false ]]; then
-        ot_message lane-unavailable "harness=$LANE_HARNESS" "$@" >&2
+        ot_message lane-unavailable harness=pi "$@" >&2
         return
       fi
     fi
     case "$rc" in
       3) ot_message lane-credit-refused cause=api-credit retry-at=none "$@" ;;
-      5) ot_message lane-provider-unmeasured "harness=$LANE_HARNESS" "model=${LAUNCH_MODEL:-none}" "$@" ;;
+      5) ot_message lane-provider-unmeasured harness=pi "model=${LAUNCH_MODEL:-none}" "$@" ;;
+      6) ot_message lane-pool-mismatch "lane=$LANE" "harness=$LAUNCH_HARNESS" pool=api-credit "$@" ;;
       *) ot_message lane-resolution-failed "exit=$rc" "$@" ;;
     esac >&2
     return
