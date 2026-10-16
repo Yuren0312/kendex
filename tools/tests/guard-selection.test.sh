@@ -121,7 +121,7 @@ if mutant_guard 's/      \*) tree=tools; rel="\.\.\/\$f" ;;/      *) continue ;;
 else
   bad 'external-input control changes the guard'
 fi
-if mutant_guard 's/^    inputs=$(sed .*$/    inputs=/' ; then
+if mutant_guard 's/if (text ~ \/\^# Inputs: \/)/if (0)/' ; then
   git -C "$R" reset -q --hard "$BASE"
   printf '# changed\n' >> "$R/skills/input/tests/lib/evaluator.py"
   preview range true "$MUTANT_TOOLS/guard"
@@ -221,6 +221,7 @@ BASE="$(git -C "$R" rev-parse HEAD)"
 git -C "$R" update-ref refs/remotes/origin/main "$BASE"
 READER_GREP="$(command -v grep)"
 READER_SED="$(command -v sed)"
+READER_AWK="$(command -v awk)"
 mkdir -p "$TMP/reader-bin"
 cat > "$TMP/reader-bin/grep" <<'SH'
 #!/usr/bin/env bash
@@ -233,6 +234,24 @@ if [ "${2:-}" = -e ] && [[ ${1:-} == -q[FE] ]]; then
 fi
 exec "$READER_GREP" "$@"
 SH
+cat > "$TMP/reader-bin/awk" <<'SH'
+#!/usr/bin/env bash
+program=$1
+shift
+case "$program:$READER_FAILURE" in
+  *'function scan_file('*:[1234])
+    needle='for (reader_phase = 0; reader_phase < 4; reader_phase++) {'
+    [[ $program == *"$needle"* ]] || exit 2
+    rest=${program#*"$needle"}
+    [[ $rest != *"$needle"* ]] || exit 2
+    phase=$((READER_FAILURE - 1))
+    replacement="$needle if (reader_phase == $phase) injected_failure = 1;"
+    program=${program/"$needle"/"$replacement"}
+    program+=$'\nEND { if (injected_failure) exit 2 }'
+    ;;
+esac
+exec "$READER_AWK" "$program" "$@"
+SH
 cat > "$TMP/reader-bin/sed" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
@@ -240,7 +259,7 @@ case "${1:-}" in
 esac
 exec "$READER_SED" "$@"
 SH
-chmod +x "$TMP/reader-bin/grep" "$TMP/reader-bin/sed"
+chmod +x "$TMP/reader-bin/grep" "$TMP/reader-bin/sed" "$TMP/reader-bin/awk"
 reader_failure() { # INPUT SCOPED FAILURE GUARD
   git -C "$R" reset -q --hard "$BASE"
   printf '# changed\n' >> "$R/$1"
@@ -248,10 +267,45 @@ reader_failure() { # INPUT SCOPED FAILURE GUARD
   rm -f -- "$TMP/reader-calls"
   RC=0
   OUT="$(cd "$R" && env -u DEV_VALIDATE_CLASS -u DEV_VALIDATE_DOCS_ONLY -u DEV_VALIDATE_PATHS \
-    PATH="$TMP/reader-bin:$PATH" READER_GREP="$READER_GREP" READER_SED="$READER_SED" \
+    PATH="$TMP/reader-bin:$PATH" READER_GREP="$READER_GREP" READER_SED="$READER_SED" READER_AWK="$READER_AWK" \
     READER_CALLS="$TMP/reader-calls" READER_FAILURE="$3" DEV_VALIDATE_SCOPED="$2" SUITE_LOG="$SUITE_LOG" \
     "$4" --selection --range "$BASE" 2>&1)" || RC=$?
 }
+
+# Two inputs in tools/ share the completed reader scan. The grep wrapper
+# counts only the old per-reader comparisons, not extraction or other gates.
+reader_grep_row() { # GUARD
+  git -C "$R" reset -q --hard "$BASE"
+  for input in tools/README.md .github/workflows/skill-tests.yml; do
+    printf '# changed\n' >> "$R/$input"
+  done
+  rm -f -- "$TMP/reader-calls"
+  : > "$SUITE_LOG"
+  RC=0
+  OUT="$(cd "$R" && env -u DEV_VALIDATE_CLASS -u DEV_VALIDATE_DOCS_ONLY -u DEV_VALIDATE_PATHS \
+    PATH="$TMP/reader-bin:$PATH" READER_GREP="$READER_GREP" READER_SED="$READER_SED" READER_AWK="$READER_AWK" \
+    READER_CALLS="$TMP/reader-calls" READER_FAILURE=none DEV_VALIDATE_SCOPED=true SUITE_LOG="$SUITE_LOG" \
+    "$1" --selection --range "$BASE" 2>&1)" || RC=$?
+  reader_grep_calls=0
+  [ ! -f "$TMP/reader-calls" ] || read -r reader_grep_calls < "$TMP/reader-calls"
+  [ "$RC" -eq 0 ] && [ "$(cat "$SUITE_LOG")" = aggregate ] && [ "$reader_grep_calls" -eq 0 ]
+}
+reader_grep_row "$GUARD" \
+  && ok 'two inputs reuse one tree reader scan without per-reader grep' \
+  || bad 'two inputs reuse one tree reader scan without per-reader grep' "calls=$reader_grep_calls rc=$RC out=$OUT"
+if mutant_guard '/^    doc_readers "\$rel" || return 2$/a\
+    grep -qF -e "/$rel" -- ${SCAN_PATH[@]+"${SCAN_PATH[@]}"} || [ $? -eq 1 ] || return 2'; then
+  if reader_grep_row "$MUTANT_TOOLS/guard"; then
+    bad 'control: repeated reader grep turns the cached comparison assertion red'
+  else
+    [ "$reader_grep_calls" -gt 0 ] && [ "$RC" -eq 0 ] && [ "$(cat "$SUITE_LOG")" = aggregate ] \
+      && ok 'control: repeated reader grep turns the cached comparison assertion red' \
+      || bad 'control: repeated reader grep turns the cached comparison assertion red' "calls=$reader_grep_calls rc=$RC out=$OUT"
+  fi
+else
+  bad 'reader grep control changes the guard'
+fi
+
 for failure in 1 2 3 4 sed; do
   for row in 'tools/README.md|false' '.github/workflows/skill-tests.yml|false' '.github/workflows/skill-tests.yml|true'; do
     IFS='|' read -r input scoped <<<"$row"
@@ -267,7 +321,7 @@ for failure in 1 2 3 4 sed; do
 done
 # The same injected failures must redden the contract when they are accepted
 # as no match. Keep all comparisons so the control still reaches the error.
-if mutant_guard 's/^        \*) return 2 ;;$/        *) ;; /; s/^  token=\(.*\) || return 2$/  token=\1 || true/'; then
+if mutant_guard '/scan_input.*|| return 2$/s/|| return 2/|| true/; s/^  token=\(.*\) || return 2$/  token=\1 || true/'; then
   for failure in 1 sed; do
     reader_failure .github/workflows/skill-tests.yml true "$failure" "$MUTANT_TOOLS/guard"
     [ -s "$SUITE_LOG" ] && [[ $OUT != *'guard: mapped-suites=2 '* ]] \
