@@ -210,6 +210,16 @@ PI_CURRENT_TITLE_RE=$'^──[[:space:]\xc2\xa0]+π - .+[[:space:]\xc2\xa0]+(─
 PI_CURRENT_FOOTER_RE='^.+ / .+ [^[:space:]]+%([[:space:]].*)?$'
 PI_CURRENT_PROMPT_RE='^π[[:space:]]*$'
 
+# Check the base editor layout: native selectors replace the final prompt
+# with a border. A historical prompt elsewhere in the capture cannot qualify.
+pane_pi_editor_ready() {
+  awk -v footer="$PI_CURRENT_FOOTER_RE" -v prompt="$PI_CURRENT_PROMPT_RE" '
+    $0 ~ footer { footer_seen = 1 }
+    /[^[:space:]]/ { final = $0 }
+    END { exit !(footer_seen && final ~ prompt) }
+  ' <<<"$1"
+}
+
 # pane_harness_up SCREEN — the predicate over one captured pane.
 pane_harness_up() {
   pane_working "$1" || grep -Eq -- "$HARNESS_UP_RE" <<<"$1" \
@@ -1160,6 +1170,34 @@ lane_state() {
     idle) printf -v "$_ls_out" idle ;;
     *) printf -v "$_ls_out" unjudged ;;
   esac
+}
+
+# lane_input_ready takes lane_state's arguments, with HARNESS required even
+# when HOSTED_ITEM is empty. OUT_VAR retains the state for provider diagnostics.
+# Exit 0 permits input, 1 refuses, and lane_state's scan errors retain status 2.
+# Pi's pulse and hidden indicators cannot establish activity from a capture.
+# Its provider must supply session_rows_lane_verdict's idle ROWS verdict;
+# lane_state alone can also reach idle through SESSION or a lifted wall.
+# Native selectors can open without an activity row. The capture lane_state
+# actually read must also show the base editor's final empty prompt.
+lane_input_ready() {
+  local _lir_out="$1" _lir_rows="${8:-}" _lir_harness="${10:-}" _lir_state=unjudged _lir_rc=0 _lir_editor=0
+  shift
+  lane_state _lir_state "$@" || _lir_rc=$?
+  if [[ -z "$_lir_harness" || ( "$_lir_harness" == pi && "$_lir_rows" != idle ) ]]; then
+    [[ "$_lir_state" != idle ]] || _lir_state=unjudged
+  fi
+  if [[ "$_lir_state" == idle && "$_lir_harness" == pi ]]; then
+    pane_pi_editor_ready "$LANE_PANE_SCREEN" || _lir_editor=$?
+    case "$_lir_editor" in
+      0) ;;
+      1) _lir_state=unjudged ;;
+      *) _lir_state=unjudged; _lir_rc=2 ;;
+    esac
+  fi
+  printf -v "$_lir_out" '%s' "$_lir_state"
+  [[ "$_lir_rc" -eq 0 ]] || return "$_lir_rc"
+  [[ "$_lir_state" == idle ]]
 }
 
 # ---------------------------------------------------------------------------
