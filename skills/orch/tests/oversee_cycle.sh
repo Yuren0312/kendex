@@ -148,7 +148,7 @@ new_case() {
   CASE="$TMP_ROOT/case-$1"
   export CASE
   mkdir -p "$CASE/state"
-  jq -n --arg at "$(at 0)" '{lanes: [range(1; 7) | {item: "KEN-\(.)", repo: null, launched_at: $at, status: "done"}], fleet_log: []}' \
+  jq -n --arg at "$(at 0)" --arg owner "$REPO" '{overseer:{cwd:$owner},lanes: [range(1; 7) | {item: "KEN-\(.)", repo: null, launched_at: $at, status: "done"}], fleet_log: []}' \
     > "$CASE/state/workflow-state-oversee.json"
 }
 
@@ -547,6 +547,126 @@ assert_eq "$(record KEN-2 micro | grep -o 'review=[^ ]* fix=[^ ]* bot=[^ ]* full
   "review=- fix=- bot=- full_validations=-|oversee-cycle: rounds-unread item=KEN-2" \
   "a lane state that does not read records no rounds and says so"
 rm -f -- "${REPO:?}/tmp/workflow-state-KEN-2.json"
+
+echo '=== missing state reports the item and every attempted path ==='
+new_case absent-state
+printf micro > "$CASE/class"
+timeline 1200
+record KEN-6 micro >/dev/null
+assert_file_contains "$CASE/err" 'oversee-cycle: rounds-unread item=KEN-6' 'an absent state produces the recorder diagnostic'
+assert_file_contains "$CASE/err" "lane-gitfile: state-tried item=KEN-6 path=$REPO/tmp/workflow-state-KEN-6.json" 'the live path is named'
+assert_file_contains "$CASE/err" "lane-gitfile: state-tried item=KEN-6 path=$REPO/tmp/cycle-state/workflow-state-pr-7.json" 'the saved path is named'
+cp -p "$BIN" "$LAYOUT/orch/scripts/no-rounds-diagnostic"
+mutate_file "$LAYOUT/orch/scripts/no-rounds-diagnostic" \
+  'elif [[ "$LANE_ITEM_STATE_REASON" != files-none ]]; then' \
+  'elif false && [[ "$LANE_ITEM_STATE_REASON" != files-none ]]; then'
+RUN_BIN="$LAYOUT/orch/scripts/no-rounds-diagnostic" record KEN-6 micro >/dev/null
+assert_eq "$(state '.lanes[] | select(.item == "KEN-6") | .cycle.rounds')" null 'control: disabling the diagnostic still records unknown rounds'
+assert_file_not_contains "$CASE/err" 'oversee-cycle: rounds-unread item=KEN-6' 'control: disabling the missing-state branch removes its diagnostic'
+
+echo '=== merged lanes retain rounds through live-state and worktree removal ==='
+connected_checkout="$TMP_ROOT/connected-cycle"
+git clone -q -b main "$ORIGIN" "$connected_checkout"
+git -C "$connected_checkout" config gc.auto 0
+git -C "$connected_checkout" config maintenance.auto false
+owner_worktree="$TMP_ROOT/owner-worktree"
+git -C "$REPO" worktree add -q --detach "$owner_worktree" HEAD
+owner_address_rows() {
+  local label owner fleet_dir caller writer_root watch_dir override got env_args
+  while IFS='|' read -r label owner fleet_dir caller writer_root watch_dir override; do
+    mkdir -p "$fleet_dir" "$watch_dir"
+    jq --arg owner "$owner" 'if $owner == "" then del(.overseer.cwd) else .overseer.cwd=$owner end' \
+      "$CASE/address-source.json" > "$fleet_dir/workflow-state-oversee.json"
+    printf 'clone-root\tKEN-6\t/clone\n' > "$watch_dir/saved__none.mail"
+    env_args=(env -u ORCH_STATE_DIR -u OVERSEE_WATCH_STATE_DIR "PATH=$TMP_ROOT/bin:$PATH")
+    [[ "$override" != yes ]] || env_args+=("OVERSEE_WATCH_STATE_DIR=$watch_dir")
+    got="$("${env_args[@]}" "$BASH" -eu -c 'source "$1"; lane_watch_state_dir "$2"' sh \
+      "$LAYOUT/orch/scripts/lib/watch-host-kinds.sh" "$writer_root")"
+    assert_eq "$got" "$watch_dir" "address $label writer"
+    got="$(cd "$caller" && "${env_args[@]}" "$BIN" --state-dir "$fleet_dir" stages KEN-6 2>"$CASE/err")"
+    assert_eq "$got" 'stage item=KEN-6 kind=review round_id=saved start=1 end=2' "address $label stages" "$CASE/err"
+    got="$(cd "$caller" && "${env_args[@]}" "$BIN" --state-dir "$fleet_dir" record --pr 7 --tier micro KEN-6 2>"$CASE/err")"
+    assert_eq "$(field review "$got") $(field fix "$got") $(field bot "$got") $(field full_validations "$got")" \
+      'review=3 fix=5 bot=4 full_validations=2' "address $label counts" "$CASE/err"
+    rm -- "$watch_dir/saved__none.mail"
+  done <<ROWS
+registered-clone|$REPO|$CASE/state|$connected_checkout|$REPO|$REPO/tmp/oversee-watch|no
+state-directory||$REPO/tmp/primary-fleet|$connected_checkout|$REPO|$REPO/tmp/oversee-watch|no
+override|$REPO|$CASE/state|$connected_checkout|$connected_checkout|$connected_checkout/tmp/explicit-watch|yes
+linked-worktree|$owner_worktree|$CASE/state|$connected_checkout|$owner_worktree|$owner_worktree/tmp/oversee-watch|no
+external-no-cwd||$CASE/state|$REPO|$REPO|$REPO/tmp/oversee-watch|no
+ROWS
+}
+for form in local hosted; do
+  new_case "saved-$form"
+  printf micro > "$CASE/class"
+  timeline 1200
+  mkdir -p "$REPO/tmp/cycle-state" "$REPO/tmp/oversee-watch"
+  saved="$REPO/tmp/cycle-state/workflow-state-pr-7.json"
+  live="$REPO/tmp/workflow-state-KEN-6.json"
+  printf '{"first_panel":true,"rereview_cycles":2,"cycles":5,"pr_comment_review":{"iterations":4},"validate_rounds":[{"mode":"full"},{"mode":"range"},{"mode":"full"}],"stages":[{"kind":"review","round_id":"saved","start":1,"end":2}]}' > "$live"
+  cp -- "$live" "$saved"
+  (cd "$REPO" && FLEET_DIR="$CASE/fleet" "$LAYOUT/orch/scripts/workflow-state" --state-dir "$REPO/tmp" remove KEN-6) >"$CASE/remove.out"
+  assert_eq "$([[ ! -e "$live" && -f "$saved" ]] && printf retained)" retained "$form close-out removes live state and retains the cycle copy" "$CASE/remove.out"
+  if [[ "$form" == hosted ]]; then
+    mkdir -p "$CASE/host/clone/tmp/cycle-state"
+    cp -- "$saved" "$CASE/host/clone/tmp/cycle-state/workflow-state-pr-7.json"
+    rm -- "$saved"
+    # stages reads the saved copy under the lane's current PR.
+    edit_json "$CASE/state/workflow-state-oversee.json" '(.lanes[] | select(.item == "KEN-6")) += {host:"box",mail_root:"/w/KEN-6",repo:"vanillagreencom/kendex",pending_pr:{pr:7}}'
+    cp -- "$CASE/state/workflow-state-oversee.json" "$CASE/address-source.json"
+    owner_address_rows
+    cp -p "$TEST_DIR/../scripts/lib/watch-host-kinds.sh" "$TMP_ROOT/common-watch-root.sh"
+    mutate_file "$TMP_ROOT/common-watch-root.sh" 'repo-root "$candidate"' 'common-root "$candidate"'
+    rm -- "$LAYOUT/orch/scripts/lib/watch-host-kinds.sh"
+    cp -p "$TMP_ROOT/common-watch-root.sh" "$LAYOUT/orch/scripts/lib/watch-host-kinds.sh"
+    if (FAIL=0; owner_address_rows; [[ "$FAIL" -eq 0 ]]) > "$TMP_ROOT/address-control.out" 2>&1; then
+      fail 'control: common-root must lose the linked-worktree watch address'
+    else
+      assert_file_contains "$TMP_ROOT/address-control.out" 'FAIL  address linked-worktree stages' 'control: clone-root lookup fails the linked-worktree row'
+    fi
+    rm -- "$LAYOUT/orch/scripts/lib/watch-host-kinds.sh"
+    ln -s "$TEST_DIR/../scripts/lib/watch-host-kinds.sh" "$LAYOUT/orch/scripts/lib/watch-host-kinds.sh"
+    cp -- "$CASE/address-source.json" "$CASE/state/workflow-state-oversee.json"
+    printf 'clone-root\tKEN-6\t/clone\n' > "$REPO/tmp/oversee-watch/saved__none.mail"
+  else
+    got="$(record KEN-6 micro)"
+    assert_eq "$(field fix "$got")" 'fix=5' 'a standing clone records saved state after live state removal' "$CASE/err"
+    git -C "$REPO" worktree add -q --detach "$CASE/lane" HEAD
+    git -C "$REPO" worktree remove "$CASE/lane"
+    edit_json "$CASE/state/workflow-state-oversee.json" "(.lanes[] | select(.item == \"KEN-6\")) += {mail_root:\"$CASE/lane\"}"
+  fi
+  got="$(record KEN-6 micro)"
+  assert_eq "$(field review "$got") $(field fix "$got") $(field bot "$got") $(field full_validations "$got")" \
+    'review=3 fix=5 bot=4 full_validations=2' "$form removed lane records numeric rounds from saved state" "$CASE/err"
+  if [[ "$form" == local ]]; then
+    got="$(record KEN-6 micro)"
+    assert_eq "$(field review "$got") $(field fix "$got") $(field bot "$got") $(field full_validations "$got")" \
+      'review=3 fix=5 bot=4 full_validations=2' 'a repeated local record reads the saved copy again' "$CASE/err"
+    assert_eq "$(state '.lanes[] | select(.item == "KEN-6") | .cycle.stages')" "$(jq -c '.stages' "$saved")" \
+      'a repeated local record keeps the saved stages'
+    # Later cases merge PR 7 again in this repository.
+    rm -- "$saved"
+  else
+    assert_eq "$([[ -f "$CASE/host/clone/tmp/cycle-state/workflow-state-pr-7.json" ]] && printf retained)" retained 'the hosted saved copy remains for host close'
+    cp -p "$TEST_DIR/../scripts/lib/lane-gitfile.sh" "$TMP_ROOT/no-saved-read.sh"
+    mutate_file "$TMP_ROOT/no-saved-read.sh" \
+      'lane_item_saved_state() { # LANE_HOST_CLI ITEM CLONE SCRATCH SAVED_KEY' \
+      $'lane_item_saved_state() { # LANE_HOST_CLI ITEM CLONE SCRATCH SAVED_KEY\n  return 0'
+    rm -- "$LAYOUT/orch/scripts/lib/lane-gitfile.sh"
+    cp -p "$TMP_ROOT/no-saved-read.sh" "$LAYOUT/orch/scripts/lib/lane-gitfile.sh"
+    record KEN-6 micro >/dev/null
+    assert_eq "$(state '.lanes[] | select(.item == "KEN-6") | .cycle.rounds')" null 'control: skipping saved reads restores null rounds on the merged lane'
+    assert_file_contains "$CASE/err" 'oversee-cycle: rounds-unread item=KEN-6' 'control: unread saved state is reported'
+    rm -- "$LAYOUT/orch/scripts/lib/lane-gitfile.sh"
+    ln -s "$TEST_DIR/../scripts/lib/lane-gitfile.sh" "$LAYOUT/orch/scripts/lib/lane-gitfile.sh"
+    rm -- "$REPO/tmp/oversee-watch/saved__none.mail"
+    rm -- "$CASE/host/clone/tmp/cycle-state/workflow-state-pr-7.json"
+    record KEN-6 micro >/dev/null
+    assert_file_contains "$CASE/err" 'lane-gitfile: state-unread item=KEN-6 cause=no-state' 'a gone hosted lane refuses missing state by item'
+    assert_file_contains "$CASE/err" 'lane-gitfile: state-tried item=KEN-6 path=/w/KEN-6/.git' 'the gone hosted worktree path is named'
+  fi
+done
 
 echo "=== a hosted lane's rounds are read from its clone ==="
 new_case hosted
@@ -1339,6 +1459,10 @@ hosted_provider="$TEST_DIR/../scripts/lane-host-ssh"
 mkdir -p "$hosted_root/tmp" "$hosted_clone/lane-state" "$CASE/ssh-bin" "$CASE/home"
 printf 'gitdir: %s/.git/worktrees/KEN-1\n' "$hosted_clone" > "$hosted_root/.git"
 cp "$stage_case_root/stage-state.saved" "$hosted_root/tmp/workflow-state-pr-7.json"
+# An earlier merge of KEN-1 saved this copy under its item key. Only PR 7's
+# own copy may answer for PR 7, in every location below.
+mkdir -p "$hosted_clone/tmp/cycle-state"
+printf '{"stages":[{"kind":"fix","round_id":"old","start":1,"end":2}]}' > "$hosted_clone/tmp/cycle-state/workflow-state-KEN-1.json"
 jq -n --arg clone "$hosted_clone" --arg account "$CASE/account" \
   '[{repo:"vanillagreencom/kendex",item:"KEN-1",target:"lane.example",clone:$clone,account:$account}]' > "$CASE/hosts.json"
 cat > "$CASE/ssh-bin/ssh" <<'SH'
@@ -1350,7 +1474,12 @@ SH
 chmod +x "$CASE/ssh-bin/ssh"
 edit_json "$CASE/state/workflow-state-oversee.json" \
   "(.lanes[] | select(.item == \"KEN-1\")) += {status: \"running\", tier: \"micro\", host: \"$hosted_provider\", mail_root: \"$hosted_root\", pending_pr: {pr: 7}}"
-for location in worktree clone-setting archive; do
+# Old watch sessions can disagree after a lane moves between clones. A live
+# root or an explicit kept archive still binds the PR-key state without them.
+mkdir -p "$REPO/tmp/oversee-watch"
+printf 'clone-root\tKEN-1\t/old-clone\n' > "$REPO/tmp/oversee-watch/old-one.mail"
+printf 'clone-root\tKEN-1\t/other-clone\n' > "$REPO/tmp/oversee-watch/old-two.mail"
+for location in worktree clone-setting archive saved-archive shared-archive; do
   case "$location" in
     clone-setting)
       mv -- "$hosted_root/tmp/workflow-state-pr-7.json" "$hosted_clone/lane-state/"
@@ -1364,16 +1493,101 @@ for location in worktree clone-setting archive; do
         ".fleet_log += [{at: \"$(at 20)\", item: \"KEN-1\", text: \"kept=$CASE/kept.tgz\"}]"
       rm -rf -- "${hosted_root:?}"
       ;;
+    saved-archive | shared-archive)
+      # Execute the shipped producer's remote shell after real state removal.
+      # Its empty live-state marker must still recover the saved PR key.
+      if [[ "$location" == saved-archive ]]; then
+        git init -q "$hosted_clone"
+        git -C "$hosted_clone" config gc.auto 0
+        git -C "$hosted_clone" config maintenance.auto false
+        printf '{"cycles":99}' > "$hosted_clone/tmp/cycle-state/workflow-state-KEN-other.json"
+        mkdir -p "$hosted_clone/.agents/skills/orch"
+        ln -s "$LAYOUT/orch/scripts" "$hosted_clone/.agents/skills/orch/scripts"
+      else
+        commit "$hosted_clone" base
+        git -C "$hosted_clone" worktree add -q --detach "$hosted_root" HEAD
+        # setup_worktree_links emits this link for WORKTREE_SYMLINKS=tmp.
+        ln -s "$hosted_clone/tmp" "$hosted_root/tmp"
+        [[ -L "$hosted_root/tmp" ]] || exit 1
+        cp -- "$stage_case_root/stage-state.saved" "$hosted_clone/lane-state/workflow-state-pr-7.json"
+      fi
+      cp -- "$hosted_clone/lane-state/workflow-state-pr-7.json" "$hosted_clone/tmp/cycle-state/workflow-state-pr-7.json"
+      (cd "$hosted_clone" && "$LAYOUT/orch/scripts/workflow-state" --state-dir "$hosted_clone/lane-state" remove pr-7) >"$CASE/remove.out"
+      env ORCH_STATE_DIR=lane-state python3 -I - "$hosted_provider" "$hosted_clone" "$hosted_root" "$BASH" >"$CASE/kept.tgz" <<'PY'
+import ast, subprocess, sys
+tree = ast.parse(open(sys.argv[1]).read())
+function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "archive_tmp")
+call = next(n for n in ast.walk(function) if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name) and n.func.id == "remote")
+script = ast.literal_eval(call.args[1])
+subprocess.run([sys.argv[4], "-c", script, "archive", sys.argv[2], sys.argv[3], "pr-7"],
+               stdout=sys.stdout.buffer, check=True)
+PY
+      assert_eq "$(tar -xzOf "$CASE/kept.tgz" lane-host-state | wc -c | tr -d ' ')" 1 'the real archive producer leaves an empty live-state marker after removal'
+      # Only the requested key is eligible when the manifest is empty.
+      rm -- "$hosted_clone/tmp/cycle-state/workflow-state-pr-7.json"
+      if [[ "$location" == shared-archive ]]; then
+        got="$(python3 -I - "$CASE/kept.tgz" <<'PY'
+import sys, tarfile
+with tarfile.open(sys.argv[1], "r:gz") as tar:
+    members = [m for m in tar.getmembers() if m.name.endswith("/cycle-state/workflow-state-pr-7.json")]
+    print(int(any(m.isfile() for m in members)), int(any(m.islnk() for m in members)))
+PY
+)"
+        assert_eq "$got" '1 1' 'shared tmp archives the saved state as a regular member and a hard-link alias'
+        git -C "$hosted_clone" worktree remove --force "$hosted_root"
+      fi
+      ;;
   esac
   got="$(HOME="$CASE/home" PATH="$CASE/ssh-bin:$PATH" LANE_HOST_SSH_INVENTORY="$CASE/hosts.json" stage_command KEN-1)"
   assert_eq "$got" "$rows" "hosted PR-key stages from $location keep the launched item identity"
   HOME="$CASE/home" PATH="$CASE/ssh-bin:$PATH" LANE_HOST_SSH_INVENTORY="$CASE/hosts.json" record KEN-1 micro >/dev/null
   assert_eq "$(state '.lanes[0].cycle.stages')" "$(jq -c '.stages' "$stage_case_root/stage-state.saved")" \
     "hosted PR-key cycle from $location records the same stages"
+  if [[ "$location" == saved-archive || "$location" == shared-archive ]]; then
+    assert_eq "$(state '.lanes[0].cycle.rounds | [.review,.fix,.bot,.full_validations] | all(type == "number")')" true 'saved archive recovery records numeric cycle counts'
+    mkdir -p "$CASE/clone-root-scratch"
+    got="$(source "$TEST_DIR/../scripts/lib/lane-gitfile.sh"
+      lane_archived_state pr-7 "$CASE/kept.tgz" "$CASE/clone-root-scratch" "$hosted_clone" pr-7
+      jq -c '.stages' <<<"$LANE_ITEM_STATE")"
+    assert_eq "$got" "$(jq -c '.stages' "$stage_case_root/stage-state.saved")" 'a clone root keeps its saved archive member eligible'
+  fi
+  if [[ "$location" == saved-archive ]]; then
+    cp -p "$TEST_DIR/../scripts/lib/lane-gitfile.sh" "$TMP_ROOT/no-archive-saved-read.sh"
+    mutate_file "$TMP_ROOT/no-archive-saved-read.sh" \
+      '            if not raw:' \
+      $'            if not raw:\n                sys.exit(0)'
+    rm -- "$LAYOUT/orch/scripts/lib/lane-gitfile.sh"
+    cp -p "$TMP_ROOT/no-archive-saved-read.sh" "$LAYOUT/orch/scripts/lib/lane-gitfile.sh"
+    HOME="$CASE/home" PATH="$CASE/ssh-bin:$PATH" LANE_HOST_SSH_INVENTORY="$CASE/hosts.json" record KEN-1 micro >/dev/null
+    assert_eq "$(state '.lanes[0].cycle.rounds')" null 'control: skipping saved archive recovery restores null rounds'
+    assert_file_contains "$CASE/err" 'oversee-cycle: rounds-unread item=KEN-1' 'control: empty archive recovery reports unread rounds'
+    rm -- "$LAYOUT/orch/scripts/lib/lane-gitfile.sh"
+    ln -s "$TEST_DIR/../scripts/lib/lane-gitfile.sh" "$LAYOUT/orch/scripts/lib/lane-gitfile.sh"
+  fi
 done
+rm -- "$REPO/tmp/oversee-watch/old-one.mail" "$REPO/tmp/oversee-watch/old-two.mail"
 CASE="$stage_case_root"
 export CASE
-rm -- "$REPO/tmp/workflow-state-pr-7.json"
+# merge-pr § 5 step 6 saves PR 7's copy before close-out removes live state.
+# An earlier merge of KEN-1 left its copy under the item key beside it.
+mkdir -p "$REPO/tmp/cycle-state"
+mv -- "$REPO/tmp/workflow-state-pr-7.json" "$REPO/tmp/cycle-state/workflow-state-pr-7.json"
+printf '{"stages":[{"kind":"fix","round_id":"old","start":1,"end":2}]}' > "$REPO/tmp/cycle-state/workflow-state-KEN-1.json"
+assert_eq "$(stage_command KEN-1)" "$rows" 'local stages read the current PR saved copy beside an earlier merge of the item'
+record KEN-1 micro >/dev/null
+assert_eq "$(state '.lanes[0].cycle.stages')" "$(jq -c '.stages' "$CASE/stage-state.saved")" \
+  'a local record reads the saved copy its PR names beside an earlier merge of the item'
+cp -p "$TEST_DIR/../scripts/lib/lane-gitfile.sh" "$TMP_ROOT/item-key-saved-read.sh"
+mutate_file "$TMP_ROOT/item-key-saved-read.sh" \
+  'lane_item_saved_state "" "$4" "$clone" "$7" "$saved_key"' \
+  'lane_item_saved_state "" "$4" "$clone" "$7" "$state_key"'
+rm -- "$LAYOUT/orch/scripts/lib/lane-gitfile.sh"
+cp -p "$TMP_ROOT/item-key-saved-read.sh" "$LAYOUT/orch/scripts/lib/lane-gitfile.sh"
+assert_contains "$(stage_command KEN-1)" 'round_id=old' 'control: a saved read by state key answers with the earlier merge'
+rm -- "$LAYOUT/orch/scripts/lib/lane-gitfile.sh"
+ln -s "$TEST_DIR/../scripts/lib/lane-gitfile.sh" "$LAYOUT/orch/scripts/lib/lane-gitfile.sh"
+rm -- "$REPO/tmp/cycle-state/workflow-state-pr-7.json" "$REPO/tmp/cycle-state/workflow-state-KEN-1.json"
 for item in KEN-unknown KEN-1; do
   rc=0
   stage_command "$item" > "$CASE/out" 2> "$CASE/err" || rc=$?
