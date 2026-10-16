@@ -438,6 +438,66 @@ done
 assert_contains "$HOSTED_WORDS" 'exec bash -lc ' "the hosted comparison reads the delivered remote command"
 assert_not_contains "$HOSTED_WORDS" "$REST_CREATE" "the hosted launch keeps its publication route"
 
+echo "=== repository access has a named manual step and a lane record ==="
+# The overseer consumes this keyed line and reads cloud_repo_access through
+# workflow-state. The stub session has no repository grant endpoint or token.
+REPO_ACCESS_CONTROL="$(mutant_scripts cloud-repo-access-control open-terminal)" || exit 1
+orch_fixture_shared_libs "$TMP_ROOT/cloud-repo-access-control"
+mutate_file "$REPO_ACCESS_CONTROL/open-terminal" \
+  'cloud_repo_access_manual "$session" "$repositories" || return 1' ':'
+REPO_SCOPE_CONTROL="$(mutant_scripts cloud-repo-scope-control open-terminal)" || exit 1
+orch_fixture_shared_libs "$TMP_ROOT/cloud-repo-scope-control"
+mutate_file "$REPO_SCOPE_CONTROL/open-terminal" 'if [[ "$OVERSEER_BIND" == connected ]]; then
+      cd -- "$OVERSEER_DIR" || exit 1' 'if false; then
+      cd -- "$OVERSEER_DIR" || exit 1'
+ACCESS_OVERSEER="$TMP_ROOT/access-overseer"
+git init -q "$ACCESS_OVERSEER"
+git -C "$ACCESS_OVERSEER" config gc.auto 0
+git -C "$ACCESS_OVERSEER" config maintenance.auto false
+git -C "$ACCESS_OVERSEER" remote add origin https://github.com/fleet/root.git
+printf '[env]\nORCH_CONNECTED_REPOS="owner/repo fleet/required"\n' > "$ACCESS_OVERSEER/kendex.settings.toml"
+printf 'ORCH_CONNECTED_REPOS=target/private\n' > "$REPO/target-access.env"
+REPO_ACCESS_ROWS=(
+  'origin||["owner/repo"]'
+  'connected|Owner/Repo team/other TEAM/OTHER|["owner/repo","team/other"]'
+  'fleet|target/only|["fleet/required","owner/repo"]'
+)
+for row in "${REPO_ACCESS_ROWS[@]}"; do
+  IFS='|' read -r name connected repositories <<<"$row"
+  access_scripts=("$OT" "$REPO_ACCESS_CONTROL/open-terminal")
+  [[ "$name" != fleet ]] || access_scripts+=("$REPO_SCOPE_CONTROL/open-terminal")
+  for script in "${access_scripts[@]}"; do
+    access_state="$REPO/tmp/repo-access-$name"
+    [[ "$script" == "$OT" ]] || access_state+=-control
+    [[ "$script" != "$REPO_SCOPE_CONTROL/open-terminal" ]] || access_state+=-scope
+    access_env=("ORCH_CONNECTED_REPOS=$connected")
+    if [[ "$name" == fleet ]]; then
+      "$WS" --state-dir "$access_state" init oversee >/dev/null
+      "$WS" --state-dir "$access_state" update oversee --arg cwd "$ACCESS_OVERSEER" '.overseer={cwd:$cwd}' >/dev/null
+      access_env+=(KENDEX_ENV_FILE=target-access.env)
+    fi
+    run_ot SCRIPT="$script" "${access_env[@]}" -- "${CLOUD[@]}" --state-dir "$access_state" CC-52
+    expected="$(jq -cn --argjson repositories "$repositories" \
+      '{step:"cloud-repo-access-manual",repositories:$repositories,url:"https://claude.ai/code/session_01CLOUD"}')"
+    access_record="$("$WS" --state-dir "$access_state" get oversee '[.lanes[] | select(.item == "CC-52")] | first | .cloud_repo_access // null' | jq -c .)"
+    access_line="$(awk '$1 == "open-terminal:" && $2 == "cloud-repo-access-manual" {print}' <<<"$ERR")"
+    red="$(FAIL=0
+      assert_eq "$access_record" "$expected" 'repository access lane record' > "$TMP_ROOT/repo-access-record.out"
+      assert_eq "$access_line" "open-terminal: cloud-repo-access-manual item=CC-52 repositories=$repositories url=https://claude.ai/code/session_01CLOUD" \
+        'repository access keyed output' > "$TMP_ROOT/repo-access-line.out"
+      printf '%s' "$FAIL")"
+    if [[ "$script" == "$OT" ]]; then
+      assert_eq "rc=$RC red=$red" 'rc=0 red=0' "the $name repositories and answer location reach the overseer" "$TMP_ROOT/err"
+    elif [[ "$script" == "$REPO_ACCESS_CONTROL/open-terminal" ]]; then
+      assert_eq "rc=$RC red=$red record=$access_record line=$access_line" 'rc=0 red=2 record=null line=' \
+        "control: the previous launch omits both the $name repository step and its record" "$TMP_ROOT/err"
+    else
+      assert_eq "rc=$RC red=$red" 'rc=0 red=2' \
+        'control: reading connected targets from the launch checkout fails the fleet access contract' "$TMP_ROOT/err"
+    fi
+  done
+done
+
 echo "=== a brief's item-tier line is the cloud lane's tier ==="
 # The item-tier line, and a different result an issue's text can quote.
 TIER_LINE='tier=small brief=small cause=estimate-within-small production=40 estimate=12 delta=40 paths=3'
@@ -838,7 +898,7 @@ cause_control() { # INDEX OLD NEW
 # shellcheck disable=SC2016  # the script's own text, never expanded here.
 cause_control 0 "jq -e '(.env.CCR_FORCE_BUNDLE // null | tostring) != \"1\"' \"\$file\" >/dev/null 2>&1" 'true'
 # shellcheck disable=SC2016
-cause_control 2 'kendex_github_origin_slug "$CLAIM_ROOT" >/dev/null' 'true'
+cause_control 2 'CLOUD_ORIGIN="$(kendex_github_origin_slug "$CLAIM_ROOT")"' 'true'
 # shellcheck disable=SC2016
 mutant task-close 'words="$LAUNCH_SESSION_TEXT"' 'words="$LAUNCH_UNATTENDED_TEXT"'
 run_ot SCRIPT="$MUTANT" -- "${CLOUD[@]}" CC-6
