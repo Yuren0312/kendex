@@ -31,9 +31,12 @@ REASONS = {
     "running": {"resumed", "new-no-record", "new-history-gone", "new-selection-changed", "new-requested", "existing"},
     "starting": {"launching"}, "handing-over": {"succession"}, "stopping": {"stop-requested"},
     "stopped": {"never-started", "stopped", "ended"}, "off": {"app-off"},
-    "blocked": {"app-off", "name-conflict", "record-unreadable", "sign-in-required", "selection-conflict", "tmux-missing", "app-missing"},
+    "blocked": {"app-off", "name-conflict", "record-unreadable", "sign-in-required", "selection-conflict", "tmux-missing", "app-missing",
+                "trust-required"},
     "failed": {"launch-failed", "handover-failed"},
 }
+# A blocked answer whose detail tells the person what to do.
+DETAILED = {("blocked", "sign-in-required"), ("blocked", "trust-required")}
 
 
 def validate(output, code, verb, duplicate_boot=False):
@@ -48,7 +51,7 @@ def validate(output, code, verb, duplicate_boot=False):
     assert answer["origin"] in (None, "boot", "manual", "app-on")
     assert isinstance(answer["detail"], str) and len(answer["detail"]) <= 200
     assert all(c.isprintable() for c in answer["detail"])
-    if answer["state"] == "failed" or (answer["state"], answer["reason"]) == ("blocked", "sign-in-required"):
+    if answer["state"] == "failed" or (answer["state"], answer["reason"]) in DETAILED:
         assert answer["detail"]
     else:
         assert answer["detail"] == ""
@@ -213,6 +216,32 @@ class SessionContract(unittest.TestCase):
             + " ]]; then exit 1; fi; done\nexec " + shlex.quote(real) + ' \"$@\"\n')
         wrapper.chmod(0o755)
         return flag
+
+    def hold_inspection_until_taken(self):
+        # A barrier, not a clock: once the brief is delivered, every pane read
+        # waits for the native hook's stamp.
+        real = shutil.which("tmux")
+        wrapper = self.root / "bin/tmux"
+        wrapper.write_text("#!" + os.environ["JARVIS_TEST_BASH"] + "\nset -euo pipefail\n"
+            + "for arg in \"$@\"; do if [[ $arg == capture-pane ]]; then until jq -e "
+            + shlex.quote('.state != "starting" or .brief_delivered != true or .pending.brief_taken == true')
+            + " " + shlex.quote(str(self.record)) + " >/dev/null 2>&1; do sleep 0.05; done; fi; done\nexec "
+            + shlex.quote(real) + ' "$@"\n')
+        wrapper.chmod(0o755)
+
+    def hold_inspection_until_started(self, events, drawn):
+        # A barrier, not a clock: a pane read the worker began against the
+        # unstarted record answers only once SessionStart stamped the record
+        # and the pane drew what follows it.
+        real = shutil.which("tmux")
+        wrapper = self.root / "bin/tmux"
+        wrapper.write_text("#!" + os.environ["JARVIS_TEST_BASH"] + "\nset -euo pipefail\n"
+            + "for arg in \"$@\"; do if [[ $arg == capture-pane ]]; then printf 'inspect\\n' >> "
+            + shlex.quote(str(events)) + "; until jq -e " + shlex.quote(".pending.started_at != null") + " "
+            + shlex.quote(str(self.record)) + " >/dev/null 2>&1 && screen=\"$(" + shlex.quote(real)
+            + ' "$@")" && [[ $screen == *' + shlex.quote(drawn) + "* ]]; do sleep 0.05; done; "
+            + "printf '%s\\n' \"$screen\"; exit; fi; done\nexec " + shlex.quote(real) + ' "$@"\n')
+        wrapper.chmod(0o755)
 
     def await_worker_result(self):
         deadline = time.monotonic() + 10
@@ -477,6 +506,77 @@ class SessionContract(unittest.TestCase):
         self.assertIsNone(answer["terminal"])
         self.assertTrue(json.loads(self.record.read_text())["history"]["pending"]["started_at"])
 
+    def test_turn_end_takes_the_brief(self):
+        # Claude Code 2.1.x's spinner matches no pane pattern; the native
+        # hook's Stop stamp after the brief proves the Start brief taken.
+        fixture = self.home / ".fixture.json"
+        fixture.write_text(json.dumps(json.loads(fixture.read_text()) | {"turn": "spinner"}))
+        self.call("start", "claude")
+        answer = self.wait(reason="new-no-record")
+        self.assertIsNotNone(answer["terminal"])
+        self.assertIs(json.loads(self.record.read_text())["pending"]["brief_taken"], True)
+
+    def test_trust_dialog_is_refused(self):
+        # Copilot CLI 1.0.88's folder-trust question holds a new home before
+        # its start; the refusal names it well inside the launch bound.
+        capture = SKILLS / "orch/tests/fixtures/oversee-watch/copilot-dialog-trust.txt"
+        question = next(re.sub(r"^[\s│]+|[\s│]+$", "", line) for line in capture.read_text().splitlines()
+                        if "Do you trust the files" in line)
+        fixture = self.home / ".fixture.json"
+        fixture.write_text(json.dumps(json.loads(fixture.read_text()) | {"trust": str(capture)}))
+        self.call("start", "copilot")
+        answer = self.wait("blocked", "trust-required")
+        self.assertEqual(answer["detail"], question)
+        self.assertIsNone(answer["terminal"])
+        self.assertEqual(subprocess.run(["tmux", "-L", self.label, "has-session", "-t", "=jarvis"],
+                                        capture_output=True, env=self.env).returncode, 1)
+        self.assertFalse(any("prompt" in json.loads(line) for line in self.rows.read_text().splitlines()))
+
+    def test_resumed_history_is_no_trust_dialog(self):
+        # A resumed Copilot session redraws its conversation; the folder-trust
+        # question quoted there, before its start or after it, is no dialog.
+        fixture = self.home / ".fixture.json"
+        self.call("start", "copilot")
+        self.wait()
+        self.call("stop")
+        self.wait("stopped")
+        events = self.observe_inspection()
+        os.mkfifo(self.gate)
+        # Pending: two reads of the held, unstarted pane complete before its
+        # start. Confirmed: the first read, begun before the start, captures
+        # the pane after it, and the worker discards that answer.
+        for drawn, reads in (("pending", 2), ("confirmed", 1)):
+            with self.subTest(drawn=drawn):
+                if drawn == "confirmed":
+                    self.hold_inspection_until_started(events, "Do you trust the files")
+                fixture.write_text(json.dumps(json.loads(fixture.read_text()) | {"history": drawn}))
+                inspections = len(events.read_text().splitlines()) if events.exists() else 0
+                self.call("start", "copilot")
+                self.await_rows(events, inspections + reads)
+                with self.gate.open("w") as stream:
+                    stream.write("1")
+                answer = self.wait(reason="resumed")
+                self.assertIsNotNone(answer["terminal"])
+                self.call("stop")
+                self.wait("stopped")
+
+    def test_sign_in_wall_after_the_stamp(self):
+        # A tool call stamps the brief taken and the turn then meets the
+        # sign-in wall: the pane read with the stamp standing still refuses.
+        # The stamp lands in the worker's poll pause after the delivery, and
+        # every later pane read waits for it.
+        self.hold_inspection_until_taken()
+        fixture = self.home / ".fixture.json"
+        fixture.write_text(json.dumps(json.loads(fixture.read_text()) | {"auth_mode": "current", "auth_event": "PreToolUse"}))
+        for harness in AUTH_MESSAGES:
+            with self.subTest(harness=harness):
+                self.call("start", harness)
+                answer = self.wait("blocked", "sign-in-required")
+                self.assertIsNone(answer["terminal"])
+                self.assertIs(json.loads(self.record.read_text())["history"]["pending"]["brief_taken"], True)
+                self.call("stop")
+                self.wait("stopped")
+
     def test_sign_in_failure(self):
         fixture = self.home / ".fixture.json"
         for harness in AUTH_MESSAGES:
@@ -592,7 +692,7 @@ class SessionContract(unittest.TestCase):
                     for acknowledgement in ("", str(wrong)):
                         result = subprocess.run([self.env["JARVIS_TEST_BASH"], str(skills / "jarvis/scripts/lib/session-backend.sh"),
                             "inspect", terminal["server"], terminal["pane"], "claude", "CLAUDE_CONFIG_DIR",
-                            str(self.account), "confirmed", acknowledgement], capture_output=True, text=True, env=self.env, timeout=10)
+                            str(self.account), "confirmed", acknowledgement, "delivered"], capture_output=True, text=True, env=self.env, timeout=10)
                         self.assertEqual((result.returncode, result.stdout.strip()), (0, "wrong-account"))
                     self.call("stop")
                     self.wait("stopped")

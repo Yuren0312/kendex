@@ -17,6 +17,26 @@ AUTH_MESSAGES = {
     "copilot": " ✗ You must be logged in to send messages. Please run /login",
 }
 
+# Pi's current editor: its title, footer and empty π prompt
+# (orch/tests/fixtures/oversee-watch/pi-current.txt).
+PI_IDLE = ("── π - jarvis - home " + "─" * 40 + "\n\n"
+           + "● home Anthropic / Opus 5.5 / high 1M " + "─" * 20 + " 4%\nπ")
+# The spinner a Claude Code 2.1.x Start turn drew (KEN-3862's owner run).
+CLAUDE_SPINNER = "✻ Contemplating… (1s · thinking with high effort)"
+# A resumed conversation that quotes the folder-trust question, drawn before
+# the session's start (above its last turn) or after it (in that turn).
+TRUST_HISTORY = {
+    "pending": "❯ What does the folder-trust dialog ask?\n  It asks: Do you trust the files in this folder?\n❯ Thanks.\n  Noted.",
+    "confirmed": "❯ What does the folder-trust dialog ask?\n  It asks: Do you trust the files in this folder?",
+}
+
+
+def brief_taken(fixture, harness, identity, event):
+    # The native hook's stamp, written by its real library at the default wait.
+    shell = 'source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/orch/scripts/lib/lane-context.sh"; source "$1/orch/scripts/lib/session-rows.sh"; key="$(tmux display-message -p "#{pid} #{pane_id}")"; session_rows_jarvis_taken "$JARVIS_RECORD" "$JARVIS_GENERATION" "$key" "$2" "$3"'
+    subprocess.run([fixture["bash"], "-c", shell, "fixture", fixture["skills"], harness, event],
+                   input=json.dumps({"session_id": identity}), text=True, check=True)
+
 
 @contextmanager
 def native_launcher():
@@ -79,6 +99,9 @@ def main():
         stream.write(json.dumps({"harness": harness, "id": identity, "argv": args, "cwd": os.getcwd(),
                                  "account": str(account), "record": str(record_path), "pid": os.getpid(),
                                  "display": [os.environ.get("WAYLAND_DISPLAY"), os.environ.get("DISPLAY")]}) + "\n")
+    history = fixture.get("history")
+    if history == "pending":
+        print(TRUST_HISTORY[history], flush=True)
     gate = Path(fixture["gate"])
     if gate.exists():
         with gate.open() as stream:
@@ -95,12 +118,19 @@ def main():
         file.parent.mkdir(parents=True, exist_ok=True)
         if not file.exists():
             file.write_text(json.dumps(header) + "\n")
+    if fixture.get("trust"):
+        # A native folder-trust question holds the harness before its start.
+        print(Path(fixture["trust"]).read_text(), end="", flush=True)
+        sys.stdin.read()
+        return
     payload = {"session_id": identity}
     if harness != "copilot":
         payload["transcript_path"] = str(file)
     shell = 'source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/orch/scripts/lib/lane-context.sh"; source "$1/orch/scripts/lib/session-rows.sh"; SESSION_ROWS_WAIT=10; key="$(tmux display-message -p "#{pid} #{pane_id}")"; session_rows_jarvis_write "$JARVIS_RECORD" "$JARVIS_GENERATION" "$key" "$2"'
     subprocess.run([fixture["bash"], "-c", shell, "fixture", fixture["skills"], harness],
                    input=json.dumps(payload), text=True, check=True)
+    if history == "confirmed":
+        print(TRUST_HISTORY[history], flush=True)
     if fixture.get("hold_prompt"):
         # The direct delivery case first observes the real identity write.
         # Hold its prompt marker so automatic delivery cannot race that probe.
@@ -109,6 +139,8 @@ def main():
     auth_mode = fixture.get("auth_mode")
     if auth_mode == "stale":
         print(AUTH_MESSAGES[harness] + "\n❯ continue\n❯\u00a0", flush=True)
+    elif harness == "pi":
+        print(PI_IDLE, flush=True)
     else:
         print("❯\u00a0", flush=True)
     prompt = sys.stdin.readline()
@@ -122,8 +154,20 @@ def main():
         print("❯\u00a0", flush=True)
     elif auth_mode == "current":
         print(AUTH_MESSAGES[harness], flush=True)
+        if fixture.get("auth_event"):
+            # The turn's tool call, drawn after its wall so the worker's
+            # first read of the stamp meets the wall on the pane.
+            brief_taken(fixture, harness, identity, fixture["auth_event"])
     elif auth_mode == "stale":
         print(AUTH_MESSAGES[harness] + "\nesc to interrupt", flush=True)
+    elif harness == "pi":
+        # Pi draws no working rung; its first tool call says it took the brief.
+        brief_taken(fixture, harness, identity, "PreToolUse")
+    elif fixture.get("turn") == "spinner":
+        # Claude Code 2.1.x draws a spinner no pane pattern names, then its
+        # composer once the turn ends.
+        print(CLAUDE_SPINNER + "\n❯\u00a0", flush=True)
+        brief_taken(fixture, harness, identity, "Stop")
     else:
         print("Working to interrupt", flush=True)
     sys.stdin.read()
