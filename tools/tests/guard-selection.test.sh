@@ -131,6 +131,86 @@ else
   bad 'input-note control changes the guard'
 fi
 
+# Shared skill libraries have consumers in other trees, directly or through
+# a test helper. An unrelated library must keep those consumers excluded.
+mkdir -p "$R/skills/orch/scripts/lib" "$R/skills/orch/tests" "$R/hooks/tests/lib" "$R/refresh/tests" "$R/skills/walkers/tests"
+printf '# Orch\n' > "$R/skills/orch/README.md"
+printf '# Hooks\n' > "$R/hooks/README.md"
+cat > "$R/skills/walkers/tests/walker.test.sh" <<'SH'
+#!/usr/bin/env bash
+SKILL_DIR="$PWD/skills/walkers"
+find "$SKILL_DIR" -name '*.md' >/dev/null
+printf 'walker\n' >> "$SUITE_LOG"
+SH
+cat > "$R/skills/walkers/tests/catalog.test.sh" <<'SH'
+#!/usr/bin/env bash
+find "$PWD/skills" -name '*.md' >/dev/null
+printf 'catalog\n' >> "$SUITE_LOG"
+SH
+printf ':\n' > "$R/skills/orch/scripts/lib/shared.sh"
+printf ':\n' > "$R/skills/orch/scripts/lib/private.sh"
+printf 'source "$PWD/skills/orch/scripts/lib/shared.sh"\n' > "$R/hooks/tests/lib/shared-world.sh"
+cat > "$R/skills/orch/tests/libraries.test.sh" <<'SH'
+#!/usr/bin/env bash
+source "$PWD/skills/orch/scripts/lib/shared.sh"
+source "$PWD/skills/orch/scripts/lib/private.sh"
+printf 'orch\n' >> "$SUITE_LOG"
+SH
+cat > "$R/hooks/tests/shared.test.sh" <<'SH'
+#!/usr/bin/env bash
+source "$PWD/hooks/tests/lib/shared-world.sh"
+printf 'hooks\n' >> "$SUITE_LOG"
+SH
+cat > "$R/refresh/tests/shared.test.sh" <<'SH'
+#!/usr/bin/env bash
+source "$PWD/skills/orch/scripts/lib/shared.sh"
+printf 'refresh\n' >> "$SUITE_LOG"
+SH
+printf '#!/usr/bin/env bash\nprintf "unrelated-refresh\\n" >> "$SUITE_LOG"\nexit 1\n' > "$R/refresh/tests/unrelated.test.sh"
+git -C "$R" add -A
+git -C "$R" commit -q -m libraries
+BASE="$(git -C "$R" rev-parse HEAD)"
+git -C "$R" update-ref refs/remotes/origin/main "$BASE"
+for row in \
+  'skills/orch/scripts/lib/shared.sh|hooks orch refresh' \
+  'skills/orch/scripts/lib/private.sh|orch' \
+  'skills/orch/README.md|catalog' \
+  'hooks/README.md|'; do
+  IFS='|' read -r input expected <<<"$row"
+  for mode in full range; do
+    git -C "$R" reset -q --hard "$BASE"
+    printf '# changed\n' >> "$R/$input"
+    preview "$mode" true
+    selected="$(sort "$SUITE_LOG" | tr '\n' ' ' | sed 's/ $//')"
+    [ "$RC" -eq 0 ] && [ "$selected" = "$expected" ] \
+      && ok "$mode input $input selects its same-tree and external consumers only" \
+      || bad "$mode input $input selects its same-tree and external consumers only" "selected=$selected rc=$RC out=$OUT"
+  done
+done
+if [ "$(grep -c '^    for consumer in .*consumer_trees.*; do$' "$GUARD")" -eq 1 ] \
+  && mutant_guard '/^    for consumer in .*consumer_trees.*; do$/,/^    done$/d'; then
+  git -C "$R" reset -q --hard "$BASE"
+  printf '# changed\n' >> "$R/skills/orch/scripts/lib/shared.sh"
+  preview range true "$MUTANT_TOOLS/guard"
+  [ "$RC" -eq 0 ] && [ "$(cat "$SUITE_LOG")" = orch ] \
+    && ok 'control: omitting cross-tree inputs loses both hooks and refresh consumers' \
+    || bad 'control: omitting cross-tree inputs loses both hooks and refresh consumers' "rc=$RC out=$OUT"
+else
+  bad 'cross-tree control changes the guard'
+fi
+if [ "$(grep -c '^    walk_root=' "$GUARD")" -eq 1 ] \
+  && mutant_guard '/^    walk_root=/s/.*/    walk_root="$skill_root|$catalog_root"/'; then
+  git -C "$R" reset -q --hard "$BASE"
+  printf '# changed\n' >> "$R/skills/orch/scripts/lib/private.sh"
+  preview range true "$MUTANT_TOOLS/guard"
+  selected="$(sort "$SUITE_LOG" | tr '\n' ' ' | sed 's/ $//')"
+  [ "$RC" -eq 0 ] && [ "$selected" = 'catalog orch walker' ] \
+    && ok 'control: ignoring external walk roots selects unrelated document walkers' \
+    || bad 'control: ignoring external walk roots selects unrelated document walkers' "selected=$selected rc=$RC out=$OUT"
+else
+  bad 'external walk-root control changes the guard'
+fi
+
 # Reader comparisons can fail while the files remain readable. Normal runs
 # must run the whole set; scoped runs must refuse the unavailable evidence.
 git -C "$R" reset -q --hard "$BASE"
@@ -198,15 +278,27 @@ else
 fi
 
 # Exercise the shipped aggregate assertion through range selection. This
-# isolated checkout keeps one tools suite so the routing fixture cannot
-# select itself while proving a workflow defect.
+# isolated checkout keeps the tools consumers used below so the routing
+# fixture cannot select itself while proving a workflow defect.
 actual="$TMP/aggregate-checkout"
 mkdir -p "$actual"
 git -C "$REPO" ls-files -z > "$TMP/aggregate-files"
 tar -C "$REPO" --null -T "$TMP/aggregate-files" -cf "$TMP/aggregate-tree.tar"
 tar -xf "$TMP/aggregate-tree.tar" -C "$actual"
+# Keep reader text and the shared runner for selection. Only the aggregate
+# assertion executes its real contract in this checkout.
+git -C "$REPO" ls-files '*/tests/*.sh' '*/tests/*.mjs' > "$TMP/replay-suites"
+while IFS= read -r suite; do
+  case "$suite" in
+    tools/* | */tests/run-all.sh | */tests/*/*) continue ;;
+    *.mjs) printf 'process.exit(0);\n' > "$TMP/replay-suite" ;;
+    *) printf 'exit 0\n' > "$TMP/replay-suite" ;;
+  esac
+  cat "$actual/$suite" >> "$TMP/replay-suite"
+  mv "$TMP/replay-suite" "$actual/$suite"
+done < "$TMP/replay-suites"
 for suite in "$actual"/tools/tests/*.sh; do
-  case "${suite##*/}" in ci-aggregate.test.sh | run-all.sh) ;; *) rm -- "$suite" ;; esac
+  case "${suite##*/}" in ci-aggregate.test.sh | vendored-settings-libs.test.sh | run-all.sh) ;; *) rm -- "$suite" ;; esac
 done
 git -C "$actual" init -q
 git -C "$actual" config user.email test@example.com
@@ -225,6 +317,79 @@ OUT="$(cd "$actual" && "$GUARD" --range "$actual_base" 2>&1)" || RC=$?
 [ "$RC" -ne 0 ] && [[ $OUT == *suite=ci-aggregate.test* ]] && [[ $OUT == *'fail=1'* ]] \
   && ok 'the shipped aggregate rejects a broken workflow through range selection' \
   || bad 'the shipped aggregate rejects a broken workflow through range selection' "$OUT"
+
+# PR #5200's changed orch scripts and libraries must reach the real hooks
+# and refresh readers. Preserve suite text for the mapper, but stop bodies
+# before execution: this row proves selection, not those suites' contracts.
+git -C "$actual" reset -q --hard "$actual_base"
+for suite in ci-aggregate.test.sh vendored-settings-libs.test.sh; do
+  printf 'exit 0\n' > "$TMP/replay-suite"
+  cat "$actual/tools/tests/$suite" >> "$TMP/replay-suite"
+  mv "$TMP/replay-suite" "$actual/tools/tests/$suite"
+done
+git -C "$actual" add tools/tests/ci-aggregate.test.sh tools/tests/vendored-settings-libs.test.sh
+git -C "$actual" commit -q -m replay
+replay_base="$(git -C "$actual" rev-parse HEAD)"
+for input in \
+  skills/orch/scripts/lib/adapters/claude.sh \
+  skills/orch/scripts/lib/lane-launch.sh \
+  skills/orch/scripts/lib/lane-model.sh \
+  skills/orch/scripts/lib/lane-relaunch.sh \
+  skills/orch/scripts/lib/overseer-launch.sh \
+  skills/orch/scripts/oversee \
+  skills/orch/scripts/oversee-succeed; do
+  printf '\n# KEN-3966 replay\n' >> "$actual/$input"
+  printf '\n# KEN-3966 replay\n' >> "$actual/.agents/$input"
+done
+RC=0
+OUT="$(cd "$actual" && env -u DEV_VALIDATE_CLASS -u DEV_VALIDATE_DOCS_ONLY -u DEV_VALIDATE_PATHS \
+  DEV_VALIDATE_SCOPED=true "$GUARD" --selection --range "$replay_base" 2>&1)" || RC=$?
+for suite in hooks/tests/lane-mail-check.test.sh hooks/tests/lane-mail-model-switch.test.sh refresh/tests/refresh-consumer.test.sh; do
+  [ "$RC" -eq 0 ] && grep -Fxq "=== $suite" <<<"$OUT" \
+    && ok "KEN-3966 replay selects $suite" || bad "KEN-3966 replay selects $suite" "rc=$RC out=$OUT"
+done
+
+# A noncanonical source and its render reach the shipped glob consumer only
+# through its input declaration. Its one-member tools roster makes the mapped
+# count identify that consumer. Both baselines retain the consumer's code.
+git -C "$actual" reset -q --hard "$replay_base"
+rm -- "$actual/tools/tests/ci-aggregate.test.sh"
+git -C "$actual" add -u tools/tests
+git -C "$actual" commit -q -m 'glob consumer'
+glob_base="$(git -C "$actual" rev-parse HEAD)"
+consumer=tools/tests/vendored-settings-libs.test.sh
+input_note='# Inputs: skills/*/scripts/lib/kendex-env.sh .agents/skills/*/scripts/lib/kendex-env.sh'
+if [ "$(grep -Fxc "$input_note" "$actual/$consumer")" -ne 1 ]; then
+  bad 'the glob-consumer control finds one input declaration'
+  exit 1
+fi
+sed '/^# Inputs: /d' "$actual/$consumer" > "$TMP/replay-suite"
+cmp -s "$actual/$consumer" "$TMP/replay-suite" && { bad 'the glob-consumer control removes its declaration'; exit 1; }
+mv "$TMP/replay-suite" "$actual/$consumer"
+git -C "$actual" add "$consumer"
+git -C "$actual" commit -q -m 'without glob inputs'
+without_inputs_base="$(git -C "$actual" rev-parse HEAD)"
+for row in \
+  'present|skills/github/scripts/lib/kendex-env.sh|1/1' \
+  'present|.agents/skills/github/scripts/lib/kendex-env.sh|1/1' \
+  'absent|skills/github/scripts/lib/kendex-env.sh|0/1' \
+  'absent|.agents/skills/github/scripts/lib/kendex-env.sh|0/1'; do
+  IFS='|' read -r declaration input expected <<<"$row"
+  if [ "$declaration" = present ]; then input_base=$glob_base; else input_base=$without_inputs_base; fi
+  for mode in full range; do
+    git -C "$actual" reset -q --hard "$input_base"
+    git -C "$actual" update-ref refs/remotes/origin/main "$input_base"
+    printf '\n# changed library input\n' >> "$actual/$input"
+    replay_args=(--selection)
+    if [ "$mode" = full ]; then replay_args+=(--full); else replay_args+=(--range "$input_base"); fi
+    RC=0
+    OUT="$(cd "$actual" && env -u DEV_VALIDATE_CLASS -u DEV_VALIDATE_DOCS_ONLY -u DEV_VALIDATE_PATHS \
+      DEV_VALIDATE_SCOPED=false "$GUARD" "${replay_args[@]}" 2>&1)" || RC=$?
+    [ "$RC" -eq 0 ] && grep -Fxq "guard-note: suites=$expected reason=mapped tree=tools" <<<"$OUT" \
+      && ok "$mode input $input with declaration $declaration maps glob consumer $expected" \
+      || bad "$mode input $input with declaration $declaration maps glob consumer $expected" "rc=$RC out=$OUT"
+  done
+done
 
 printf 'pass: %s fail: %s\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
