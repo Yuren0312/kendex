@@ -116,14 +116,36 @@ def receive(fd, deadline):
             return json.loads(data)
 
 
+# The op arguments that renew each route's approval. The vendor names op vault list as a call the app
+# integration approves; op whoami can report no signed-in account there.
+RENEWALS = {"session": ["whoami"], "app-integration": ["vault", "list"]}
+
+
+def app_integration():
+    """Return whether the home selected the desktop app integration route."""
+    value = os.environ.get("JARVIS_OP_APP_INTEGRATION")
+    if value not in (None, "", "1"):
+        raise Refusal("setting=JARVIS_OP_APP_INTEGRATION")
+    return value == "1"
+
+
 def session(op, account):
+    """Return the call environment and its route, session or app-integration."""
     # Only these values configure op. A child's unrelated credentials stay out.
     keys = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "OP_CONFIG_DIR")
     env = {key: os.environ[key] for key in keys if key in os.environ}
-    env.update(OP_BIOMETRIC_UNLOCK_ENABLED="false", OP_DEBUG="false")
+    env["OP_DEBUG"] = "false"
     if account:
         env["OP_ACCOUNT"] = account
     token = os.environ.get("OP_SESSION")
+    if app_integration():
+        if token:
+            raise Refusal("session=route-conflict\nOP_SESSION and JARVIS_OP_APP_INTEGRATION=1 each select a route. "
+                          "Set one of them.")
+        # The desktop app approves the calls, so no session exists to check at startup.
+        env["OP_BIOMETRIC_UNLOCK_ENABLED"] = "true"
+        return env, "app-integration"
+    env["OP_BIOMETRIC_UNLOCK_ENABLED"] = "false"
     if not token:
         # A service has no terminal for a person to approve a sign-in.
         if not os.isatty(0):
@@ -136,7 +158,7 @@ def session(op, account):
     result = call_op([op, "whoami"], env)
     if result.returncode:
         raise Refusal("session=unavailable")
-    return env
+    return env, "session"
 
 
 def keepalive_seconds():
@@ -149,16 +171,17 @@ def keepalive_seconds():
     return int(value)
 
 
-def keep_session(op, env):
-    """Renew the session and log a failed renewal; the keepalive stays armed either way."""
-    # op whoami contacts the server, so a failed run, an unreachable server included, says nothing about the session.
+def keep_session(op, env, renewal):
+    """Renew the session, log a failed renewal, and return whether it succeeded."""
+    # The renewal contacts the server, so a failed run, an unreachable server included, says nothing about the session.
     try:
-        status = call_op([op, "whoami"], env).returncode
+        status = call_op([op, *renewal], env).returncode
     except (OSError, subprocess.TimeoutExpired):
         print("op-broker: keepalive=failed", file=sys.stderr, flush=True)
-        return
+        return False
     if status:
         print("op-broker: keepalive=failed exit=%d" % status, file=sys.stderr, flush=True)
+    return status == 0
 
 
 def call_op(argv, env, interactive=False):
@@ -312,7 +335,7 @@ def broker(args):
         if reused:
             check_own_entries(directory)
         lock = lock_directory(directory)
-        env = session(op, args.account or os.environ.get("OP_ACCOUNT"))
+        env, route = session(op, args.account or os.environ.get("OP_ACCOUNT"))
         try:
             os.unlink("requests", dir_fd=directory)
         except FileNotFoundError:
@@ -326,7 +349,10 @@ def broker(args):
         while True:
             # After a successful call, an idle broker renews the session before it expires.
             if not select.select([fifo], [], [], keepalive if renewing else None)[0]:
-                keep_session(op, env)
+                # A failed whoami asks nobody, so the session route stays armed. Under the app integration a
+                # failure can mean the app locked, and each retry would raise an approval prompt with no request
+                # pending, so only a caller's successful call arms it again.
+                renewing = keep_session(op, env, RENEWALS[route]) or route == "session"
                 continue
             pending.extend(os.read(fifo, 4096))
             while b"\n" in pending:
@@ -425,9 +451,14 @@ def main(kind):
         "Linux only: the op and @SCRIPT requests, a broker whose directory comes from JARVIS_OP_DIRECTORY, "
         "and a broker that reuses an existing directory.",
         epilog="The broker takes OP_SESSION from its environment, or starts op signin --raw when its stdin is a "
-               "terminal. Calls disable desktop integration and never print secrets. When JARVIS_OP_KEEPALIVE_SECS "
-               "is set, the broker runs op whoami whenever it has been idle that many seconds after a successful "
-               "call, which keeps the session past 1Password's idle expiry; unset, it never renews. "
+               "terminal; those calls disable desktop integration, so they raise no desktop approval prompt. With "
+               "JARVIS_OP_APP_INTEGRATION=1 and no OP_SESSION, calls go through the 1Password desktop app instead: "
+               "one approval covers every call until 10 minutes pass with no call, 12 hours pass, or the app "
+               "locks. Setting both refuses. Calls never print secrets. When JARVIS_OP_KEEPALIVE_SECS is set, the "
+               "broker renews whenever it has been idle that many seconds after a successful call, with op whoami "
+               "for OP_SESSION or op vault list for the app integration, which keeps the approval past 1Password's "
+               "idle expiry; unset, it never renews. "
+               "Under the app integration, a failed renewal stops renewal until a caller's next successful call. "
                "Clients need Python 3, not op. read writes the raw value to --output; op and @SCRIPT write one "
                "JSON record {\"exit\": N, \"stdout\": BASE64}. After an op or @SCRIPT request was sent, "
                "request=timeout or request=cancelled leaves its outcome unknown: check before retrying a write. "
