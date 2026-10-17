@@ -5,12 +5,14 @@ set -euo pipefail
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$TEST_DIR/lib/pr-watch-fixture.sh"
 
-mv "$TMP_ROOT/scripts/lib/refresh-identity.sh" "$TMP_ROOT/refresh-identity.sh"
-run_watch '' --help
-assert_eq "$RC" 2 'a missing identity owner refuses watcher startup'
-assert_eq "$(sed -n 's/^review-gate-error=\([^ ]*\) value=.*/\1/p' <<<"$OUT")" \
-  refresh-identity-load 'the missing shared owner has a structured load error'
-mv "$TMP_ROOT/refresh-identity.sh" "$TMP_ROOT/scripts/lib/refresh-identity.sh"
+for lib in refresh-identity kendex-env; do
+  mv "$TMP_ROOT/scripts/lib/$lib.sh" "$TMP_ROOT/$lib.sh"
+  run_watch '' --help
+  assert_eq "$RC" 2 "a missing lib/$lib.sh refuses watcher startup"
+  assert_eq "$(sed -n 's/^review-gate-error=\([^ ]*\) value=.*/\1/p' <<<"$OUT")" \
+    "$lib-load" "the missing lib/$lib.sh has a structured load error"
+  mv "$TMP_ROOT/$lib.sh" "$TMP_ROOT/scripts/lib/$lib.sh"
+done
 
 P7GHOST="$(jq -cn --arg head "$HEAD_A" '[{number:7, state:"open", draft:false, head:{sha:$head}, user:null, created_at:"2026-01-01T00:00:00Z", auto_merge:{merge_method:"merge"}}]')"
 P7BADTIMES="$(jq -cn --arg head "$HEAD_A" '[{number:7, state:"open", draft:false, head:{sha:$head}, user:{login:"author"}, created_at:"garbage", auto_merge:{merge_method:"merge"}}]')"
