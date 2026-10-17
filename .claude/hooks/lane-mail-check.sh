@@ -1930,7 +1930,9 @@ handoff_instruction() {
 # Stop's task registry is the documented input. Older Claude versions, an
 # unreachable registry and every tool call omit it; only then use the measured
 # Agent-call results, task-notification status lines, teammate idle
-# notifications and SendMessage calls. No child result body is interpreted.
+# notifications, SendMessage calls and TaskStop calls. A tool result is read
+# for those notification markers alone; no other part of a child result body
+# is interpreted.
 # AGENT_ROWS names each child still out, and AGENT_STATE says whether any may
 # be: none, out, or unknown where the roster could not be read or holds an
 # entry neither read classifies, which callers never read as none.
@@ -1989,17 +1991,39 @@ claude_attached_agents() { # [emergency STATE_FILE]
     # teammate; a plain-text SendMessage to either puts it out again, and a
     # sent shutdown_request ends it, since the lead's transcript never
     # receives the approval and the lead is owed no further result. A
-    # foreground Agent call (no run_in_background, no name) returns its
+    # TaskStop call that did not fail ends the child it names by id or name.
+    # A foreground Agent call (no run_in_background, no name) returns its
     # child's finished output, so its result puts nothing out. Any other
-    # result of an async or named call is unclassified.
+    # result of an async or named call is unclassified. Claude Code appends a
+    # notification that arrives during a tool call to that call's result, and
+    # records one queued while the model works as a queue-operation enqueue
+    # entry (2.1.302), so task and idle notifications are read there as well;
+    # the later remove entry repeats the enqueued text and is skipped. A
+    # notification in a record arrived before or during the calls whose
+    # results it carries, so it describes a turn that ended before their
+    # message reached the child: a record's notifications apply before its
+    # call results. A launch or spawn result in the same record may carry
+    # that child's first notification on a sibling result, so the record's
+    # launches register first.
     agents=$("${scan_bound[@]}" jq -Rnr '
       def text: if type == "string" then . elif type == "array" then
         [.[] | select(.type == "text") | .text] | join("\n") else "" end;
+      def said: text,
+        (if type == "array" then .[] | select(.type == "tool_result") | .content | text else empty end);
       def launched: (select(startswith("Async agent launched successfully"))
           | capture("agentId: (?<id>[A-Za-z0-9_-]+)")?),
         (select(startswith("Spawned successfully"))
           | capture("\nagent_id: (?<id>[A-Za-z0-9_-]+)\nname: (?<name>[^\n]+)")?);
-      reduce (inputs | fromjson | .message? | objects) as $m ({calls: {}, agents: {}, names: {}, unclassified: false};
+      def results: .content | if type == "array" then .[] else empty end | select(.type == "tool_result");
+      def noted($m): reduce ($m.content | said
+            | scan("<task-notification>[\\s\\S]*?<task-id>([A-Za-z0-9_-]+)</task-id>[\\s\\S]*?<status>([a-z_]+)</status>[\\s\\S]*?</task-notification>")) as $n
+            (. ; if .agents | has($n[0]) then .agents[$n[0]] = $n[1] else . end)
+          | reduce ($m.content | said
+            | scan("<teammate-message teammate_id=\"([^\"]+)\"[^>]*>\\s*\\{\\s*\"type\"\\s*:\\s*\"idle_notification\"")) as $n
+            (. ; if .names | has($n[0]) then .agents[.names[$n[0]]] = "completed" else . end);
+      reduce (inputs | fromjson | objects
+          | if .type == "queue-operation" then select(.operation == "enqueue") | {role: "user", content: (.content | strings)}
+            else .message? | objects end) as $m ({calls: {}, agents: {}, names: {}, unclassified: false};
         if $m.role == "assistant" then
           reduce ($m.content | if type == "array" then .[] else empty end
             | select(.type == "tool_use" and (.id | type) == "string")) as $c
@@ -2011,25 +2035,21 @@ claude_attached_agents() { # [emergency STATE_FILE]
                 elif ($c.input.message | type) == "object"
                   and $c.input.message.type == "shutdown_request" then .calls[$c.id] = {to: $c.input.to, status: "completed"}
                 else . end
+              elif $c.name == "TaskStop" and ($c.input.task_id | type) == "string" then
+                .calls[$c.id] = {to: $c.input.task_id, status: "killed"}
               else . end)
         elif $m.role == "user" then
-          reduce ($m.content | if type == "array" then .[] else empty end
-            | select(.type == "tool_result")) as $r
-            (. ; [$r.content | text | launched][0] as $l
-              | .calls[$r.tool_use_id | if type == "string" then . else "" end] as $c
-              | if $l != null then .agents[$l.id] = "running"
-                  | if $l.name != null then .names[$l.name] = $l.id else . end
-                elif $c == null or $r.is_error == true then .
+          reduce ($m | results | [.content | text | launched][0] | objects) as $l
+            (. ; .agents[$l.id] = "running"
+              | if $l.name != null then .names[$l.name] = $l.id else . end)
+          | noted($m)
+          | reduce ($m | results) as $r
+            (. ; .calls[$r.tool_use_id | if type == "string" then . else "" end] as $c
+              | if [$r.content | text | launched][0] != null or $c == null or $r.is_error == true then .
                 elif $c | has("to") then (.names[$c.to] // $c.to) as $t
                   | if .agents | has($t) then .agents[$t] = $c.status else . end
                 elif $c.sync then .
                 else .unclassified = true end)
-          | reduce ($m.content | text
-            | scan("<task-notification>[\\s\\S]*?<task-id>([A-Za-z0-9_-]+)</task-id>[\\s\\S]*?<status>([a-z_]+)</status>[\\s\\S]*?</task-notification>")) as $n
-            (. ; if .agents | has($n[0]) then .agents[$n[0]] = $n[1] else . end)
-          | reduce ($m.content | text
-            | scan("<teammate-message teammate_id=\"([^\"]+)\"[^>]*>\\s*\\{\\s*\"type\"\\s*:\\s*\"idle_notification\"")) as $n
-            (. ; if .names | has($n[0]) then .agents[.names[$n[0]]] = "completed" else . end)
         else . end)
       | (.agents | to_entries[] | [.key, .value] | @tsv),
         (select(.unclassified) | ["?", "agent-result"] | @tsv)
