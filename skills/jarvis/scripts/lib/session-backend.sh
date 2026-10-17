@@ -59,8 +59,8 @@ case "$verb" in
     # Jarvis acts on the owner's desktop, so its session keeps the live display.
     lane_launch_keep_live_session
     line="$(lane_launch_line "$cmd" "$harness" "$var" "$LANE_TRUST_HOME" "$form" "" "$child_env")" || exit 1
-    jq -cn --arg line "$line" --arg var "$var" --arg home "$LANE_TRUST_HOME" \
-      '{line:$line, var:$var, effective_home:$home}' ;;
+    jq -cn --arg line "$line" --arg var "$var" --arg home "$LANE_TRUST_HOME" --argjson kickoff "$LANE_SESSION_PROMPTED" \
+      '{line:$line, var:$var, effective_home:$home, kickoff:$kickoff}' ;;
   inspect)
     socket="$1" pane="$2" harness="$3" var="$4" account="$5" brief="$8"
     export TMUX="$socket,0,0"
@@ -100,7 +100,10 @@ case "$verb" in
         *) exit 1 ;;
       esac
     fi
-    if [[ "$state" == working || "$6" == confirmed ]]; then
+    # The account is judged once SessionStart confirmed the start. Copilot and
+    # Codex draw their kickoff turn before their stamp lands, and a pending
+    # record holds no observed account to compare.
+    if [[ "$6" == confirmed ]]; then
       lane_account_equivalent "${7:-}" "$account" || { printf 'wrong-account\n'; exit; }
       lane_account_check "$pane" "$var" "$account" prefix 2 || { printf 'wrong-account\n'; exit; }
       case "$LANE_ACCOUNT_RESULT" in

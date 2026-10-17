@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 import shutil
 import signal
-from fixtures.harness import AUTH_MESSAGES, main as harness_main, native_header, native_launcher
+from fixtures.harness import AUTH_MESSAGES, launch_prompt, main as harness_main, native_header, native_launcher
 import shlex
 import subprocess
 import sys
@@ -515,6 +515,46 @@ class SessionContract(unittest.TestCase):
         answer = self.wait(reason="new-no-record")
         self.assertIsNotNone(answer["terminal"])
         self.assertIs(json.loads(self.record.read_text())["pending"]["brief_taken"], True)
+
+    def test_session_start_at_first_prompt(self):
+        # Copilot CLI and Codex fire SessionStart only once the first prompt is
+        # submitted. Their kickoff turn draws a working line before its stamp
+        # and a bare composer after it, and the brief waits for that turn's
+        # native end.
+        events = self.observe_inspection()
+        fixture = self.home / ".fixture.json"
+        fixture.write_text(json.dumps(json.loads(fixture.read_text()) | {"kickoff_barrier": str(events)}))
+        brief = self.home / "private.txt"
+        brief.write_text("Continue the consumer's private work.")
+        for harness in ("copilot", "codex"):
+            with self.subTest(harness=harness):
+                launches = len(self.started()) if self.rows.exists() else 0
+                self.call("start", harness, brief=brief)
+                # The launch line itself submits the kickoff, as the harness
+                # reads its argv; without one the start waits out its bound.
+                self.await_launches(launches + 1)
+                self.assertIsNotNone(launch_prompt(harness, self.started()[-1]["argv"]))
+                answer = self.wait()
+                self.assertIsNotNone(answer["terminal"])
+                launched = self.started()[-1]
+                record = json.loads(self.record.read_text())
+                if harness == "copilot":
+                    # The native id is the id Start preassigned at launch.
+                    self.assertIn("--session-id=" + record["pending"]["native_session_id"], launched["argv"])
+                self.assertEqual(record["pending"]["native_session_id"], launched["id"])
+                self.assertEqual(record["history"]["pending"]["native_session_id"], launched["id"])
+                self.assertTrue(record["history"]["pending"]["started_at"])
+                self.assertIs(record["pending"].get("kickoff_ended"), True)
+                # Running follows the session's own word that it took the brief.
+                self.assertIs(record["pending"].get("brief_taken"), True)
+                rows = [json.loads(line) for line in self.rows.read_text().splitlines()]
+                own = [row for row in rows if row.get("id") == launched["id"] and ("kickoff" in row or "prompt" in row)]
+                self.assertEqual(["kickoff" in row for row in own], [True, False])
+                self.assertNotIn(brief.read_text(), own[0]["kickoff"])
+                self.assertNotIn(str(brief), own[0]["kickoff"])
+                self.assertIn(brief.read_text(), own[1]["prompt"])
+                self.call("stop")
+                self.wait("stopped")
 
     def test_trust_dialog_is_refused(self):
         # Copilot CLI 1.0.88's folder-trust question holds a new home before

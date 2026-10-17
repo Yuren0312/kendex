@@ -1,4 +1,5 @@
 """Plant each defect in an owned, disposable source copy, never this tree."""
+import argparse
 import os
 from pathlib import Path
 import shutil
@@ -17,17 +18,22 @@ CONTROLS = [
     ("ensure", "jarvis/scripts/lib/session.py", 'if matching and record["state"] in ("starting", "running")', 'if False and record["state"] in ("starting", "running")', "test_claude_contract"),
     ("app Off", "jarvis/scripts/lib/session.py", 'if record and record.get("app_off") and args.origin != "app-on":', 'if False:', "test_off_and_boot_receipt"),
     ("app On", "jarvis/scripts/lib/session.py", 'if args.origin == "app-on":', 'if False:', "test_off_and_boot_receipt"),
-    ("native identity", "jarvis/scripts/lib/session.py", 'if identity.get("native_session_id") and identity.get("started_at") and not record.get("brief_delivered") and observed in ("idle", "working"):', 'if not record.get("brief_delivered"):', "test_identity_before_private_brief"),
+    ("native identity", "jarvis/scripts/lib/session.py", 'if identity.get("native_session_id") and identity.get("started_at") and not record.get("brief_delivered") and ((record.get("identity_verified") and identity.get("kickoff_ended")) if prepared["kickoff"] else observed in ("idle", "working")):', 'if not record.get("brief_delivered"):', "test_identity_before_private_brief"),
+    ("kickoff turn end before the brief", "jarvis/scripts/lib/session.py", '(record.get("identity_verified") and identity.get("kickoff_ended")) if prepared["kickoff"]', 'record.get("identity_verified") if prepared["kickoff"]', "test_session_start_at_first_prompt"),
+    ("kickoff turn is no brief turn", "jarvis/scripts/lib/session.py", '(observed == "working" and not prepared["kickoff"])', '(observed == "working")', "test_session_start_at_first_prompt"),
     ("live harness before brief", "orch/scripts/lib/pane-write.sh", 'pane_write_expect "$expect" || return', 'true || { pane_write_expect "$expect" || return; }', "test_identity_before_private_brief"),
-    ("account before brief", "jarvis/scripts/lib/session-backend.sh", 'if [[ "$state" == working || "$6" == confirmed ]]; then', 'if [[ "$state" == working ]]; then', "test_account_is_checked_before_private_brief"),
+    ("account before brief", "jarvis/scripts/lib/session-backend.sh", 'if [[ "$6" == confirmed ]]; then', 'if [[ "$state" == working ]]; then', "test_account_is_checked_before_private_brief"),
+    ("kickoff turn before the start", "jarvis/scripts/lib/session-backend.sh", 'if [[ "$6" == confirmed ]]; then', 'if [[ "$state" == working || "$6" == confirmed ]]; then', "test_session_start_at_first_prompt"),
+    ("Copilot kickoff", "orch/scripts/lib/lane-launch.sh", "printf ' -i %s' \"$kickoff\"", 'true', "test_session_start_at_first_prompt"),
+    ("Codex kickoff", "orch/scripts/lib/lane-launch.sh", "printf ' %s' \"$kickoff\"", 'true', "test_session_start_at_first_prompt"),
     ("observed account acknowledgement", "jarvis/scripts/lib/session-backend.sh", 'lane_account_equivalent "${7:-}" "$account" ||', 'true || { lane_account_equivalent "${7:-}" "$account"; } ||', "test_account_is_checked_before_private_brief"),
     ("fixture EOF is not delivery", "jarvis/tests/fixtures/harness.py", 'if prompt == "":', 'if False and prompt == "":', "test_account_is_checked_before_private_brief"),
     ("local acquisition ownership", "jarvis/scripts/lib/session.py", 'acquired = record', 'acquired = None', "test_start_acquisition_failure_releases_ownership"),
     ("brief acquisition cleanup", "jarvis/scripts/lib/session.py", 'prompt.unlink()', 'if False:\n                                prompt.unlink()', "test_start_acquisition_failure_releases_ownership"),
     ("worker acquisition cleanup", "jarvis/scripts/lib/session.py", '            child.terminate()\n            try:\n                child.wait(timeout=2)\n            except subprocess.TimeoutExpired:\n                child.kill()\n                child.wait(timeout=2)', '            if False:\n                child.terminate()\n                try:\n                    child.wait(timeout=2)\n                except subprocess.TimeoutExpired:\n                    child.kill()\n                    child.wait(timeout=2)', "test_start_acquisition_failure_releases_ownership"),
-    ("working turn", "jarvis/scripts/lib/session.py", 'elif record.get("brief_delivered") and (taken or observed == "working"):', 'elif record.get("brief_delivered"):', "test_idle_prompt_is_not_running"),
-    ("brief taken", "jarvis/scripts/lib/session.py", '(taken or observed == "working")', '(observed == "working")', "test_turn_end_takes_the_brief"),
-    ("Pi tool call takes the brief", "jarvis/scripts/lib/session.py", '(taken or observed == "working")', '(observed == "working")', "test_pi_contract"),
+    ("working turn", "jarvis/scripts/lib/session.py", 'record.get("brief_delivered") and (taken or (observed == "working" and not prepared["kickoff"])):', 'record.get("brief_delivered"):', "test_idle_prompt_is_not_running"),
+    ("brief taken", "jarvis/scripts/lib/session.py", '(taken or (observed == "working" and not prepared["kickoff"]))', '((observed == "working" and not prepared["kickoff"]))', "test_turn_end_takes_the_brief"),
+    ("Pi tool call takes the brief", "jarvis/scripts/lib/session.py", '(taken or (observed == "working" and not prepared["kickoff"]))', '((observed == "working" and not prepared["kickoff"]))', "test_pi_contract"),
     ("Pi idle before the brief", "jarvis/scripts/lib/session-backend.sh", 'if [[ "$harness" == pi && "$6" == confirmed && "$brief" == undelivered ]]; then', 'if false; then', "test_pi_contract"),
     ("trust refusal", "jarvis/scripts/lib/session-backend.sh", "0) printf 'trust\\n%s\\n' \"$dialog\"; exit ;;", '0) ;;', "test_trust_dialog_is_refused"),
     ("trust below the last turn", "jarvis/scripts/lib/session-backend.sh", 'dialog="$(pane_trust_dialog "$slice")"', 'dialog="$(pane_trust_dialog "$screen")"', "test_resumed_history_is_no_trust_dialog"),
@@ -57,6 +63,22 @@ CONTROLS = [
 ]
 
 
+# All controls in one suite ran into run-all.sh's per-suite bound, so they
+# run as two suites in separate slots: controls.test.sh runs part 1 and
+# controls-2.test.sh part 2. A control runs in the part of its baseline case,
+# so each baseline runs once; a case this set does not name runs in part 2.
+PART_1_BASELINES = frozenset({
+    "test_idle_prompt_is_not_running",
+    "test_start_acquisition_failure_releases_ownership",
+    "test_pi_contract",
+    "test_resumed_history_is_no_trust_dialog",
+})
+
+
+def part_of(control):
+    return 1 if control[4] in PART_1_BASELINES else 2
+
+
 def applicable_controls(boot_scenario=BootReceiptScenario):
     controls = list(CONTROLS)
     if boot_scenario.applicable:
@@ -65,9 +87,14 @@ def applicable_controls(boot_scenario=BootReceiptScenario):
 
 
 def main():
-    controls = applicable_controls()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--part", type=int, choices=(1, 2), required=True)
+    part = parser.parse_args().part
+    stale = PART_1_BASELINES - {row[4] for row in CONTROLS}
+    assert not stale, "part-baseline-unknown=" + ",".join(sorted(stale))
+    controls = [row for row in applicable_controls() if part_of(row) == part]
     if not BootReceiptScenario.applicable:
-        for name, *_ in BootReceiptScenario.controls:
+        for name, *_ in (row for row in BootReceiptScenario.controls if part_of(row) == part):
             print("control: unavailable=" + name + " producer=boot-receipt", flush=True)
     with native_launcher() as native, tempfile.TemporaryDirectory() as allocation:
         scratch = Path(allocation).resolve()

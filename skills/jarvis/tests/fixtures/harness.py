@@ -9,6 +9,7 @@ import select
 import sys
 import shutil
 import tempfile
+import time
 
 # Native errors and turn markers exercised by orch/tests/lane-state-auth.sh.
 AUTH_MESSAGES = {
@@ -29,6 +30,41 @@ TRUST_HISTORY = {
     "pending": "❯ What does the folder-trust dialog ask?\n  It asks: Do you trust the files in this folder?\n❯ Thanks.\n  Noted.",
     "confirmed": "❯ What does the folder-trust dialog ask?\n  It asks: Do you trust the files in this folder?",
 }
+
+
+# Codex options the launch line spells with a separate value word.
+CODEX_VALUE_OPTIONS = {"-c", "--config", "-m", "--model", "-a", "--ask-for-approval", "-p", "--profile",
+                       "-s", "--sandbox", "-C", "--cd", "-i", "--image", "--enable", "--disable"}
+
+
+def launch_prompt(harness, args):
+    # Copilot CLI takes the prompt as the value of -i, Codex as the positional
+    # after its options and its resume id: `codex [resume ID] [PROMPT]`.
+    if harness == "copilot":
+        return args[args.index("-i") + 1] if "-i" in args else None
+    words, skip = [], False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg in CODEX_VALUE_OPTIONS:
+            skip = True
+        elif not arg.startswith("-"):
+            words.append(arg)
+    if words[:1] == ["resume"]:
+        words = words[2:]
+    return words[0] if words else None
+
+
+def await_inspections(events, count):
+    # A barrier, not a clock: the second pane read that began after the draw
+    # proves the controller decided on the first one.
+    def seen():
+        return len(events.read_text().splitlines()) if events.exists() else 0
+    target = seen() + count
+    deadline = time.monotonic() + 10
+    while seen() < target:
+        assert time.monotonic() < deadline, "the controller did not read the drawn pane"
+        time.sleep(0.05)
 
 
 def brief_taken(fixture, harness, identity, event):
@@ -106,7 +142,6 @@ def main():
     if gate.exists():
         with gate.open() as stream:
             stream.read(1)
-    assert not select.select([sys.stdin], [], [], 0)[0], "a prompt preceded SessionStart"
     file = account / "sessions" / (identity + ".jsonl")
     header = native_header(harness, identity, os.getcwd())
     if harness == "copilot":
@@ -123,12 +158,38 @@ def main():
         print(Path(fixture["trust"]).read_text(), end="", flush=True)
         sys.stdin.read()
         return
+    barrier = fixture.get("kickoff_barrier")
+    deferred = harness in ("copilot", "codex")
+    if deferred:
+        # Copilot CLI and Codex fire SessionStart only once the first prompt
+        # is submitted: the launch line's prompt, or else the first typed line.
+        kickoff = launch_prompt(harness, args)
+        if kickoff is None:
+            print("❯\u00a0", flush=True)
+            kickoff = sys.stdin.readline().strip()
+        with rows.open("a") as stream:
+            stream.write(json.dumps({"kickoff": kickoff, "id": identity, "harness": harness}) + "\n")
+        if barrier:
+            # The kickoff turn draws before its SessionStart stamp lands.
+            print("Working to interrupt", flush=True)
+            await_inspections(Path(barrier), 2)
+    assert not select.select([sys.stdin], [], [], 0)[0], "a prompt preceded SessionStart"
     payload = {"session_id": identity}
     if harness != "copilot":
         payload["transcript_path"] = str(file)
     shell = 'source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/orch/scripts/lib/lane-context.sh"; source "$1/orch/scripts/lib/session-rows.sh"; SESSION_ROWS_WAIT=10; key="$(tmux display-message -p "#{pid} #{pane_id}")"; session_rows_jarvis_write "$JARVIS_RECORD" "$JARVIS_GENERATION" "$key" "$2"'
     subprocess.run([fixture["bash"], "-c", shell, "fixture", fixture["skills"], harness],
                    input=json.dumps(payload), text=True, check=True)
+    if barrier:
+        # The kickoff turn still runs after its stamp and draws only its
+        # composer, which the pane reads as idle: no brief may land before
+        # the turn's own end. The first read after the draw may pair it with
+        # the record from before the stamp, so the third proves the worker
+        # decided on a read of both.
+        print("\033[2J\033[H❯\u00a0", flush=True)
+        await_inspections(Path(barrier), 3)
+        assert not select.select([sys.stdin], [], [], 0)[0], "the brief reached the kickoff turn"
+        print("\033[2J\033[H", end="", flush=True)
     if history == "confirmed":
         print(TRUST_HISTORY[history], flush=True)
     if fixture.get("hold_prompt"):
@@ -136,6 +197,9 @@ def main():
         # Hold its prompt marker so automatic delivery cannot race that probe.
         with gate.open() as stream:
             stream.read(1)
+    if deferred:
+        # The kickoff turn ends: its native turn-end hook stamps the record.
+        brief_taken(fixture, harness, identity, "Stop")
     auth_mode = fixture.get("auth_mode")
     if auth_mode == "stale":
         print(AUTH_MESSAGES[harness] + "\n❯ continue\n❯\u00a0", flush=True)
@@ -170,6 +234,13 @@ def main():
         brief_taken(fixture, harness, identity, "Stop")
     else:
         print("Working to interrupt", flush=True)
+    if deferred and auth_mode != "current":
+        if barrier:
+            # A working pane after a kickoff turn is no proof of the brief:
+            # the controller reads it twice before the stamp.
+            await_inspections(Path(barrier), 2)
+        # The Start brief's first tool call says the session took it.
+        brief_taken(fixture, harness, identity, "PreToolUse")
     sys.stdin.read()
 
 
