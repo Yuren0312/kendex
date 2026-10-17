@@ -165,6 +165,12 @@ Create Options:
   kept. Create also refuses a declared label Linear does not have, where with
   no taxonomy it skips that label with a warning.
 
+  Project map: where the repository declares one (project-management
+  references/project-map.md), create refuses with no --project, and create,
+  update --project and bulk-update --project refuse, before any write, a
+  project the map does not list and a map project with no single live Linear
+  project in the team.
+
 Update Options:
   --state <name>        New state
   --label(s) <a,b,c>    Replace labels (comma-separated)
@@ -680,7 +686,7 @@ bulk_update_issues() {
     local from_stdin="false"
     local update_args=()
     local attach_paths=()
-    local description="" description_set="false" state=""
+    local description="" description_set="false" state="" project=""
 
     # Separate issue IDs from update options
     while [[ $# -gt 0 ]]; do
@@ -693,6 +699,7 @@ bulk_update_issues() {
             # These are update options - collect with their values
             # (--attach re-uploads per issue: Linear assets are issue-agnostic
             # but each issue gets its own embed/attachment)
+            [[ "$1" != --project ]] || project="$2"
             update_args+=("$1" "$2")
             [[ "$1" != --state && "$1" != --status ]] || state="$2"
             [[ "$1" != --attach ]] || attach_paths+=("$2")
@@ -705,6 +712,7 @@ bulk_update_issues() {
         --state=* | --status=* | --labels=* | --label=* | --title=* | --description=* | --project=* | --parent=* | --milestone=* | --priority=* | --estimate=* | --assignee=* | --cycle=* | --sort-order=* | --attach=*)
             # Support --key=value syntax (AI agents often use this)
             local _key="${1%%=*}" _val="${1#*=}"
+            [[ "$_key" != --project ]] || project="$_val"
             update_args+=("$_key" "$_val")
             [[ "$_key" != --state && "$_key" != --status ]] || state="$_val"
             [[ "$_key" != --attach ]] || attach_paths+=("$_val")
@@ -754,21 +762,47 @@ bulk_update_issues() {
         attach_preflight_files "${attach_paths[@]}" || return 1
     fi
     [[ "$description_set" != "true" ]] || require_issue_header_shape "$description" || return 1
+    local project_map=""
+    if [ -n "$project" ]; then
+        project_map=$(linear_project_map) || return 1
+        linear_map_preflight "$project_map" "$project" update || return 1
+    fi
     linear_guard_issue_team bulk-update "${identifiers[@]}" || return 1
 
-    # A later refusal must not leave earlier issues Done or assets uploaded.
-    if [ -n "$state" ]; then
-        local preflight_failed=0 issue_result effective_description
+    # The state check and the map-project check run here, before any write,
+    # so neither refusal leaves an issue Done, moved or with uploaded assets.
+    # update_issue still refuses per issue in the write loop below (a
+    # --milestone missing from that issue's project, a label for that issue's
+    # team), after earlier issues are written. This loop reads each issue at
+    # most once, and only when the state check or the issue's team needs it:
+    # the guard above pins every issue to LINEAR_TEAM when one is set. The map
+    # project is judged in each issue's own team; issue_project_id keeps each
+    # team's result for the update_issue subshells below.
+    local own_team_id=""
+    if [[ -n "$project_map" && -n "$DEFAULT_TEAM" ]]; then
+        linear_own_team || return 1
+        own_team_id=$(jq -r '.id' <<<"$LINEAR_OWN_TEAM") || return 1
+    fi
+    if [[ -n "$state" || -n "$project_map" ]]; then
+        local preflight_failed=0 issue_result effective_description team_id
         for id in "${identifiers[@]}"; do
-            if ! issue_result=$(get_issue "$id" --format=raw); then
+            issue_result=""
+            if [[ -n "$state" || -z "$own_team_id" ]] && ! issue_result=$(get_issue "$id" --format=raw); then
                 preflight_failed=1
                 continue
             fi
-            effective_description="$description"
-            if [ "$description_set" != true ]; then
-                effective_description=$(jq -r '.issue.description // ""' <<<"$issue_result") || return 1
+            if [ -n "$state" ]; then
+                effective_description="$description"
+                if [ "$description_set" != true ]; then
+                    effective_description=$(jq -r '.issue.description // ""' <<<"$issue_result") || return 1
+                fi
+                resolve_issue_update_state "$issue_result" "$state" "$effective_description" >/dev/null || preflight_failed=1
             fi
-            resolve_issue_update_state "$issue_result" "$state" "$effective_description" >/dev/null || preflight_failed=1
+            if [ -n "$project_map" ]; then
+                team_id="$own_team_id"
+                [ -n "$team_id" ] || team_id=$(jq -r '.issue.team.id // empty' <<<"$issue_result") || return 1
+                issue_project_id "$project_map" "$project" "$team_id" "$id" || return 1
+            fi
         done
         [ "$preflight_failed" = 0 ] || return 1
     fi
@@ -1074,6 +1108,94 @@ require_agent_routing_label() {
     return 0
 }
 
+# Project map guard
+# -----------------------------------------------------------------------------
+# Under a declared project map (project-management references/project-map.md),
+# an issue write places its issue only in a map project, and a create names
+# one. This script holds the rule because Linear cannot: an issue may join any
+# project its team can reach, and no team setting narrows which
+# (https://linear.app/docs/teams). With no map both checks pass and send no
+# request.
+
+# Refuse, before any request, a placement the map's text rules out: a create
+# with no project, and a project name the map does not list. A UUID waits for
+# the live check.
+# Usage: linear_map_preflight MAP REF ACTION || return 1
+linear_map_preflight() {
+    local map="$1" ref="$2" action="$3" legal
+    [[ -n "$map" ]] || return 0
+    legal=$(jq -c '[.projects[].name]' <<<"$map") || return 1
+    if [[ -z "$ref" ]]; then
+        [[ "$action" == create ]] || return 0
+        linear_project_message project-missing "" "$legal" >&2
+        return 1
+    fi
+    [[ ! "$ref" =~ $LINEAR_UUID_PATTERN ]] || return 0
+    if ! jq -e --arg ref "$ref" 'any(.[]; . == $ref)' <<<"$legal" >/dev/null; then
+        linear_project_message off-map "$ref" "$legal" >&2
+        return 1
+    fi
+}
+
+# Print the Linear id of the map project REF names, read live within TEAM_ID
+# (empty reads the workspace), or refuse: a map name with no live project or
+# with more than one, and a UUID that is no map project's.
+# Usage: project_id=$(linear_map_live MAP REF TEAM_ID) || return 1
+linear_map_live() {
+    local map="$1" ref="$2" team_id="$3" projects entry legal
+    projects=$(linear_map_projects "$map" "$team_id") || return 1
+    entry=$(jq -c --arg ref "$ref" 'first(.[] | select(.name == $ref or .id == $ref)) // empty' <<<"$projects") || return 1
+    if [[ -z "$entry" ]]; then
+        legal=$(jq -c '[.projects[].name]' <<<"$map") || return 1
+        linear_project_message off-map "$ref" "$legal" >&2
+        return 1
+    fi
+    case "$(jq -r '.live' <<<"$entry")" in
+    1) jq -r '.id' <<<"$entry" ;;
+    0)
+        linear_project_message declared-missing "$(jq -r '.name' <<<"$entry")" >&2
+        return 1
+        ;;
+    *)
+        linear_project_message ambiguous "$(jq -r '.name' <<<"$entry")" >&2
+        return 1
+        ;;
+    esac
+}
+
+# The Linear id each --project ref of this invocation resolved to, keyed by
+# "TEAM_ID:REF": a ref resolved in one team says nothing of another. A
+# `$(...)` subshell inherits it, so bulk-update fills it before its
+# update_issue subshells and each finds its issue's team there.
+declare -A LINEAR_ISSUE_PROJECT_IDS=()
+ISSUE_PROJECT_ID=""
+
+# Set ISSUE_PROJECT_ID to the Linear id of --project REF for ISSUE, an
+# existing issue of team TEAM_ID: under MAP the map project in that team, else
+# the project resolve_project_id names. A name resolves only in the issue's
+# team, so an issue whose team is unknown refuses one; a UUID needs no team.
+# Call it in the command's own shell, not `$(...)`, so the result is kept.
+# Usage: issue_project_id MAP REF TEAM_ID ISSUE || return 1
+issue_project_id() {
+    local map="$1" ref="$2" team_id="$3" issue="$4" key="$3:$2" id
+    if [[ -n "${LINEAR_ISSUE_PROJECT_IDS[$key]:-}" ]]; then
+        ISSUE_PROJECT_ID="${LINEAR_ISSUE_PROJECT_IDS[$key]}"
+        return 0
+    fi
+    if [[ -z "$team_id" && ! "$ref" =~ $LINEAR_UUID_PATTERN ]]; then
+        jq -cn --arg issue "$issue" '{code: "ISSUE_TEAM_MISSING", issue: $issue, error: ("Issue team missing: " + $issue)}' >&2
+        return 1
+    fi
+    if [ -n "$map" ]; then
+        id=$(linear_map_live "$map" "$ref" "$team_id") || return 1
+    else
+        id=$(resolve_project_id "$ref" "$team_id") || return 1
+    fi
+    [ -n "$id" ] || return 1
+    LINEAR_ISSUE_PROJECT_IDS[$key]="$id"
+    ISSUE_PROJECT_ID="$id"
+}
+
 # Create pending non-image attachments on an issue that already exists.
 # Entries are "assetUrl<TAB>title" strings from the upload loop. A failure
 # here is a partial write: the issue mutation succeeded but an attachment is
@@ -1303,6 +1425,9 @@ create_issue() {
         declared=$(linear_declared_labels) || return 1
         linear_require_declared_labels "$labels" || return 1
     fi
+    local project_map
+    project_map=$(linear_project_map) || return 1
+    linear_map_preflight "$project_map" "$project" create || return 1
     require_issue_reach "$description" "$priority" "$review_born" || return 1
     require_issue_header_shape "$description" || return 1
 
@@ -1327,7 +1452,9 @@ create_issue() {
     # the asset in Linear storage with no issue referencing it. The ids they
     # yield are what the input below carries.
     local project_id=""
-    if [ -n "$project" ]; then
+    if [ -n "$project_map" ]; then
+        project_id=$(linear_map_live "$project_map" "$project" "$team_id") || return 1
+    elif [ -n "$project" ]; then
         project_id=$(resolve_project_id "$project" "$team_id") || return 1
         if [ -z "$project_id" ]; then
             return 1
@@ -1831,6 +1958,13 @@ update_issue() {
     if [ ${#attach_paths[@]} -gt 0 ]; then
         attach_preflight_files "${attach_paths[@]}" || return 1
     fi
+    # A move is judged against the map; an issue already off it stays where
+    # it is, as a label it already carries is kept, for `projects audit`.
+    local project_map=""
+    if [ -n "$project" ]; then
+        project_map=$(linear_project_map) || return 1
+        linear_map_preflight "$project_map" "$project" update || return 1
+    fi
     linear_guard_issue_team update "$issue_id" || return 1
 
     local input_parts=()
@@ -1875,14 +2009,8 @@ update_issue() {
     # after the upload strands the asset in Linear storage.
     local project_id=""
     if [ -n "$project" ]; then
-        if [[ -z "$team_id" && ! "$project" =~ $LINEAR_UUID_PATTERN ]]; then
-            jq -cn --arg issue "$issue_id" '{code: "ISSUE_TEAM_MISSING", issue: $issue, error: ("Issue team missing: " + $issue)}' >&2
-            return 1
-        fi
-        project_id=$(resolve_project_id "$project" "$team_id") || return 1
-        if [ -z "$project_id" ]; then
-            return 1
-        fi
+        issue_project_id "$project_map" "$project" "$team_id" "$issue_id" || return 1
+        project_id="$ISSUE_PROJECT_ID"
     fi
     local milestone_id=""
     if [ -n "$milestone" ]; then
