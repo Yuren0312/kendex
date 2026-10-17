@@ -138,8 +138,8 @@ change_class_lanes() { # CLASS DOCS EVENT REPO HEAD QUEUE_ONLY WORK LANES_FROM Q
   local queue_only="$6" work="$7" lanes_from="$8" queue_default="${9:-false}"
   local declaration="" lanes_root="" judged_root="" per_push
   local base_lane_count declaration_comparison no_changed_paths unclaimed_path
-  local render_base render_head has_deletions status path index delta name claimed
-  local moved_paths=() added_paths=() lane_hits=() lane_changed=() render_hits=()
+  local render_base render_head path index delta name claimed
+  local lane_hits=() lane_changed=() render_hits=()
   local reader_missing queue_reader per_push_reader standdown_missing hit
 # Every class but `standard` is reached only after the classifier read a
 # changed path, so an empty list under one of them is a state neither script
@@ -259,34 +259,24 @@ if [ "$lane_state" = read ] && [ "$class" = render ]; then
     die "cause=render-range-unreadable" "could not read the render head revision"
   [ -n "$render_base" ] && [ -n "$render_head" ] ||
     die "cause=render-range-unreadable" "the render classifier supplied no resolved range"
+  # A render proof shows the files equal their sources, not that the
+  # consumer's code still works against them, so every changed path runs
+  # the lanes that claim it. WriteTree carries paths and bytes, not move
+  # identity, and rename pairing would name only a move's new end:
+  # disabling it names both ends.
   git -C "$REPO" diff --no-ext-diff --no-textconv \
-    --name-status -z --no-renames --diff-filter=AD "$render_base" "$render_head" -- \
-    >"${work:?}/moved" || die "cause=render-moves-unreadable" "could not read render additions and deletions"
-  moved_paths=() added_paths=() has_deletions=false
-  while IFS= read -r -d '' status <&3; do
-    IFS= read -r -d '' path <&3 || die "cause=render-moves-unreadable" "a moved path is absent"
-    case "$status" in
-      A) added_paths+=("$path") ;;
-      D) has_deletions=true; moved_paths+=("$path") ;;
-    esac
-  done 3<"${work:?}/moved"
-  # WriteTree carries paths and bytes, not move identity. Similarity can pair
-  # an old file with a retained copy and hide its rewritten destination.
-  # Disabling rename pairing keeps every disappeared path visible. Each
-  # addition then needs its claiming lane. Additions alone grant no lane.
-  if [ "$has_deletions" = true ]; then
-    moved_paths=("${moved_paths[@]+"${moved_paths[@]}"}" "${added_paths[@]+"${added_paths[@]}"}")
-  fi
-  for path in ${moved_paths[@]+"${moved_paths[@]}"}; do
+    --name-only -z --no-renames "$render_base" "$render_head" -- \
+    >"${work:?}/render-changed" || die "cause=render-paths-unreadable" "could not read the render's changed paths"
+  while IFS= read -r -d '' path; do
     index=0
     while [ "$index" -lt "$lane_count" ]; do
-      if ci_lanes_claims "$index" "$path" && [ -z "${render_hits[$index]:-}" ]; then
+      if [ -z "${render_hits[$index]:-}" ] && ci_lanes_claims "$index" "$path"; then
         render_hits[$index]="path=$path glob=$LANE_GLOB_HIT"
-        lanes=true lanes_cause=render-moved-claim
+        lanes=true lanes_cause=render-claim
       fi
       index=$((index + 1))
     done
-  done
+  done <"${work:?}/render-changed"
 fi
 declaration_comparison=not-needed
 no_changed_paths=false
@@ -398,11 +388,13 @@ if [ "$lanes" = true ] && [ "$queue_default" = true ] && [ "$per_push" = unset ]
   esac
 fi
 
-# Each lane's classified verdict and cause, at its index. On a pull request
-# a lane marked `:queue` that one of its own globs reached stands down only
-# where this run's change-class answered queue_only=true and both renders
-# read the mark, so pr-merge, asking the same question from either, keeps
-# the pull request off the admin merge. Otherwise it runs, its cause naming
+# Each lane's classified verdict and cause, at its index. A lane's hit is the
+# path one of its own globs reached: the render claim on a render, the
+# ordinary claim otherwise. On a pull request a lane marked `:queue` with a
+# hit stands down only where this run's change-class answered
+# queue_only=true and both renders read the mark, so pr-merge, asking the
+# same question from either, keeps the pull request off the admin merge, and
+# a render is no exception. Otherwise it runs, its cause naming
 # what was missing. A queue lane only a fallback reached runs here, since no
 # glob of its own put the diff in the queue.
 # A failed declaration comparison permits no queue deferral, and a diff whose
@@ -415,20 +407,20 @@ lane_causes=()
 reader_missing=unread
 index=0
 while [ "$index" -lt "$lane_count" ]; do
+  if [ "$class" = render ]; then
+    hit="${render_hits[$index]:-}"
+  else
+    hit="${lane_hits[$index]:-}"
+  fi
   if [ "$lanes_cause" = full-run ]; then
     lane_values[$index]=true lane_causes[$index]="cause=full-run event=$EVENT"
   elif [ "$lanes" = false ]; then
     lane_values[$index]=false lane_causes[$index]="cause=lanes-false lanes_cause=$lanes_cause"
-  elif [ "$class" = render ]; then
-    if [ -n "${render_hits[$index]:-}" ]; then
-      lane_values[$index]=true lane_causes[$index]="cause=render-moved-claim ${render_hits[$index]}"
-    else
-      lane_values[$index]=false lane_causes[$index]="cause=render-unreached"
-    fi
+  elif [ "$class" = render ] && [ -z "$hit" ]; then
+    lane_values[$index]=false lane_causes[$index]="cause=render-unreached"
   elif [ "$declaration_comparison" = unreadable ]; then
     lane_values[$index]=true lane_causes[$index]="cause=lane-declaration-unreadable path=.github/ci-lanes.conf"
-  elif [ "$EVENT" = pull_request ] && [ "${lane_queue[$index]}" = true ] && [ -n "${lane_hits[$index]}" ]; then
-    hit="${lane_hits[$index]}"
+  elif [ "$EVENT" = pull_request ] && [ "${lane_queue[$index]}" = true ] && [ -n "$hit" ]; then
     [ "$reader_missing" != unread ] || reader_missing="$(render_reader_missing "$queue_reader")"
     if [ -n "$reader_missing" ]; then
       lane_values[$index]=true lane_causes[$index]="cause=queue-reader-absent tree=$reader_missing $hit"
@@ -437,6 +429,8 @@ while [ "$index" -lt "$lane_count" ]; do
     else
       lane_values[$index]=false lane_causes[$index]="cause=queue-deferred $hit"
     fi
+  elif [ "$class" = render ]; then
+    lane_values[$index]=true lane_causes[$index]="cause=render-claim $hit"
   elif [ "$no_changed_paths" = true ]; then
     lane_values[$index]=true lane_causes[$index]="cause=no-changed-paths"
   elif [ "${lane_nightly[$index]}" = true ]; then
