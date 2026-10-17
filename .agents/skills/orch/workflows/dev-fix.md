@@ -197,7 +197,7 @@ Before stamping or delegating the round, check its base:
    git -C "[WORKTREE_PATH]" log -1 --oneline
    ```
 
-   A `ci` receipt accepts the local edits on the current commit. Required CI remains pending until the combined push and submit's existing § 5 wait. Acceptance starts no wait on the unpublished head.
+   A `ci` receipt accepts the local edits on the current commit. Required CI remains pending until the published head's run proves it: the merge-group run where the record names `ci-event=merge_group`, as every queue-only change's does, and the pull-request run otherwise, which submit's § 5 wait reads. A red queue run returns the change to its lane under [merge-pr.md § 5](merge-pr.md#5-execute-the-merge) Recovery cycle. Acceptance starts no wait on the unpublished head.
 
    `B = pass` when the worktree is clean and the reported fix commit resolves in the log — or when the round applied nothing and made no commit.
 
