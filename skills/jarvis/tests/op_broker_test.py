@@ -1,8 +1,12 @@
 """Surface: op-broker and opq, approved session, private FIFOs and protected outputs."""
+import base64
+from contextlib import redirect_stderr
+import io
 import json
 import os
 from pathlib import Path
 import select
+import shutil
 import signal
 import stat
 import subprocess
@@ -12,24 +16,48 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from desktop_world import SCRIPTS, World, load, run_case
 
-
-class Broker(World):
-    def start(self, body=None):
-        self.executable("op", body or """import os,sys,json
-with open(os.environ['HOME']+'/calls','a') as f:
+# Records each call. Sign-in needs a terminal, as op's does. Record verbs print
+# their arguments and exit 2 when asked. A call fails when HOME/expired existed
+# as it started, so a whoami acknowledged before the file appears still renews.
+# HOME/ack, when present, takes one byte per whoami.
+OP = """import os,sys,json
+home=os.environ['HOME']
+expired=os.path.exists(home+'/expired')
+with open(home+'/calls','a') as f:
     f.write(json.dumps({'verb':sys.argv[1], 'session':os.environ.get('OP_SESSION'), 'biometric':os.environ.get('OP_BIOMETRIC_UNLOCK_ENABLED'), 'account':os.environ.get('OP_ACCOUNT')})+'\\n')
-if sys.argv[1]=='signin': print('fixture-session')
+if sys.argv[1]=='whoami' and os.path.exists(home+'/ack'):
+    with open(home+'/ack','wb',buffering=0) as f: f.write(b'W')
+if expired: sys.exit(1)
+if sys.argv[1]=='signin' and not os.isatty(0): sys.exit(1)
+elif sys.argv[1]=='signin': print('fixture-session')
 elif sys.argv[1]=='read':
     reference=sys.argv[-1]
     if reference.endswith('/fail'): sys.exit(1)
     value=b'fixture-value\\n' if reference.endswith('/newline') else b'fixture-value'
     sys.stdout.buffer.write(value)
     if '--no-newline' not in sys.argv: sys.stdout.buffer.write(b'\\n')
-""")
+elif sys.argv[1]!='whoami':
+    print(' '.join(sys.argv[1:]))
+    sys.exit(2 if 'exit-two' in sys.argv else 0)
+"""
+
+
+class Broker(World):
+    def start(self, body=None, args=None, terminal=True):
+        self.executable("op", body or OP)
         self.directory = self.root / "broker"
-        process = subprocess.Popen([sys.executable, "-B", str(SCRIPTS / "op-broker"),
-            "--directory", str(self.directory), "--account", "fixture-account"],
-            env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if args is None:
+            args = ["--directory", str(self.directory), "--account", "fixture-account"]
+        # Only a broker whose stdin is a terminal may start an interactive sign-in.
+        if terminal:
+            controller, stdin = os.openpty()
+            self.addCleanup(os.close, controller)
+        else:
+            stdin = subprocess.DEVNULL
+        process = subprocess.Popen([sys.executable, "-B", str(SCRIPTS / "op-broker"), *args],
+            env=self.env, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if terminal:
+            os.close(stdin)
 
         def stop():
             if process.poll() is None:
@@ -77,7 +105,7 @@ elif sys.argv[1]=='read':
             self.assertEqual(call["session"], "fixture-session")
             self.assertEqual(call["biometric"], "false")
             self.assertEqual(call["account"], "fixture-account")
-        self.assertEqual(sorted(path.name for path in self.directory.iterdir()), ["requests"])
+        self.assertEqual(sorted(path.name for path in self.directory.iterdir()), ["lock", "requests"])
         self.assertEqual(stat.S_IMODE(self.directory.stat().st_mode), 0o700)
         process.terminate()
         _, stderr = process.communicate(timeout=10)
@@ -123,7 +151,7 @@ elif sys.argv[1]=='read':
                     self.assertEqual(stdout, b"")
                     self.assertEqual(stderr.splitlines()[0], b"op-client: request=cancelled")
                     self.assertFalse(output.exists())
-                    self.assertEqual(sorted(p.name for p in self.directory.iterdir()), ["requests"])
+                    self.assertEqual(sorted(p.name for p in self.directory.iterdir()), ["lock", "requests"])
                     os.write(release, b"R")
                     result = self.run_tool("opq", "--directory", self.directory, "read",
                                            "op://fixture/item/password", "--output", self.root / "normal")
@@ -179,9 +207,6 @@ elif sys.argv[1]=='read':
 
     def test_read_failure_and_existing_output(self):
         self.start()
-        duplicate = self.run_tool("op-broker", "--directory", self.directory)
-        self.assertEqual(duplicate.returncode, 2)
-        self.assertEqual([call["verb"] for call in self.calls()], ["signin", "whoami"])
         output = self.root / "secret"
         output.write_bytes(b"existing")
         result = self.run_tool("opq", "--directory", self.directory, "read", "op://fixture/item/password", "--output", output)
@@ -191,7 +216,7 @@ elif sys.argv[1]=='read':
         result = self.run_tool("opq", "--directory", self.directory, "read", "op://fixture/item/fail", "--output", output)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(output.exists())
-        self.assertEqual(sorted(path.name for path in self.directory.iterdir()), ["requests"])
+        self.assertEqual(sorted(path.name for path in self.directory.iterdir()), ["lock", "requests"])
 
     def test_private_transport(self):
         module = load("lib/op_fifo.py")
@@ -256,11 +281,25 @@ elif sys.argv[1]=='read':
         reply = "0" * 32 + ".reply"
         os.mkfifo(directory / reply, 0o600)
         stream = module.open_fifo(fd, reply, os.O_RDWR)
+        script = self.script("private-script")
         try:
-            for verb, reference in (("write", "op://fixture/item/password"), ("read", "https://example.org")):
-                with self.subTest(verb=verb, reference=reference):
-                    module.answer(fd, json.dumps({"reply": reply, "verb": verb, "reference": reference}).encode(), str(op), {})
+            # The unknown verb carries every field a known verb would accept. Linux is
+            # patched in so the shape checks behind macOS's platform refusal run everywhere.
+            for request in ({"verb": "write", "reference": "op://fixture/item/password", "args": ["whoami"], "path": str(script)},
+                            {"verb": "read", "reference": "https://example.org"},
+                            {"verb": "op", "args": []}, {"verb": "op", "args": "whoami"}, {"verb": "op", "args": ["whoami", 1]},
+                            {"verb": "script", "path": "relative-script"}):
+                with self.subTest(request=request), patch.object(module, "sys", SimpleNamespace(platform="linux")):
+                    module.answer(fd, json.dumps(dict(request, reply=reply)).encode(), str(op), {})
                     self.assertEqual(module.receive(stream, module.time.monotonic() + 5)["status"], "invalid-request")
+            self.assertFalse((self.root / "ran").exists())
+            # A request that bypasses opq meets the broker's own platform rule.
+            with patch.object(module, "sys", SimpleNamespace(platform="darwin")):
+                for request in ({"verb": "op", "args": ["whoami"]}, {"verb": "script", "path": str(script)}):
+                    with self.subTest(platform="darwin", verb=request["verb"]):
+                        module.answer(fd, json.dumps(dict(request, reply=reply)).encode(), str(op), {})
+                        self.assertEqual(module.receive(stream, module.time.monotonic() + 5)["status"], "platform-unsupported")
+            self.assertFalse((self.root / "ran").exists())
             outside = self.root / "outside"
             os.mkfifo(outside, 0o600)
             outside_fd = os.open(outside, os.O_RDWR | os.O_NONBLOCK)
@@ -272,6 +311,288 @@ elif sys.argv[1]=='read':
         finally:
             os.close(stream)
             os.close(fd)
+
+    def script(self, name, body="", mode=0o700):
+        # Every script marks HOME/ran, so a refusal shows that nothing ran.
+        path = self.root / name
+        path.write_text("#!/bin/sh\n: > \"$HOME/ran\"\n" + body)
+        path.chmod(mode)
+        return path
+
+    def opq(self, *words, output, directory=True):
+        location = ("--directory", self.directory) if directory else ()
+        return self.run_tool("opq", *location, "--output", output, *words)
+
+    def record(self, result, output):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+        content = json.loads(output.read_bytes())
+        output.unlink()
+        return content["exit"], base64.b64decode(content["stdout"])
+
+    def refused(self, result, output, key):
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stderr.splitlines()[0], key)
+        self.assertFalse(output.exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "op requests are Linux only")
+    def test_op_request_record(self):
+        self.start()
+        output = self.root / "record"
+        for words, status in ((["vault", "list"], 0), (["item", "get", "Fixture Item", "--fields", "password", "--reveal"], 0),
+                              (["item", "edit", "fixture", "exit-two"], 2)):
+            with self.subTest(words=words):
+                self.assertEqual(self.record(self.opq("op", "--", *words, output=output), output),
+                                 (status, (" ".join(words) + "\n").encode()))
+        calls = self.calls()
+        self.assertEqual([call["verb"] for call in calls], ["signin", "whoami", "vault", "item", "item"])
+        for call in calls[1:]:
+            self.assertEqual((call["session"], call["biometric"], call["account"]), ("fixture-session", "false", "fixture-account"))
+        output.write_bytes(b"existing")
+        self.assertEqual(self.opq("op", "--", "vault", "list", output=output).returncode, 2)
+        self.assertEqual(output.read_bytes(), b"existing")
+        output.unlink()
+        try:
+            oversized = self.opq("op", "--", "item", "create", "x" * 5000, output=output)
+        except subprocess.TimeoutExpired:
+            self.fail("an oversized request reached the broker")
+        self.refused(oversized, output, b"op-client: request=too-large")
+        self.assertEqual(len(self.calls()), 5)
+
+    @unittest.skipUnless(sys.platform == "linux", "@SCRIPT requests are Linux only")
+    def test_script_request(self):
+        self.start()
+        output = self.root / "record"
+        script = self.script("private-script", 'printf "%s %s" "$OP_SESSION" "$OP_ACCOUNT"\nexit 3\n')
+        self.assertEqual(self.record(self.opq("@" + str(script), output=output), output), (3, b"fixture-session fixture-account"))
+        (self.root / "ran").unlink()
+        link = self.root / "link-script"
+        link.symlink_to(script)
+        forms = [(self.script(oct(mode) + "-script", mode=mode), oct(mode)) for mode in (0o755, 0o750, 0o600)]
+        for path, form, key in [*((path, form, b"op-client: script=private-owner-required") for path, form in forms),
+                                (link, "symlink", b"op-client: script=private-owner-required"),
+                                (self.root / "missing-script", "missing", b"op-client: script=not-found")]:
+            with self.subTest(form=form):
+                self.refused(self.opq("@" + str(path), output=output), output, key)
+                self.assertFalse((self.root / "ran").exists())
+        self.refused(self.opq("@relative-script", output=output), output, b"op-client: path=absolute-required")
+
+    @unittest.skipUnless(sys.platform == "linux", "the no-argument broker is Linux only")
+    def test_service_form(self):
+        self.env.update(JARVIS_OP_DIRECTORY=str(self.root / "broker"), OP_ACCOUNT="service-account", OP_SESSION="service-session")
+        output = self.root / "record"
+        for run in ("first", "restarted"):
+            with self.subTest(run=run):
+                process = self.start(args=[], terminal=False)
+                for words in (["vault", "list"], ["item", "get", run]):
+                    self.assertEqual(self.record(self.opq("op", "--", *words, output=output, directory=False), output)[0], 0)
+                process.kill()
+                process.communicate(timeout=10)
+        self.assertEqual(sorted(path.name for path in self.directory.iterdir()), ["lock", "requests"])
+        calls = self.calls()
+        self.assertEqual([call["verb"] for call in calls], ["whoami", "vault", "item"] * 2)
+        self.assertTrue(all((call["session"], call["account"]) == ("service-session", "service-account") for call in calls))
+        for missing, key in (("OP_SESSION", b"op-broker: session=OP_SESSION-required"),
+                             ("JARVIS_OP_DIRECTORY", b"op-broker: setting=JARVIS_OP_DIRECTORY")):
+            with self.subTest(missing=missing):
+                env = {name: value for name, value in self.env.items() if name != missing}
+                result = subprocess.run([sys.executable, "-B", str(SCRIPTS / "op-broker")], env=env,
+                                        stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stderr.splitlines()[0], key)
+        self.assertEqual(len(self.calls()), 6)
+
+    @unittest.skipUnless(sys.platform == "linux", "a reused directory is Linux only")
+    def test_directory_states(self):
+        self.executable("op", OP)
+        self.env["OP_SESSION"] = "fixture-session"
+        directory = self.root / "broker"
+        reply = "0" * 32 + ".reply"
+
+        def existing(entries, mode=0o700):
+            def prepare():
+                directory.mkdir()
+                directory.chmod(mode)
+                for name, kind in entries.items():
+                    if kind == stat.S_IFIFO:
+                        os.mkfifo(directory / name, 0o600)
+                    else:
+                        (directory / name).write_text("keep")
+                        (directory / name).chmod(0o600)
+            return prepare
+
+        def snapshot():
+            if not directory.exists():
+                return None
+            return {path.name: (stat.S_IFMT(path.lstat().st_mode), path.read_text() if path.is_file() else None)
+                    for path in directory.iterdir()}
+
+        def running():
+            return self.start(args=["--directory", str(directory)], terminal=False)
+
+        def refusal():
+            process = subprocess.Popen([sys.executable, "-B", str(SCRIPTS / "op-broker"), "--directory", str(directory)],
+                                       env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                _, stderr = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=10)
+                self.fail("the broker served a directory it must refuse")
+            return process.returncode, stderr
+
+        # Every state the broker's directory can be in when a broker starts over it. A
+        # refusal leaves every entry as it was and makes no op call.
+        rows = (
+            ("absent", lambda: None, None, None),
+            ("leftover", existing({"lock": stat.S_IFREG, "requests": stat.S_IFIFO, reply: stat.S_IFIFO}), None,
+             {reply: (stat.S_IFIFO, None)}),
+            ("foreign-entry", existing({"lock": stat.S_IFREG, "notes": stat.S_IFREG}), b"op-broker: directory=foreign", None),
+            ("foreign-requests", existing({"requests": stat.S_IFREG}), b"op-broker: directory=foreign", None),
+            ("foreign-reply", existing({reply: stat.S_IFREG}), b"op-broker: directory=foreign", None),
+            ("public", existing({}, mode=0o755), b"op-broker: directory=private-owner-required", None),
+            ("busy", running, b"op-broker: directory=busy", None),
+        )
+        for state, prepare, key, after in rows:
+            with self.subTest(state=state):
+                held = prepare()
+                try:
+                    before, calls = snapshot(), len(self.calls()) if self.log.exists() else 0
+                    if key is None:
+                        process = running()
+                        process.terminate()
+                        _, stderr = process.communicate(timeout=10)
+                        self.assertEqual(process.returncode, 0, stderr)
+                        self.assertEqual(snapshot(), after)
+                    else:
+                        status, stderr = refusal()
+                        self.assertEqual(status, 2, stderr)
+                        self.assertEqual(stderr.splitlines()[0], key)
+                        self.assertEqual(snapshot(), before)
+                        self.assertEqual(len(self.calls()) if self.log.exists() else 0, calls)
+                finally:
+                    if held is not None:
+                        held.terminate()
+                        held.communicate(timeout=10)
+                    if directory.exists():
+                        directory.chmod(0o700)
+                        shutil.rmtree(directory)
+
+    def test_broker_platform(self):
+        module = load("lib/op_fifo.py")
+        configured, reused = self.root / "broker", self.root / "existing"
+        reused.mkdir(mode=0o700)
+        # Each condition that makes a broker Linux only, met on macOS: nothing is created and no session starts.
+        for form, argv, env, key in (("configured-directory", ["op-broker"], {"JARVIS_OP_DIRECTORY": str(configured)},
+                                      "platform=unsupported"),
+                                     ("reused-directory", ["op-broker", "--directory", str(reused)], {}, "directory=exists")):
+            with self.subTest(form=form):
+                with patch.object(module, "sys", SimpleNamespace(platform="darwin")), \
+                     patch.object(sys, "argv", argv), patch.dict(os.environ, env), \
+                     patch.object(module.shutil, "which", return_value=str(self.root / "op")), \
+                     patch.object(module, "session", side_effect=module.Refusal("session=reached")), \
+                     redirect_stderr(io.StringIO()) as stderr:
+                    with self.assertRaises(SystemExit) as refused:
+                        module.main("broker")
+                self.assertEqual((refused.exception.code, stderr.getvalue().splitlines()[0]), (2, "op-broker: " + key))
+                self.assertFalse(configured.exists())
+                self.assertEqual(list(reused.iterdir()), [])
+
+    def test_keep_session(self):
+        module = load("lib/op_fifo.py")
+        # Every way op whoami can end, and the line the broker's journal carries for it.
+        rows = (("renewed", subprocess.CompletedProcess([], 0, b""), ""),
+                ("unreachable", subprocess.CompletedProcess([], 1, b""), "op-broker: keepalive=failed exit=1\n"),
+                ("not-run", FileNotFoundError("op"), "op-broker: keepalive=failed\n"),
+                ("deadline", subprocess.TimeoutExpired(["op", "whoami"], 30), "op-broker: keepalive=failed\n"))
+        for state, outcome, diagnostic in rows:
+            with self.subTest(state=state):
+                effect = outcome if isinstance(outcome, BaseException) else (lambda *_: outcome)
+                with patch.object(module, "call_op", side_effect=effect) as call, redirect_stderr(io.StringIO()) as stderr:
+                    module.keep_session("op", {})
+                self.assertEqual(stderr.getvalue(), diagnostic)
+                call.assert_called_once_with(["op", "whoami"], {})
+
+    @unittest.skipUnless(sys.platform == "linux", "op requests are Linux only")
+    def test_keepalive(self):
+        # A timer test: it waits real keepalive intervals of one second.
+        ack_path = self.root / "ack"
+        os.mkfifo(ack_path, 0o600)
+        ack = os.open(ack_path, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, ack)
+
+        def whoami(seconds):
+            return bool(select.select([ack], [], [], seconds)[0]) and os.read(ack, 1) == b"W"
+
+        self.env["OP_SESSION"] = "fixture-session"
+        output = self.root / "record"
+        # Without the setting, a broker never renews, even after a successful call.
+        process = self.start(terminal=False)
+        self.assertTrue(whoami(5), "startup whoami")
+        self.assertEqual(self.record(self.opq("op", "--", "vault", "list", output=output), output)[0], 0)
+        self.assertFalse(whoami(2.5), "keepalive ran without JARVIS_OP_KEEPALIVE_SECS")
+        process.terminate()
+        _, stderr = process.communicate(timeout=10)
+        self.assertEqual((process.returncode, stderr), (0, b""))
+        self.env["JARVIS_OP_KEEPALIVE_SECS"] = "1"
+        process = self.start(terminal=False)
+        self.assertTrue(whoami(5), "startup whoami")
+        self.assertFalse(whoami(2.5), "keepalive ran before a successful call")
+        self.assertEqual(self.record(self.opq("op", "--", "vault", "list", output=output), output)[0], 0)
+        self.assertTrue(whoami(10), "keepalive did not renew the idle session")
+        # A failed renewal, then a failed call, leave the keepalive armed until op answers again.
+        (self.root / "expired").touch()
+        failed = b"op-broker: keepalive=failed exit=1\n"
+        self.assertTrue(select.select([process.stderr], [], [], 10)[0], "keepalive did not meet the failure")
+        self.assertEqual(process.stderr.readline(), failed)
+        self.assertEqual(self.record(self.opq("op", "--", "vault", "list", output=output), output)[0], 1)
+        self.assertTrue(select.select([process.stderr], [], [], 10)[0], "keepalive stopped after a failed renewal")
+        self.assertEqual(process.stderr.readline(), failed)
+        # That whoami has exited, and the next starts one interval later, after the failure ends.
+        try:
+            os.read(ack, 4096)
+        except BlockingIOError:
+            pass
+        (self.root / "expired").unlink()
+        self.assertTrue(whoami(10), "keepalive did not renew after the failure ended")
+        self.assertTrue(whoami(10), "keepalive did not continue after the failure ended")
+        self.assertIsNone(process.poll())
+        process.terminate()
+        _, stderr = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(stderr, b"")
+
+    @unittest.skipUnless(sys.platform == "linux", "caller work runs on Linux only")
+    def test_work_process_group(self):
+        module = load("lib/op_fifo.py")
+        # The descendant holds the work's stdout and this test's pipe, and sleeps past the deadline.
+        work = self.executable("work", "import subprocess,sys,time\n"
+            "subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],pass_fds=(int(sys.argv[1]),))\n"
+            "sys.stdout.write('out'); sys.stdout.flush()\n"
+            "if sys.argv[2]=='stay': time.sleep(60)\n"
+            "sys.exit(3)\n")
+        for mode, deadline, expected in (("exit", 10, (3, b"out")), ("stay", 0.5, None)):
+            with self.subTest(mode=mode):
+                held, holder = os.pipe()
+                try:
+                    argv = [str(work), str(holder), mode]
+                    with patch.object(module, "CALL_SECONDS", deadline):
+                        if expected is None:
+                            with self.assertRaises(subprocess.TimeoutExpired):
+                                module.run_work(argv, self.env, (holder,))
+                        else:
+                            result = module.run_work(argv, self.env, (holder,))
+                            self.assertEqual((result.returncode, result.stdout), expected)
+                    os.close(holder)
+                    holder = None
+                    # End of file proves every process holding the pipe has ended.
+                    self.assertTrue(select.select([held], [], [], 5)[0], "a descendant outlived the work")
+                    self.assertEqual(os.read(held, 1), b"")
+                finally:
+                    os.close(held)
+                    if holder is not None:
+                        os.close(holder)
 
 
 def deadline_worker():
