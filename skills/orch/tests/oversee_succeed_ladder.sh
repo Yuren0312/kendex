@@ -190,6 +190,9 @@ launched() {
 }
 caller_open() { if [[ "$(tm list-windows -t fleet -F '#{window_id}')" == *"$CALLER_WINDOW"* ]]; then echo yes; else echo no; fi; }
 first_key() { sed -n 1p <<<"$OUT" | awk '{print $2}'; }
+# walked_key — first_key with kendex's model-resolution warning passed over:
+# it precedes a refusal that comes after the walk classified a model.
+walked_key() { sed -n '/^model-resolution: /!{p;q;}' <<<"$OUT" | awk '{print $2}'; }
 # keyed KEY — the first line OUT carries under KEY, or `none`.
 keyed() { grep -m1 "^oversee-succeed: $1 " <<<"$OUT" || echo none; }
 
@@ -211,7 +214,7 @@ assert_eq "$RC|$(caller_open)|$(launched claude)|$(launched codex)|$(grep -cx -e
   "a Fable-walled seat with Opus room is chosen for the default ladder's Opus entry, at high effort"
 DEFAULTCTL="$(mutant_scripts defaultctl lib/overseer-launch.sh)" || exit 1
 mutate_file "$DEFAULTCTL/lib/overseer-launch.sh" \
-  'OL_DEFAULT_PREFERENCE="claude:opus:high,codex::high"' 'OL_DEFAULT_PREFERENCE="claude:sonnet:high,codex::high"'
+  'OL_DEFAULT_PREFERENCE="claude:standard:high,codex:standard:high"' 'OL_DEFAULT_PREFERENCE="claude:light:high,codex:standard:high"'
 new_caller
 SUCCEED_BIN="$DEFAULTCTL/oversee-succeed" run_succeed defaultctl unset
 assert_eq "$RC|$(caller_open)|$(launched claude)" "0|no|$H/.eclaude sonnet" \
@@ -256,7 +259,7 @@ mutate_file "$EXCLUDECTL/oversee-succeed" '  [[ "$MODE" != walled ]] || exclude=
 new_caller
 SUCCEED_BIN="$EXCLUDECTL/oversee-succeed" run_succeed excludectl unset --walled-pane "$CALLER_PANE"
 assert_eq "$RC|$(keyed successor-lane-spent | awk '{print $2, $4}')|$(caller_open)|$(launched claude)" \
-  "3|successor-lane-spent entry=claude:opus:high|yes|none" \
+  "3|successor-lane-spent entry=claude:standard:high|yes|none" \
   "control: a walled pick that keeps the walled account drops the Opus entry"
 seat claude 10 99 99
 
@@ -317,8 +320,8 @@ assert_eq "$RC|$(launched claude)" \
   "0|$H/.eclaude opus" \
   "the same fleet with no claim takes the first seat"
 
-# Every claude seat walled for every model: the default reaches codex on
-# its native default, the second entry.
+# Every claude seat walled for every model: the default reaches codex's
+# standard class, the second entry, which runs codex's native default.
 seat eclaude 99 99 10
 seat fclaude 99 99 10
 codex_seat codex 20
@@ -326,7 +329,7 @@ new_caller
 run_succeed codex unset
 assert_eq "$RC|$(caller_open)|$(launched claude)|$(launched codex | awk '{print $2}')|$(grep -cx 'model_reasoning_effort=high' "$TMP_ROOT/argv.codex")" \
   "0|no|none||1" \
-  "every claude entry walled: the default reaches codex on its native default"
+  "every claude entry walled: the default reaches codex's standard class on its native default"
 
 # The setting is the one list of models: a codex model no tier ladder and no
 # script names launches as the setting writes it.
@@ -392,14 +395,18 @@ cp "$FIXTURE_DIR/.1copilot.json" "$FIXTURE_DIR/.2copilot.json"
 seat eclaude 10 10 10
 codex_seat codex 99
 codex_seat dcodex 20
+# The conversion never advises a claude exact id, which warns on the next
+# run, nor a class the session's model has none of: it names that model and
+# no replacement, while the launch keeps it and the record carries no class.
+# A codex, copilot or pi model is a supported form, which it advises.
 for row in \
-  'claude|observed|claude-fable-5-1|CLAUDE_CONFIG_DIR|eclaude|--effort|high|2' \
-  'codex|observed|gpt-5.6-sol|CODEX_HOME|dcodex|model_reasoning_effort=high|model_reasoning_effort=high|1' \
-  'claude|flags|claude-fable-5-1|CLAUDE_CONFIG_DIR|eclaude|--effort|high|2' \
-  'codex|flags|gpt-5.6-sol|CODEX_HOME|dcodex|model_reasoning_effort=high|model_reasoning_effort=high|1' \
-  'copilot|flags|gpt-5.3-codex|COPILOT_HOME|2copilot|--reasoning-effort|high|2' \
-  'pi|flags|pi-claude/claude-fable-5-1|CLAUDE_CONFIG_DIR|eclaude|--thinking|high|2'; do
-  IFS='|' read -r harness source model var successor effort_word effort_value effort_count <<<"$row"
+  'claude|observed|claude-fable-5-1|CLAUDE_CONFIG_DIR|eclaude|--effort|high|2|model=claude-fable-5-1' \
+  'codex|observed|gpt-5.6-sol|CODEX_HOME|dcodex|model_reasoning_effort=high|model_reasoning_effort=high|1|replacement=codex:gpt-5.6-sol:high' \
+  'claude|flags|claude-fable-5-1|CLAUDE_CONFIG_DIR|eclaude|--effort|high|2|model=claude-fable-5-1' \
+  'codex|flags|gpt-5.6-sol|CODEX_HOME|dcodex|model_reasoning_effort=high|model_reasoning_effort=high|1|replacement=codex:gpt-5.6-sol:high' \
+  'copilot|flags|gpt-5.3-codex|COPILOT_HOME|2copilot|--reasoning-effort|high|2|replacement=copilot:gpt-5.3-codex:high' \
+  'pi|flags|pi-claude/claude-fable-5-1|CLAUDE_CONFIG_DIR|eclaude|--thinking|high|2|replacement=pi:pi-claude/claude-fable-5-1:high'; do
+  IFS='|' read -r harness source model var successor effort_word effort_value effort_count conversion <<<"$row"
   permission=""
   [[ "$harness" == pi ]] || permission="$(launch_choice_permission_write "$harness")" || exit 1
   if [[ "$source" == observed ]]; then
@@ -436,8 +443,8 @@ for row in \
     [[ -n "$CODEX_LAUNCH_HOME" && "$CODEX_LAUNCH_HOME" != *$'\n'* ]] || { echo 'fixture: codex-home=not-single' >&2; exit 1; }
     launch_home="$CODEX_LAUNCH_HOME"
   fi
-  assert_eq "$RC|$(caller_open)|$(launched "$harness")|$(grep -cx -e "$effort_word" -e "$effort_value" "$TMP_ROOT/argv.$harness")|$(grep '^preference-deprecated ' <<<"$OUT")" \
-    "0|no|$launch_home $model|$effort_count|preference-deprecated entry=$harness:1:high form=harness:model:effort" \
+  assert_eq "$RC|$(caller_open)|$(launched "$harness")|$(grep -cx -e "$effort_word" -e "$effort_value" "$TMP_ROOT/argv.$harness")|$(grep '^preference-deprecated ' <<<"$OUT")|$(sed -n -e 's/^preference-deprecated-conversion .* replacement=\([^ ]*\).*/replacement=\1/p' -e 's/^preference-deprecated-conversion .* model=\([^ ]*\).*/model=\1/p' <<<"$OUT")|$(jq -r '.overseer.class // "none"' "$TMP_ROOT/work/tmp/workflow-state-oversee.json")" \
+    "0|no|$launch_home $model|$effort_count|preference-deprecated entry=$harness:1:high form=harness:model:effort|$conversion|none" \
     "numeric $harness preference keeps the $source model and supplied effort" "$TMP_ROOT/out"
 done
 # Normalizing the observed Codex model for account measurement must not erase
@@ -477,7 +484,7 @@ new_caller codex
 CALLER_FLAGS=(-m gpt-5.6-sol -c model_reasoning_effort=high -a never)
 CALLER_LANE="CODEX_HOME=$H/.codex" run_succeed codexcaller unset
 assert_eq "$RC|$(keyed entry-permission-untransferable)|$(launched claude)|$(launched codex | sed "s|^$H/.dcodex[^ ]* |dcodex |")|$(grep -cx never "$TMP_ROOT/argv.codex")" \
-  "0|oversee-succeed: entry-permission-untransferable entry=claude:opus:high source=codex target=claude|none|dcodex |1" \
+  "0|oversee-succeed: entry-permission-untransferable entry=claude:standard:high source=codex target=claude|none|dcodex |1" \
   "a codex caller whose permission words cannot cross skips the claude entries and succeeds on codex"
 # Its control: a walk that chooses the claude entry anyway refuses after it,
 # launching nothing.
@@ -485,7 +492,7 @@ SKIPCTL="$(mutant_scripts skipctl lib/overseer-launch.sh)" || exit 1
 mutate_file "$SKIPCTL/lib/overseer-launch.sh" '      ol_entry_permitted "$permitted_entry" || continue' '      : ol_entry_permitted "$permitted_entry" || continue'
 new_caller codex
 CALLER_LANE="CODEX_HOME=$H/.codex" SUCCEED_BIN="$SKIPCTL/oversee-succeed" run_succeed skipctl unset
-assert_eq "$RC|$(first_key)|$(launched claude)|$(launched codex)" \
+assert_eq "$RC|$(walked_key)|$(launched claude)|$(launched codex)" \
   "1|launch-choice-failed|none|none" \
   "control: a walk that chooses the untransferable entry refuses and launches nothing"
 CALLER_FLAGS=("$BYPASS")
@@ -578,8 +585,8 @@ for row in 'empty|0|none' 'caller|3|model' 'restricted|3|permission'; do
 done
 TARGETCTL="$(mutant_scripts targetctl lib/overseer-launch.sh)" || exit 1
 mutate_file "$TARGETCTL/lib/overseer-launch.sh" \
-  '          permitted_entry="$OL_ENTRY_HARNESS:$OL_ENTRY_MODEL:$OL_ENTRY_EFFORT"' \
-  '          : permitted_entry="$OL_ENTRY_HARNESS:$OL_ENTRY_MODEL:$OL_ENTRY_EFFORT"'
+  '        permitted_entry="$OL_ENTRY_HARNESS:$OL_ENTRY_MODEL:$OL_ENTRY_EFFORT"' \
+  '        : permitted_entry="$OL_ENTRY_HARNESS:$OL_ENTRY_MODEL:$OL_ENTRY_EFFORT"'
 copilot_ladder targetctl walled "$TARGETCTL/oversee-succeed" empty 'claude:1:high'
 assert_eq "$RC|$(launched claude)" "3|none" \
   "control: treating the target default as caller-derived loses the available Claude successor"

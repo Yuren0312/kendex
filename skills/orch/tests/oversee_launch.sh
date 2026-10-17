@@ -298,10 +298,12 @@ case "$1" in
     printf '\n' >&2
     ;;
   hooks-off) printf '{"switched_off_by":null}\n' ;;
+  tier-model) exec "$0-tier-model" "$@" ;;
   *) exit 2 ;;
 esac
 STUB
 chmod +x "$BIN/kendex"
+ln -s "$TEST_DIR/fixtures/tier-model/kendex" "$BIN/kendex-tier-model"
 # Repository lookup belongs to the fixture. With no answer, the existing
 # directory fallback case remains independent of credentials and network.
 cat > "$BIN/gh" <<'STUB'
@@ -359,6 +361,9 @@ run_oversee() {
 FLEET_STATE="$TMP_ROOT/work/tmp/workflow-state-oversee.json"
 recorded() { jq -r ".overseer.$1 // \"none\"" "$FLEET_STATE" 2>/dev/null || echo unreadable; }
 keyed() { awk -v k="oversee: $1" 'index($0, k) == 1 { found = 1 } found' <<<"$2"; }
+# first_line — OUT's first line, kendex's model-resolution warning passed
+# over: it precedes a refusal that comes after the walk classified a model.
+first_line() { sed -n '/^model-resolution: /!{p;q;}' <<<"$OUT"; }
 field() { sed -n "s/.* $2=\([^ ]*\).*/\1/p" <<<"$(sed -n 1p <<<"$1")"; }
 layout() { tm list-windows -t fleet -F '#{window_id} #{window_index} #{window_name}' | awk -v keep="$KEEP_WINDOW" '$1 != keep { print $2, $3 }' | tr '\n' ';'; }
 overseers() { tm list-windows -t fleet -F '#{window_name}' | awk '$0 == "overseer"' | wc -l | tr -d ' '; }
@@ -494,11 +499,28 @@ for row in \
     "1|oversee: $row_want|0" \
     "$row_what: refused, nothing opened"
 done
+# A model kendex cannot classify refuses before anything opens, kendex's
+# words after the keyed line.
+mv -- "${BIN:?}/kendex-tier-model" "$BIN/kendex-tier-model.real"
+printf '#!/bin/sh\necho "Error: invalid manifest" >&2\nexit 1\n' >"$BIN/kendex-tier-model"
+chmod +x "$BIN/kendex-tier-model"
+LAUNCH_PREF=claude:standard:high run_oversee -- launch --wait-secs 5
+assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(tail -n 1 <<<"$OUT")|$(overseers)" \
+  "1|oversee: preference-class-unread entry=claude:standard:high|Error: invalid manifest|0" \
+  "a model kendex cannot classify: refused with kendex's words, nothing opened"
+mv -f -- "${BIN:?}/kendex-tier-model.real" "$BIN/kendex-tier-model"
 claude_usage 95 20 5 Opus > "$FIXTURE_DIR/.claude.json"
 run_oversee -- launch --wait-secs 5
-assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)" \
-  "3|oversee: no-lane-qualifies entries=1 walled=2 unmeasured=0|0" \
-  "no lane above the trigger: refused at 3 with the walk's counts"
+# The refusal relays DEP_ERR after its keyed line; the pick's own model lines
+# never reach it.
+assert_eq "$RC|$(first_line)|$(overseers)|$(keyed no-lane-qualifies "$OUT" | grep -c -e '^model-resolution: ' -e '^preference-deprecated' -e 'class ladder' || :)" \
+  "3|oversee: no-lane-qualifies entries=1 walled=2 unmeasured=0|0|0" \
+  "no lane above the trigger: refused at 3 with the walk's counts and no kendex words beside them"
+HELDCTL="$(mutant_scripts heldctl lib/overseer-launch.sh)" || exit 1
+mutate_file "$HELDCTL/lib/overseer-launch.sh" 'export ORCH_MODEL_LINES_HELD=1' ':'
+OVERSEE_BIN="$HELDCTL/oversee" run_oversee -- launch --wait-secs 5
+assert_eq "$RC|$(keyed no-lane-qualifies "$OUT" | grep -c '^model-resolution: ' || :)" "3|1" \
+  "control: a pick run without the latch relays its kendex line under the refusal"
 # An overseer opens through overseer-host on this machine, under this machine's
 # copy of the account, so the walk reads that copy even on a fleet whose
 # provider reports the same account with room. Run from a repository of its
@@ -509,7 +531,7 @@ git -C "$HOSTED_WORK" init -q -b main
 printf 'account=%s\tharness=claude\tsession-5h-pct=5\tweekly-pct=5\tmodel-pct=5\tmodel-label=Fable 5.1\n' "$H/.claude" > "$TMP_ROOT/accounts-room.tsv"
 HOSTED_ENV=(ORCH_LANE_HOST="$TEST_DIR/fixtures/lane-host" LANE_HOST_STUB_ACCOUNTS="$TMP_ROOT/accounts-room.tsv" LANE_HOST_STUB_LOG="$TMP_ROOT/host.log")
 RUN_DIR="$HOSTED_WORK" run_oversee "${HOSTED_ENV[@]}" -- launch --wait-secs 5
-assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)" \
+assert_eq "$RC|$(first_line)|$(overseers)" \
   "3|oversee: no-lane-qualifies entries=1 walled=2 unmeasured=0|0" \
   "a provider row with room for an account this machine reads walled opens no overseer on it"
 claude_usage 60 20 5 Opus > "$FIXTURE_DIR/.claude.json"
@@ -608,13 +630,13 @@ tm kill-window -t "$(recorded window)"
 # A fleet whose settings name no preference: the first launch walks the default
 # order and opens on its standard Opus alias.
 LAUNCH_PREF=unset run_oversee -- launch --wait-secs 20
-assert_eq "$RC|$(recorded model)|$(recorded_argv)" \
-  "0|opus|lane=$H/.claude;-n;overseer;--model;opus;--effort;high;$BYPASS;$COMPACT;$QUESTION_OFF;$BRIEF;" \
-  "an unset preference launches the first overseer on the standard Opus alias"
+assert_eq "$RC|$(recorded model)|$(recorded class)|$(recorded_argv)" \
+  "0|opus|standard|lane=$H/.claude;-n;overseer;--model;opus;--effort;high;$BYPASS;$COMPACT;$QUESTION_OFF;$BRIEF;" \
+  "an unset preference launches the first overseer on the standard class, Opus, and records both"
 tm kill-window -t "$(recorded window)"
 DEFAULTCTL="$(mutant_scripts defaultctl lib/overseer-launch.sh)" || exit 1
 mutate_file "$DEFAULTCTL/lib/overseer-launch.sh" \
-  'OL_DEFAULT_PREFERENCE="claude:opus:high,codex::high"' 'OL_DEFAULT_PREFERENCE="claude:sonnet:high,codex::high"'
+  'OL_DEFAULT_PREFERENCE="claude:standard:high,codex:standard:high"' 'OL_DEFAULT_PREFERENCE="claude:light:high,codex:standard:high"'
 OVERSEE_BIN="$DEFAULTCTL/oversee" LAUNCH_PREF=unset run_oversee -- launch --wait-secs 20
 assert_eq "$RC|$(recorded model)|$(recorded_argv)" \
   "0|sonnet|lane=$H/.claude;-n;overseer;--model;sonnet;--effort;high;$BYPASS;$COMPACT;$QUESTION_OFF;$BRIEF;" \
@@ -963,7 +985,7 @@ pending_refused() { # OVERSEE_BIN
 PENDFAIL="$(mutant_scripts pendfail workflow-state)" || exit 1
 pendfail_stub "$PENDFAIL"
 pending_refused "$PENDFAIL/oversee"
-assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)|$(listed "$PRED")|$(recorded pane)|$(recorded generation)" \
+assert_eq "$RC|$(first_line)|$(overseers)|$(listed "$PRED")|$(recorded pane)|$(recorded generation)" \
   "1|oversee: record-unwritten field=overseer step=pending|1|1|$PRED|$PRED_GEN" \
   "a pending write the state refuses stops the succession, the predecessor running and recorded"
 # A session record write the state refuses refuses the launch too: the stub
@@ -1078,7 +1100,7 @@ STUB
     "a numeric $verb preference uses the default preference model under $form"
   conversion="$(grep '^preference-deprecated-conversion ' <<<"$OUT")"
   assert_eq "$(grep -c '^preference-deprecated ' <<<"$OUT")|$(field "$conversion" entry)|$(field "$conversion" replacement)|$(field "$(keyed overseer-launch "$OUT")" form)" \
-    "1|claude:1:high|claude:opus:high|$want_form" \
+    "1|claude:1:high|claude:standard:high|$want_form" \
     "the numeric $verb warning names its conversion and the launch reports $form"
   tm kill-window -t "$(recorded window)"
 done
@@ -1086,8 +1108,8 @@ rm -- "$BIN/eclaude"
 # The migration diagnostic pairs the original consumer entry with its own
 # conversion before an account or permission refusal can skip that entry.
 for row in \
-  'later-account|claude:1:high,codex:2:high|95|20|0|codex|claude:1:high|claude:opus:high|' \
-  'all-walled|claude:1:high,codex:2:high|95|99|3|none|claude:1:high|claude:opus:high|' \
+  'later-account|claude:1:high,codex:2:high|95|20|0|codex|claude:1:high|claude:standard:high|' \
+  'all-walled|claude:1:high,codex:2:high|95|99|3|none|claude:1:high|claude:standard:high|' \
   'permission-skip|pi:1:high,claude:2:high|60|99|0|claude|pi:1:high||harness-default'; do
   IFS='|' read -r case_name preference claude_used codex_used expected_rc selected original replacement native_model <<<"$row"
   claude_usage "$claude_used" 20 5 Opus > "$FIXTURE_DIR/.claude.json"

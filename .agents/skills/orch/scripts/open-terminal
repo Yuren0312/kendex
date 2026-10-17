@@ -385,6 +385,13 @@ if [[ "$WAKE" != true && -n "${ORCH_LANE_PREFERENCE:-}" \
   fi
   OL_WALK_SOURCE_HARNESS="$preference_harness" OL_WALK_SOURCE_FLAGS="${preference_input[*]+${preference_input[*]}}"
 fi
+# Every `lanes` read below prints no model line (lib/overseer-launch.sh §
+# OL_LINES_HELD). This launch prints those lines only for the entry
+# preference_select's walk picks (ol_model_line); a launch whose text names its
+# model prints none, since that model reaches the harness as written. Set
+# after the preference walk's source of that file, which reads the hold before
+# it exports it.
+export ORCH_MODEL_LINES_HELD=1
 
 # One owner chooses and rebuilds a preference launch from the original input.
 # Permission eligibility and flag translation belong to the overseer walk.
@@ -395,7 +402,9 @@ preference_select() {
   fi
   PREFERENCE_ENTRY="" PREFERENCE_LANE_ENV=""
   for preference_entry in "${OL_ENTRIES[@]}"; do
-    ol_entry_model "$preference_entry"
+    ol_entry_model "$preference_entry" || {
+      ot_message preference-class-unread "entry=$preference_entry" >&2; printf '%s\n' "$OL_CLASS_ERR" >&2; return 1;
+    }
     OL_HARNESS="$OL_ENTRY_HARNESS" OL_WALK_SKIPS=()
     if ! ol_entry_permitted "$preference_entry"; then
       ot_message entry-permission-untransferable "entry=$preference_entry" \
@@ -403,7 +412,7 @@ preference_select() {
       continue
     fi
     LANE_HOST="${OL_ENTRY_HOST:-$preference_host}"
-    LANE_HARNESS="$OL_ENTRY_HARNESS" LAUNCH_MODEL="$OL_ENTRY_MODEL"
+    LANE_HARNESS="$OL_ENTRY_HARNESS" LAUNCH_MODEL="$OL_ENTRY_MODEL" LAUNCH_CLASS="$OL_ENTRY_CLASS"
     lane_capabilities_read "$SCRIPT_DIR/lane-host" "$LANE_HOST" "${PROJECT_ROOT:-$PWD}" || {
       ot_message host-capabilities-failed "host=$LANE_HOST" >&2; return 1;
     }
@@ -430,6 +439,7 @@ preference_select() {
     esac
   done
   [[ -n "$PREFERENCE_ENTRY" ]] || { ot_message lane-unavailable "walk=$ORCH_LANE_PREFERENCE" >&2; return 1; }
+  ol_model_line "$OL_ENTRY_WARNING"
   ol_launch_flags --question-off "$OL_ENTRY_HARNESS" "$OL_ENTRY_MODEL" "$OL_ENTRY_EFFORT" \
     "$OL_ENTRY_MODEL" "$preference_harness" ${preference_input[@]+"${preference_input[@]}"} || {
     ot_message lane-resolution-failed "entry=$PREFERENCE_ENTRY" "step=$OL_REASON" >&2; return 1;
@@ -682,7 +692,7 @@ if [[ -n "$LANE" && -n "$(launch_choice_row "$LAUNCH_HARNESS")" ]]; then
   launch_choice_missing=false
   if [[ -z "$LAUNCH_MODEL" ]]; then
     ot_message launch-model-missing "harness=$LAUNCH_HARNESS" "lane=$LANE" \
-      "spellings=${LAUNCH_MODEL_SPELLINGS// /,}" >&2
+      "spellings=${LAUNCH_MODEL_SPELLINGS// /,}" ${LAUNCH_CLASS:+"class=$LAUNCH_CLASS"} >&2
     launch_choice_missing=true
   fi
   if [[ -n "$LAUNCH_EFFORT_SPELLINGS" && -z "$LAUNCH_EFFORT" ]]; then

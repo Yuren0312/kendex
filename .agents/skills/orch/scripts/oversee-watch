@@ -4111,10 +4111,13 @@ check_overseer() {
   # oversee-succeed's own keyed lines are the detail under the event, not
   # records of their own. The walled recovery's stdout carries the command it
   # built as well, so the pass output says which line it sent.
+  # The walled succession walks ORCH_OVERSEER_PREFERENCE, a walk no other
+  # process prints, so it runs without this watch's model-line hold
+  # (lib/overseer-launch.sh § OL_LINES_HELD); the dead one replays a line.
   succeed_rc=0
   if [[ "$ov_case" == walled || "$ov_case" == reserve ]]; then
     overseer_launch_args
-    "$SUCCEED" --walled-pane "$pane" "${OVERSEER_LAUNCH_ARGS[@]}" >&2 || succeed_rc=$?
+    env -u ORCH_MODEL_LINES_HELD "$SUCCEED" --walled-pane "$pane" "${OVERSEER_LAUNCH_ARGS[@]}" >&2 || succeed_rc=$?
   else
     printf '%s\n' "$OVERSEER_LINE" > "$WORK_DIR/overseer-line" \
       || { overseer_relaunch_failed "$row" "$rows" "$identity" "$pane" "$window" "$attempt" line-file "$ov_case"; return 1; }

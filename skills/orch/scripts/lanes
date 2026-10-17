@@ -470,6 +470,21 @@
 #                    on the shared windows alone; behind a host row with no
 #                    window for NAME, a local reading with no model window, or
 #                    a stale one, stays unmeasured (see pick).
+#                    On claude, codex and copilot, `kendex tier-model`
+#                    classifies NAME (lib/overseer-launch.sh §
+#                    ol_model_class): a class is judged as claude's family
+#                    alias for it, a `[1m]` suffix kept, and as no NAME on
+#                    codex and copilot, whose class runs the harness default;
+#                    kendex's warning for that answer prints once. Any other
+#                    NAME is judged as written. A claude exact id warns once
+#                    as `preference-deprecated` with `form=model-class`; a
+#                    codex or copilot exact id is a supported form and warns
+#                    nothing. Under ORCH_MODEL_LINES_HELD, which every orch
+#                    script that starts `lanes` exports to its children,
+#                    pick prints neither line. A NAME kendex cannot
+#                    classify, kendex missing or refusing the manifest,
+#                    exits 1 as `model-class-unread`, kendex's words after
+#                    it.
 #   --binding-floor  pick: hold the account's own binding bucket to the same
 #                    bound as well, so a lane is room only where BOTH clear it.
 #                    With --model the two can differ: an account whose binding
@@ -946,6 +961,11 @@ message() {
     invalid-pick-harness)
       printf 'lanes: invalid-pick-harness option=%s\n' "--harness"
       printf '%s\n' "pick --harness must be claude, codex, copilot or pi"
+      ;;
+    model-class-unread)
+      printf 'lanes: model-class-unread harness=%s model=%s\n' "$1" "$2"
+      printf '%s\n' "kendex tier-model could not classify the model, so whether it names a class is unknown and no window is judged on it. kendex is missing, or it refused this project's manifest or personal settings; its words follow. Install or repair kendex, or fix the setting they name."
+      printf '%s\n' "$3"
       ;;
     pick-provider-unmeasured)
       printf 'lanes: pick-provider-unmeasured harness=%s model=%s\n' "$1" "$2"
@@ -4455,6 +4475,15 @@ case "$SUB" in
 		;;
 	pick)
 		HARNESS="${HARNESS:-claude}"
+		# A class becomes its model before any window is matched to it.
+		model_rc=0
+		ol_model_class "$HARNESS" "$MODEL" || model_rc=$?
+		case "$model_rc" in
+			0) ol_model_line "$OL_CLASS_WARNING" ;;
+			2) ol_deprecated "harness=$HARNESS" "model=$MODEL" form=model-class ;;
+			*) die model-class-unread "$HARNESS" "$MODEL" "$OL_CLASS_ERR" ;;
+		esac
+		MODEL="$OL_CLASS_MODEL"
 		# The accounts this launch spends, which both forms judge it on: a Pi
 		# launch on a Claude seat is a claude pick in every respect.
 		PICK_HARNESS="$(lane_pick_harness "$HARNESS" "$MODEL")"
