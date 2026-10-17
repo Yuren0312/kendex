@@ -819,6 +819,7 @@ while IFS='|' read -r name trigger blockers now deadline status control merge_at
     containment|arguments) expected="${expected%deadline=*}deadline=2026-10-03T00:00:00Z blocked_by=-" ;;
     cutoff|waiting|fractional|null) expected="${expected%deadline=*}deadline=- blocked_by=-" ;;
     fired) expected="${expected%deadline=*}deadline=2026-10-05T00:00:00Z blocked_by=-" ;;
+    merge-hours) expected="${expected%deadline=*}deadline=2026-10-04T00:00:00Z blocked_by=-" ;;
     *) [[ "$blockers" != '[]' ]] && expected+=KEN-99 || expected+=- ;;
   esac
   if [[ "$trigger" == release* ]]; then expected="${expected/ blocked_by=/ merged=2026-10-01T00:00:00Z blocked_by=}"; fi
@@ -899,6 +900,7 @@ while IFS='|' read -r name trigger blockers now deadline status control merge_at
     null) mutate_verifying "$MUTANT_WATCH" '.deadline_epoch != null and ' '' ;;
     fired) mutate_verifying "$MUTANT_WATCH" '$fired + (.deadline_hours * 3600)' '$merged + 259200' ;;
     merge-clock) mutate_verifying "$MUTANT_WATCH" '.deadline_epoch <= $now' 'false' ;;
+    merge-hours) mutate_verifying "$MUTANT_WATCH" '"needs_merge":true' '"needs_merge":never' ;;
     release) mutate_verifying "$MUTANT_WATCH" 'select(.trigger_kind == "release")' 'select(.trigger_kind == "release" and ($row.blocked_by_open // [] | length) == 0)' ;;
     invalid) mutate_verifying "$MUTANT_WATCH" 'if ! boxes="$(verifying_parse "$row" 2>"$errf")"; then' 'if ! boxes="$(verifying_parse "$row" 2>"$errf")"; then die verifying-invalid "" "issue=$id"' ;;
   esac
@@ -920,6 +922,7 @@ release_unfired_late|release owner/releases v*|[]|2026-10-04T01:00:00Z|+72h|wait
 release_null_deadline|release owner/releases v*|[]|2026-10-04T01:00:00Z|+72h|waiting|null
 release_fired_72h|release owner/releases v*|[]|2026-10-04T01:00:00Z|+72h|due|fired
 merge_72h|merge|[]|2026-10-04T01:00:00Z|2026-10-04T00:00:00Z|overdue|merge-clock
+merge_relative_72h|merge|[]|2026-10-04T01:00:00Z|+72h|overdue|merge-hours
 release_blocked|release owner/releases v*|["KEN-99"]|2026-10-02T00:00:01Z|+24h|blocked|release
 release_waiting|release owner/releases v*|[]|2026-10-02T00:00:01Z|+24h|waiting|waiting
 invalid_then_due|merge|[]|2026-10-02T00:00:01Z|2026-10-03T00:00:00Z|due|invalid
@@ -1091,16 +1094,19 @@ glob|[[ "$tag" == $glob ]]|[[ "$tag" == * ]]
 draft|select(.isDraft == false)|select(true)
 ROWS
 
-# Each release-read guard has a control at its own failing input.
+# Each release-read guard has a control at its own failing input. A
+# merge-hours fixture is a merge box with +24h, which needs the merge read too.
 while IFS='@' read -r name fixture status key old new; do
-  release_world "release_guard_$name"
+  trigger='release owner/releases v*'
+  [[ "$fixture" != merge-hours ]] || trigger=merge
+  release_world "release_guard_$name" "$trigger"
   case "$fixture" in
     shape) echo '{}' >"$STUB_DIR/releases.owner_releases.json" ;;
     page) jq -n '[range(1000) | {tagName:"v1",publishedAt:"2026-10-01T12:00:00Z",isDraft:false}]' >"$STUB_DIR/releases.owner_releases.json" ;;
     time) echo '[{"tagName":"v1","publishedAt":"2026-09-31T12:00:00Z","isDraft":false}]' >"$STUB_DIR/releases.owner_releases.json" ;;
     tag) echo '[{"tagName":42,"publishedAt":"2026-10-01T12:00:00Z","isDraft":false}]' >"$STUB_DIR/releases.owner_releases.json" ;;
     draft) echo '[{"tagName":"v1","publishedAt":"2026-10-01T12:00:00Z"}]' >"$STUB_DIR/releases.owner_releases.json" ;;
-    merge) echo '[]' >"$STUB_DIR/merged.json" ;;
+    merge|merge-hours) echo '[]' >"$STUB_DIR/merged.json" ;;
   esac
   MUTANT_DIR="$TMP_ROOT/release-guard-$name"
   MUTANT_WATCH="$(mutant_scripts "release-guard-$name/orch" oversee-watch)/oversee-watch" || exit 1
@@ -1121,7 +1127,8 @@ page@page@due@verifying-release-unread@or length >= $limit@or false
 time@time@due@verifying-release-unread@todateiso8601 == $stamp@true
 draft@draft@waiting@verifying-release-unread@(.isDraft | type) != "boolean"@false
 tag@tag@waiting@verifying-release-unread@(.tagName | type) != "string"@false
-merge@merge@waiting@verifying-merge-unread@[[ "$merged" != null ]]@[[ "$merged" != null ]] || merged="$now"
+merge@merge@waiting@verifying-merge-unread@"$merged" != null ]]@"$merged" != null ]] || merged="$now"
+merge_hours@merge-hours@due@verifying-merge-unread@"$merged" != null ]]@"$merged" != null ]] || merged="$now"
 ROWS
 release_world release_read_control
 touch "$STUB_DIR/release-fail"
