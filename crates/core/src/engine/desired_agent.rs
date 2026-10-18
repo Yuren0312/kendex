@@ -437,12 +437,27 @@ fn effective_agent<'a>(
     upstream_skills: &[String],
     project: Project<'a>,
 ) -> EffectiveAgent<'a> {
-    let overrides = merge_overrides(
+    let mut overrides = merge_overrides(
         ctx.config
             .frontmatter
             .get(harness.name())
             .and_then(|by_agent| by_agent.get(ctx.name)),
         project.frontmatter,
+    );
+    resolve_default_delegates(
+        harness,
+        source.role,
+        ctx.config.role_policy.as_ref(),
+        &mut overrides,
+        |name| {
+            ctx.expansion
+                .decl_of(ItemKind::Agent, name)
+                .is_some_and(|decl| decl.enabled)
+                && ctx
+                    .expansion
+                    .harnesses(ItemKind::Agent, name)
+                    .contains(&harness)
+        },
     );
     let permissions = EffectiveAgent::intent(source, &overrides);
     EffectiveAgent {
@@ -471,5 +486,21 @@ fn effective_agent<'a>(
         additional_instructions: project.additional_instructions,
         custom_hooks: project.custom_hooks,
         role_policy: ctx.config.role_policy.as_ref(),
+    }
+}
+
+/// Resolve only the built-in default. Installation supplies its expanded
+/// declarations; capture supplies the install record it is reading back.
+pub(super) fn resolve_default_delegates(
+    harness: HarnessId,
+    role: Option<crate::render::agent::Role>,
+    policy: Option<&crate::render::agent::RolePolicy>,
+    overrides: &mut FrontmatterOverrides,
+    installed: impl Fn(&str) -> bool,
+) {
+    if harness == HarnessId::Pi && policy.is_none() && overrides.allowed_subagents.is_none() {
+        let mut defaults = crate::render::agent::role_rule(None, harness, role);
+        defaults.allowed_subagents.retain(|name| installed(name));
+        overrides.allowed_subagents = Some(defaults.allowed_subagents);
     }
 }
