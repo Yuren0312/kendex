@@ -165,6 +165,91 @@ for row in "${ARM_CONTROLS[@]}"; do
   back_to_base
 done
 
+echo "=== runtime manifest reads select only the reading crate's tests ==="
+# The corpus producer joins a literal directory onto CARGO_MANIFEST_DIR.
+# Keep the fixture read below a skill subtree to prove unrelated skill paths
+# remain outside coverage, and a root read to prove unresolved paths do not
+# widen that coverage.
+mkdir -p "$R/crates/core/tests/quality" "$R/skills/watched" "$R/skills/unread"
+printf '%s\n' 'let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/watched");' \
+  'let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");' \
+  >"$R/crates/core/tests/quality/corpus.rs"
+printf '# skill\n' >"$R/skills/watched/SKILL.md"
+printf '# skill\n' >"$R/skills/unread/SKILL.md"
+git -C "$R" add -A
+git -C "$R" commit -q -m "chore: a runtime skill reader"
+runtime_base="$(git -C "$R" rev-parse HEAD)"
+TEST_CALL='cargo test --manifest-path crates/core/Cargo.toml --quiet'
+RUNTIME_ROWS=(
+  "skills/watched/SKILL.md|$TEST_CALL"
+  "skills/unread/SKILL.md|"
+  "docs/unread.md|"
+  "skills/watchedness/SKILL.md|"
+)
+for row in "${RUNTIME_ROWS[@]}"; do
+  IFS='|' read -r path want <<<"$row"
+  mkdir -p "$R/$(dirname "$path")"
+  printf 'edit\n' >>"$R/$path"
+  run_range "$runtime_base"
+  [ "$RC" -eq 0 ] && [ "$LOG" = "$want" ] \
+    && ok "manifest coverage for $path selects [$want]" \
+    || bad "manifest coverage for $path selects [$want]" "rc=$RC log=$LOG out=$OUT"
+  if [ -n "$want" ] && mutant_guard 's/\$1 == "manifest" \&\& /$1 == "include" \&\& /'; then
+    run_range "$runtime_base" "$MUTANT_TOOLS/guard"
+    [ "$RC" -eq 0 ] && [ -z "$LOG" ] \
+      && ok "control: include-only selection runs no cargo test for $path" \
+      || bad "control: include-only selection runs no cargo test for $path" "rc=$RC log=$LOG"
+  elif [ -n "$want" ]; then
+    bad "control: runtime read selection could not be removed"
+  fi
+  if [ -z "$want" ]; then
+    if mutant_guard 's/if (changed\[i\] == \$2 || index(changed\[i\], \$2 "\/") == 1)/if (1)/'; then
+      run_range "$runtime_base" "$MUTANT_TOOLS/guard"
+      [ "$RC" -eq 0 ] && [ "$LOG" = "$TEST_CALL" ] \
+        && ok "control: widening direct coverage wrongly selects tests for $path" \
+        || bad "control: widening direct coverage wrongly selects tests for $path" "rc=$RC log=$LOG"
+    else
+      bad "control: direct manifest coverage could not be widened"
+    fi
+  fi
+  git -C "$R" reset -q --hard "$runtime_base"
+  git -C "$R" clean -qfd -e fake-bin
+done
+# The configured ci-mode local route runs this same range with scoped=true.
+# A selected cargo test's failure must still fail that route.
+printf 'edit\n' >>"$R/skills/watched/SKILL.md"
+cp "$R/fake-bin/cargo" "$TMP/cargo.saved"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "cargo $*" >>"$CALL_LOG"' \
+  '[ "${1:-}" != test ]' >"$R/fake-bin/cargo"
+scoped_runtime_failure() { # GUARD — the configured route, with cargo test failing
+  RC=0
+  : >"$CALLS"
+  OUT="$(cd "$R" && env DEV_VALIDATE_SCOPED=true PATH="$R/fake-bin:$PATH" CALL_LOG="$CALLS" \
+    "$1" --selection --range "$runtime_base" 2>&1 </dev/null)" || RC=$?
+}
+scoped_runtime_failure "$GUARD"
+[ "$RC" -eq 1 ] && grep -qFx "$TEST_CALL" "$CALLS" \
+  && grep -qFx 'guard: cargo-test=crates/core/Cargo.toml' <<<"$OUT" \
+  && ok "the configured scoped route fails when the manifest reader's test fails" \
+  || bad "the configured scoped route fails when the manifest reader's test fails" "rc=$RC out=$OUT"
+if mutant_guard 's/\$1 == "manifest" \&\& /$1 == "include" \&\& /'; then
+  scoped_runtime_failure "$MUTANT_TOOLS/guard"
+  [ "$RC" -eq 0 ] && [ ! -s "$CALLS" ] \
+    && ok "control: include-only selection misses the failing runtime test in the scoped route" \
+    || bad "control: include-only selection misses the failing runtime test in the scoped route" "rc=$RC out=$OUT"
+fi
+if mutant_guard 's/say cargo-test "\$manifest"/say tests "$manifest"/'; then
+  scoped_runtime_failure "$MUTANT_TOOLS/guard"
+  [ "$RC" -eq 1 ] && grep -qFx "$TEST_CALL" "$CALLS" \
+    && ! grep -qFx 'guard: cargo-test=crates/core/Cargo.toml' <<<"$OUT" \
+    && ok "control: an unregistered failure key loses the cargo-test machine category" \
+    || bad "control: an unregistered failure key loses the cargo-test machine category" "rc=$RC out=$OUT"
+else
+  bad "control: the cargo-test failure key could not be removed"
+fi
+cp "$TMP/cargo.saved" "$R/fake-bin/cargo"
+back_to_base
+
 echo "=== a range keeps its own selection whatever class it is handed ==="
 # dev-validate-run hands every run the branch's change class; the lane
 # selection that reads it is the full run's, and a range selects from its own
@@ -241,41 +326,69 @@ else
 fi
 back_to_base
 
-echo "=== an include read that fails compiles the workspace ==="
-# Without the derivation no change can be shown to reach no included file, so
-# the range compiles everything and says why.
+echo "=== failed Rust read dependencies cannot pass the range ==="
+# find produces the extractor's source set; awk and sort produce the reading
+# manifest selection. Partial dependency output is not complete evidence.
 REAL_FIND="$(command -v find)"
+REAL_SORT="$(command -v sort)"
 cat >"$R/fake-bin/find" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-if [ "${FAIL_FIND:-0}" -eq 1 ] && [ "${1:-}" = crates ] && [ "${4:-}" = -name ] && [ "${5:-}" = '*.rs' ]; then
+if [ "${FAIL_DEP:-}" = find ] && [ "${1:-}" = crates ] && [ "${4:-}" = -name ] && [ "${5:-}" = '*.rs' ]; then
   exit 1
 fi
 exec "$REAL_FIND" "$@"
 SH
-chmod +x "$R/fake-bin/find"
-range_find_fails() { # GUARD
+cat >"$R/fake-bin/awk" <<'SH'
+#!/usr/bin/env bash
+if [ "${FAIL_DEP:-}" = awk ] && [[ $* == *'ENVIRON["CHANGED"]'* ]]; then
+  printf 'crates/core/Cargo.toml\n'
+  exit 2
+fi
+exec "$REAL_AWK" "$@"
+SH
+cat >"$R/fake-bin/sort" <<'SH'
+#!/usr/bin/env bash
+data=$(cat) || exit 2
+if [ "${FAIL_DEP:-}" = sort ] && [ "$data" = crates/core/Cargo.toml ]; then
+  printf '%s\n' "$data"
+  exit 2
+fi
+exec "$REAL_SORT" "$@" <<<"$data"
+SH
+chmod +x "$R/fake-bin/find" "$R/fake-bin/awk" "$R/fake-bin/sort"
+range_dependency_fails() { # DEPENDENCY GUARD
   OUT=""
   RC=0
   : >"$CALLS"
-  OUT="$(cd "$R" && env FAIL_FIND=1 REAL_FIND="$REAL_FIND" PATH="$R/fake-bin:$PATH" CALL_LOG="$CALLS" "$1" --range "$BASE" 2>&1 </dev/null)" || RC=$?
+  OUT="$(cd "$R" && env FAIL_DEP="$1" REAL_FIND="$REAL_FIND" REAL_AWK="$REAL_AWK" REAL_SORT="$REAL_SORT" \
+    PATH="$R/fake-bin:$PATH" CALL_LOG="$CALLS" "$2" --range "$runtime_base" 2>&1 </dev/null)" || RC=$?
   LOG="$(cat "$CALLS")"
 }
-printf 'echo more\n' >>"$R/skills/demo/scripts/demo.sh"
-printf 'echo more\n' >>"$R/.agents/skills/demo/scripts/demo.sh"
-range_find_fails "$GUARD"
-[ "$RC" -eq 1 ] && [[ "$OUT" == *"guard: rust-reads=crates"* ]] && [ "$LOG" = "$WORKSPACE_CALLS" ] \
-  && ok "a failed include read is a finding and the range checks the workspace" \
-  || bad "a failed include read is a finding and the range checks the workspace" "rc=$RC log=$LOG out=$OUT"
-if mutant_guard '/^  say rust-reads crates$/d'; then
-  range_find_fails "$MUTANT_TOOLS/guard"
-  [ "$RC" -eq 0 ] && [[ "$OUT" != *"guard: rust-reads="* ]] \
-    && ok "control: with the finding removed the failed read passes" \
-    || bad "control: with the finding removed the failed read passes" "rc=$RC out=$OUT"
-else
-  bad "control: the include-read finding could not be removed from a guard copy"
-fi
-rm -f -- "${R:?}/fake-bin/find"
+git -C "$R" reset -q --hard "$runtime_base"
+printf 'edit\n' >>"$R/skills/watched/SKILL.md"
+DEPENDENCY_ROWS=(
+  "find|$WORKSPACE_CALLS"
+  "awk|"
+  "sort|"
+)
+for row in "${DEPENDENCY_ROWS[@]}"; do
+  dependency="${row%%|*}"
+  want="${row#*|}"
+  range_dependency_fails "$dependency" "$GUARD"
+  [ "$RC" -eq 1 ] && grep -qFx 'guard: rust-reads=crates' <<<"$OUT" && [ "$LOG" = "$want" ] \
+    && ok "failed $dependency refuses Rust read selection with the expected cargo calls" \
+    || bad "failed $dependency refuses Rust read selection with the expected cargo calls" "rc=$RC log=$LOG out=$OUT"
+  if mutant_guard 's/^[[:space:]]*say rust-reads crates$/  :/'; then
+    range_dependency_fails "$dependency" "$MUTANT_TOOLS/guard"
+    [ "$RC" -eq 0 ] && ! grep -qFx 'guard: rust-reads=crates' <<<"$OUT" \
+      && ok "control: removing the failure verdict lets failed $dependency pass" \
+      || bad "control: removing the failure verdict lets failed $dependency pass" "rc=$RC log=$LOG out=$OUT"
+  else
+    bad "control: the Rust read failure verdict could not be removed"
+  fi
+done
+rm -f -- "${R:?}/fake-bin/find" "${R:?}/fake-bin/awk" "${R:?}/fake-bin/sort"
 back_to_base
 
 echo "=== the default rules read the range, not only the last commit ==="
