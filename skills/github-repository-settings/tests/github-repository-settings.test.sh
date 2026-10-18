@@ -64,12 +64,13 @@ def launcher(root):
     return root / "catalog/github-repository-settings/scripts/github-repository-settings"
 
 
-def invoke(root, verb, *args, setting="off", location="local", library=False):
+def invoke(root, verb, *args, setting="off", location="local", library=False, extra_env=None):
     env = dict(environment)
     if setting is not None:
         env["GITHUB_STANDARD_BOT_REVIEW"] = setting
     if location is not None:
         env["GITHUB_STANDARD_CHECK_LOCATION"] = location
+    env.update(extra_env or {})
     command = ([str(root / "catalog/bot-instructions/scripts/bot-instructions")]
                if library else [bash, str(launcher(root))])
     return subprocess.run([*command, verb, "--repo", str(root), *args],
@@ -157,10 +158,99 @@ def checking(root):
         if not stale:
             assert json.loads(result.stdout) == {"version": 1, "paths": []}
         assert snapshot(root) == before
-    before = snapshot(root)
-    result = invoke(root, "check", "--staged")
-    assert result.returncode == 2 and "github-repository-settings: usage=--staged\n" in result.stderr, result
-    assert snapshot(root) == before
+
+
+def staged(root):
+    # Expected output and exit classes are independent of the wrapper's selection.
+    for name, status, review, private, process, output, nested, location in (
+        ("clean", 0, "off", "", {}, "local", None, "hosted"),
+        ("stale", 1, "off", "", {}, "local", None, "hosted"),
+        ("incomplete", 2, "off", "", {}, "local", None, "hosted"),
+        ("absent-settings", 0, None, "", {}, "local", None, "unset"),
+        ("private", 0, "on", "GITHUB_STANDARD_BOT_REVIEW=off\n", {}, "local", None, "hosted"),
+        ("process", 0, "off", "GITHUB_STANDARD_BOT_REVIEW=off\n",
+         {"GITHUB_STANDARD_BOT_REVIEW": "on", "GITHUB_STANDARD_CHECK_LOCATION": "hosted",
+          "KENDEX_ENV_FILE": "process.env"}, "full", None, "hosted"),
+        ("nested-tracked", 0, "off", "", {}, "full", "tracked", "local"),
+        ("nested-untracked", 0, "off", "", {}, "full", "untracked", "local"),
+        ("nested-private", 0, "off", "", {}, "local", "private", "local"),
+        ("nested-deleted", 0, "off", "", {}, "local", "deleted", "hosted"),
+        ("nested-symlink", 2, "off", "", {}, "local", "symlink", "local"),
+        ("root-symlink", 2, "on", "", {}, "local", None, "hosted"),
+        ("root-symlink-explicit", 0, "on", "", {"REVIEW_GATE_SETTINGS_FILE": "explicit.toml"},
+         "local", None, "hosted"),
+        ("root-symlink-defaults", 0, "on", "", {"REVIEW_GATE_SETTINGS_FILE": "/dev/null"},
+         "local", None, "unset"),
+    ):
+        config = root / "kendex.settings.toml"
+        config.unlink(missing_ok=True)
+        if review is not None:
+            config.write_text('[env]\nGITHUB_STANDARD_CHECK_LOCATION = "hosted"\n'
+                              f'GITHUB_STANDARD_BOT_REVIEW = "{review}"\n'
+                              'KENDEX_ENV_FILE = "staged.env"\n')
+        (root / "staged.env").write_text(private)
+        (root / "tree.env").write_text("GITHUB_STANDARD_BOT_REVIEW=on\nGITHUB_STANDARD_CHECK_LOCATION=local\n")
+        (root / "process.env").write_text("GITHUB_STANDARD_BOT_REVIEW=off\nGITHUB_STANDARD_CHECK_LOCATION=local\n")
+        (root / "explicit.toml").write_text('[env]\nGITHUB_STANDARD_BOT_REVIEW = "off"\n'
+                                           'GITHUB_STANDARD_CHECK_LOCATION = "hosted"\n')
+        nested_config = root / ".kendex/settings.toml"
+        if nested is not None:
+            nested_config.parent.mkdir(exist_ok=True)
+            nested_config.write_text('[env]\nGITHUB_STANDARD_BOT_REVIEW = "on"\n'
+                                     'GITHUB_STANDARD_CHECK_LOCATION = "local"\n'
+                                     'KENDEX_ENV_FILE = "nested.env"\n')
+            (root / "nested.env").write_text("GITHUB_STANDARD_BOT_REVIEW=off\n" if nested == "private" else "")
+        else:
+            nested_config.unlink(missing_ok=True)
+        link = nested_config if nested == "symlink" else config if name.startswith("root-symlink") else None
+        if link is not None:
+            target = root / "linked-settings.toml"
+            target.write_bytes(link.read_bytes())
+            link.unlink()
+            link.symlink_to("../linked-settings.toml" if link == nested_config else "linked-settings.toml")
+            assert link.is_symlink(), name
+        rendered(root, "on" if output == "full" else "off")
+        if name == "stale":
+            path = root / "AGENTS.md"
+            path.write_text(path.read_text().replace("SKILL.md#doctrine", "missing.md"))
+        subprocess.run(["git", "-C", str(root), "add", "-A"], env=environment, check=True)
+        if nested == "deleted":
+            subprocess.run(["git", "-C", str(root), "-c", "user.name=Fixture", "-c",
+                            "user.email=fixture@example.invalid", "commit", "-qm", "nested settings"],
+                           env=environment, check=True, capture_output=True)
+        if nested in ("untracked", "deleted"):
+            subprocess.run(["git", "-C", str(root), "rm", "--cached", ".kendex/settings.toml"],
+                           env=environment, check=True, capture_output=True)
+        elif nested is not None and nested != "symlink":
+            nested_config.write_text('[env]\nGITHUB_STANDARD_BOT_REVIEW = "off"\n'
+                                     'GITHUB_STANDARD_CHECK_LOCATION = "hosted"\n'
+                                     'KENDEX_ENV_FILE = "tree.env"\n')
+        if name == "incomplete":
+            # A staged package deletion leaves the doctrine unavailable.
+            subprocess.run(["git", "-C", str(root), "rm", "--cached", "catalog/bot-instructions/SKILL.md"],
+                           env=environment, check=True, capture_output=True)
+        config.write_text('[env]\nGITHUB_STANDARD_CHECK_LOCATION = "local"\n'
+                          'GITHUB_STANDARD_BOT_REVIEW = "on"\nKENDEX_ENV_FILE = "tree.env"\n')
+        before = snapshot(root)
+        result = invoke(root, "check", "--staged", "--json", setting=None,
+                        location=None, extra_env=process)
+        if status == 2 and link is not None:
+            assert result.returncode == status and result.stdout == "", (name, result)
+            # Command callers read the shared diagnostics protocol.
+            assert result.stderr.splitlines()[0] == f"review-gate-error=settings-index-mode value={link.relative_to(root)}", (name, result)
+            assert snapshot(root) == before, name
+            continue
+        expected = invoke(root, "check", "--staged", "--json", "--output", output, library=True)
+        assert result.returncode == expected.returncode == status, (name, result, expected)
+        assert result.stdout == expected.stdout, (name, result, expected)
+        # The check-report protocol is consumed by command callers.
+        assert result.stderr == f"github-standard-check-location={location}\n" + expected.stderr, (name, result)
+        assert snapshot(root) == before, name
+    for verb, args in (("render", ()), ("adopt", ("--dry-run",))):
+        before = snapshot(root)
+        result = invoke(root, verb, "--staged", *args)
+        assert result.returncode == 2 and "usage=--staged\n" in result.stderr, result
+        assert snapshot(root) == before
 
 
 def locations(root):
@@ -195,7 +285,7 @@ def settings(root):
 
 
 contracts = {"preview": preview, "symlink": symlink, "selection": selection,
-             "equality": equality, "checking": checking, "locations": locations,
+             "equality": equality, "checking": checking, "staged": staged, "locations": locations,
              "settings": settings}
 completed = 0
 for name, contract in contracts.items():
@@ -228,8 +318,16 @@ for name, contract, path, old, new in (
      '--output "$output"', '--output full'),
     ("check-write", checking, "bot-instructions/scripts/lib/verbs.py",
      'def check_verb(ctx):\n', 'def check_verb(ctx):\n    open(ctx.root + "/check-write", "w").close()\n'),
-    ("staged-option", checking, "github-repository-settings/scripts/github-repository-settings",
-     '    --json)', '    --staged|--json)'),
+    ("staged-settings", staged, "github-repository-settings/scripts/github-repository-settings",
+     'rg_settings_index_sources "$staged_settings" || exit 2', ':'),
+    ("nested-settings", staged, "review-gate/scripts/lib/settings.sh",
+     'rg_settings_nested_source=$nested', 'rg_settings_nested_source="$dir/absent.toml"'),
+    ("staged-source-mode", staged, "review-gate/scripts/lib/settings.sh",
+     "*) entry='' ;;", "*) : ;;"),
+    ("staged-option", staged, "github-repository-settings/scripts/github-repository-settings",
+     'staged=true; args+=("$1")', 'staged=true'),
+    ("staged-status", staged, "github-repository-settings/scripts/github-repository-settings",
+     'exit "$status"', 'exit 0'),
     ("location-gate", locations, "github-repository-settings/scripts/github-repository-settings",
      '[ "$verb" = adopt ] && [ -z "$location" ]', '[ "$verb" = never ] && [ -z "$location" ]'),
 ):
