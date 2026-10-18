@@ -1573,6 +1573,7 @@ scan_load() { # DIR
       for (reader_phase = 0; reader_phase < 4; reader_phase++) {
         for (q in queries) {
           pattern = query_patterns[q, reader_phase]
+          if (pattern == "-") continue
           for (reader in reader_counts) {
             for (line = 1; line <= reader_counts[reader]; line++) {
               if (reader_phase == 0 ? index(reader_lines[reader, line], pattern) : reader_lines[reader, line] ~ pattern) {
@@ -1638,8 +1639,9 @@ doc_readers() { # REL
   esac
   walk_root="$skill_root|$catalog_root"
   if [ "$external" -eq 1 ]; then
-    dir='a^'
-    walk_root='a^'
+    # Nonempty markers preserve disabled comparisons through shell capture.
+    dir='-'
+    walk_root=''
     case "$rel" in
       skills/*/*)
         source_rel=${rel#skills/}
@@ -1651,12 +1653,18 @@ doc_readers() { # REL
         ;;
     esac
   fi
-  walk='(^|[^[:alnum:]_-])find[[:space:]]+(-[HLP][[:space:]]+)?([^-[:space:]][^[:space:]]*[[:space:]]+)*"?('"$walk_root"')"?([[:space:]]|\)|$)'
+  walk='-'
+  if [ -n "$walk_root" ]; then
+    walk='(^|[^[:alnum:]_-])find[[:space:]]+(-[HLP][[:space:]]+)?([^-[:space:]][^[:space:]]*[[:space:]]+)*"?('"$walk_root"')"?([[:space:]]|\)|$)'
+  fi
   reader_patterns=("/$rel" "$token" "$dir" "$walk")
 }
 # A file in the reach adds its name as a needle by its role, into the
 # caller's next_any, next_script and reach_scripts.
-reach_join() { # ROLE PATH
+reach_join() { # ROLE PATH [changed]
+  if [ "$scoped_only" -eq 1 ] && [ "${3:-reader}" != changed ]; then
+    case "$1" in script | lib | module) return 0 ;; esac
+  fi
   case "$1" in
     lib | helper | module | test-module) next_any+=("${2##*/}") ;;
     script)
@@ -1695,6 +1703,10 @@ reach_join() { # ROLE PATH
 #   - Every tree also scans repository inputs outside its tree. Whole paths in
 #     code and `# Inputs:` path patterns seed the same reader reach. Input
 #     notes name indirect reads that the text scan cannot resolve.
+# With DEV_VALIDATE_SCOPED=true, only the changed production file seeds
+# production needles. Readers under tests/ still extend the reach, so a
+# suite can cover the file through its test helpers. Other production
+# readers add no needles or named suites. Merge-group CI keeps the full reach.
 # The reach is what the scan can see, not every caller: a script run through
 # a variable path is missed, and so is a suite that runs a changed script
 # only through another script that runs it. CI's full run owns completeness.
@@ -1743,7 +1755,7 @@ mapped_suites() { # DIR REL
       reach_join "${SCAN_ROLE[i]}" "${SCAN_PATH[i]}" || return 3
     done <<<"$readers"
   else
-    reach_join "$role" "$dir/$rel" || return 3
+    reach_join "$role" "$dir/$rel" changed || return 3
     if [ "$role" = module ]; then
       name=${rel#scripts/}
       next_any+=("${name%%/*}")
@@ -1821,6 +1833,9 @@ mapped_suites() { # DIR REL
 # The final report uses the runner's subset vocabulary only for a smaller
 # mapped set. Empty means no tree was selected; any whole set makes it all.
 suite_selection=""
+suite_trees=()
+suite_runs=()
+suite_scripts=()
 if [ "$MODE" != default ] && lane_on shell_shards; then
   # Each touched path of a tree with suites, as `<tree> TAB <path inside
   # it> TAB <path>`: a render reads as the source it renders.
@@ -1872,8 +1887,10 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
 "
     done
   done <<<"$touched"
-  npm_available=unchecked
+  # Publish only a complete plan. Pi launch probes and tests execute below,
+  # after every later battery is available to cancellation reporting.
   for d in $(cut -f1 <<<"$tree_paths" | sort -u); do
+    suite_script=""
     case "$d" in
       pi-extensions/*)
         [ -f "$d/package.json" ] || continue
@@ -1884,24 +1901,13 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
           continue
         fi
         if jq -e '.scripts["test:ci"]' "$d/package.json" >/dev/null; then
-          npm_args=(run test:ci)
+          suite_script=test:ci
         elif jq -e '.scripts.test' "$d/package.json" >/dev/null; then
-          npm_args=(test)
+          suite_script=test
         else
           continue
         fi
-        # Prove the npm launcher can start, including its Node interpreter,
-        # once for the selected Pi suites before interpreting suite output.
-        if [ "$npm_available" = unchecked ]; then
-          npm_available=ready
-          if ! command -v npm >/dev/null 2>&1 || ! npm --version >/dev/null 2>&1; then
-            unrun missing-tool npm
-            npm_available=unavailable
-          fi
-        fi
-        [ "$npm_available" = ready ] || continue
-        suite_out=$(cd "$d" && npm "${npm_args[@]}" 2>&1) || pi_suite_failed "$d" "$suite_out"
-        [ -z "$suite_out" ] || printf '%s\n' "$suite_out"
+        run=$d
         ;;
       *)
         [ -d "$d/tests" ] || continue
@@ -1937,7 +1943,6 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
           done <<<"$tree_paths"
           [ "$run" = all ] || run=$(sort -u <<<"$run") || run=all
         fi
-        filters=()
         if [ "$run" = all ]; then
           suite_selection=all
           run=$(skill_suites "$d")
@@ -1951,31 +1956,90 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
           fi
           note suites "$selected_count/$total_count reason=mapped tree=$d"
           [ -n "$run" ] || continue
-          while IFS= read -r t; do
-            [ -n "$t" ] || continue
-            t="${t##*/}"
-            filters+=("=${t%.sh}")
-          done <<<"$run"
         fi
         if [ "$selection_only" -eq 1 ] && [ "$scoped_only" -eq 0 ]; then continue; fi
-        if [ -f "$d/tests/run-all.sh" ]; then
-          # A mapped run hands run-all.sh each suite as `=name`, which it
-          # matches whole; with none it runs the whole set.
-          echo "=== $d/tests/run-all.sh" ${filters[@]+"${filters[@]}"}
-          bash "$d/tests/run-all.sh" ${filters[@]+"${filters[@]}"} || say suite "$d/tests/run-all.sh"
-          continue
-        fi
-        while IFS= read -r t; do
-          [ -f "$t" ] || continue
-          echo "=== $t"
-          case "$t" in
-            *.mjs) node --test "$t" || say suite "$t" ;;
-            *) bash "$t" || say suite "$t" ;;
-          esac
-        done <<<"$run"
         ;;
     esac
+    suite_trees+=("$d")
+    suite_runs+=("$run")
+    suite_scripts+=("$suite_script")
   done
+  # Bash defers this guard's trap while a foreground runner stops children.
+  # The active runner therefore reports its current and later batteries.
+  suite_index=0
+  suite_later=""
+  active_runner=0
+  unstarted_suites() {
+    local t pending
+    [ "$active_runner" -eq 0 ] || return 0
+    for ((pending = suite_index; pending < ${#suite_runs[@]}; pending++)); do
+      while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        printf 'guard-note: unstarted-suite=%s\n' "$t"
+      done <<<"${suite_runs[pending]}"
+    done
+  }
+  trap 'unstarted_suites; exit 143' TERM
+  trap 'unstarted_suites; exit 130' INT
+  trap 'unstarted_suites; exit 129' HUP
+  for run in ${suite_runs[@]+"${suite_runs[@]}"}; do
+    while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      printf 'guard-note: selected-suite=%s\n' "$t"
+    done <<<"$run"
+  done
+  npm_available=unchecked
+  for ((suite_index = 0; suite_index < ${#suite_trees[@]}; suite_index++)); do
+    d=${suite_trees[suite_index]}
+    run=${suite_runs[suite_index]}
+    if [ -n "${suite_scripts[suite_index]}" ]; then
+      # Prove the npm launcher can start, including its Node interpreter,
+      # once for the selected Pi suites before interpreting suite output.
+      if [ "$npm_available" = unchecked ]; then
+        npm_available=ready
+        if ! command -v npm >/dev/null 2>&1 || ! npm --version >/dev/null 2>&1; then
+          unrun missing-tool npm
+          npm_available=unavailable
+        fi
+      fi
+      [ "$npm_available" = ready ] || continue
+      npm_args=(test)
+      [ "${suite_scripts[suite_index]}" != test:ci ] || npm_args=(run test:ci)
+      suite_runs[suite_index]=""
+      suite_out=$(cd "$d" && npm "${npm_args[@]}" 2>&1) || pi_suite_failed "$d" "$suite_out"
+      [ -z "$suite_out" ] || printf '%s\n' "$suite_out"
+      continue
+    fi
+    suite_later=""
+    for ((pending = suite_index + 1; pending < ${#suite_runs[@]}; pending++)); do
+      suite_later+="${suite_runs[pending]}"$'\n'
+    done
+    filters=()
+    while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      t="${t##*/}"
+      filters+=("=${t%.sh}")
+    done <<<"$run"
+    if [ -f "$d/tests/run-all.sh" ]; then
+      # Family aliases can expand these filters; the runner publishes its selection.
+      echo "=== $d/tests/run-all.sh" ${filters[@]+"${filters[@]}"}
+      active_runner=1
+      RUN_ALL_PENDING_SUITES="$run"$'\n'"$suite_later" bash "$d/tests/run-all.sh" ${filters[@]+"${filters[@]}"} || say suite "$d/tests/run-all.sh"
+      suite_runs[suite_index]=""
+      active_runner=0
+      continue
+    fi
+    while IFS= read -r t; do
+      suite_runs[suite_index]=${suite_runs[suite_index]#*"$t"}
+      [ -f "$t" ] || continue
+      echo "=== $t"
+      case "$t" in
+        *.mjs) node --test "$t" || say suite "$t" ;;
+        *) bash "$t" || say suite "$t" ;;
+      esac
+    done <<<"$run"
+  done
+  trap - TERM INT HUP
 fi
 [ -n "$suite_selection" ] || suite_selection=all
 if [ "$selection_only" -eq 1 ]; then
