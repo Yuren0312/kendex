@@ -16,7 +16,14 @@ WORKTREE_SCRIPT="${WORKTREE_SCRIPT:-$WORKTREE_PACKAGE_DIR/scripts/worktree}"
 TMP_ROOT="$(mktemp -d)" || { echo "worktree_remove: scratch=mktemp-failed" >&2; exit 1; }
 [[ -d $TMP_ROOT && ! -L $TMP_ROOT ]] || { echo "worktree_remove: scratch=not-a-directory value=[$TMP_ROOT]" >&2; exit 1; }
 TMP_ROOT="$(cd -- "$TMP_ROOT" && pwd -P)" || { echo "worktree_remove: scratch=resolve-failed" >&2; exit 1; }
-trap 'rm -rf -- "${TMP_ROOT:?}"' EXIT
+LIVE_PID=''
+finish_session() {
+  [[ -n "$LIVE_PID" ]] || return 0
+  printf 'close\n' >"$ROOT/session.pipe"
+  wait "$LIVE_PID"
+  LIVE_PID=''
+}
+trap 'finish_session; rm -rf -- "${TMP_ROOT:?}"' EXIT
 
 PASS=0
 FAIL=0
@@ -39,6 +46,8 @@ make_repo() {
   git -C "$repo" config user.email test@example.com
   git -C "$repo" config user.name Test
   git -C "$repo" config commit.gpgsign false
+  git -C "$repo" config gc.auto 0
+  git -C "$repo" config maintenance.auto false
   printf 'base\n' > "$repo/file.txt"
   git -C "$repo" add file.txt
   git -C "$repo" commit -q -m base
@@ -64,6 +73,7 @@ ROOT=""
 MAIN=""
 WT=""
 ROW_PATH=""
+ROW_ENV=()
 
 step() {
   case "$1" in
@@ -114,6 +124,86 @@ step() {
       local owner=TOPIC
       [[ "$1" != foreign-lease ]] || owner=another-session
       "$WORKTREE_PACKAGE_DIR/scripts/worktree-session-guard" claim "$WT" --owner "$owner" >/dev/null
+      ;;
+    adopted-lease)
+      # The hook claims under the session identity; orch adopts under its item.
+      env KENDEX_SESSION_OWNER=predecessor "$WORKTREE_PACKAGE_DIR/scripts/worktree-session-guard" claim "$WT" >/dev/null
+      env KENDEX_SESSION_OWNER=predecessor "$WORKTREE_PACKAGE_DIR/scripts/worktree-session-guard" claim "$WT" --owner TOPIC --adopt >/dev/null
+      ;;
+    item-record)
+      # create records the normalized issue ID, rather than the lease spelling.
+      printf 'topic\n' >"$(git -C "$WT" rev-parse --absolute-git-dir)/kendex-issue"
+      ;;
+    kendex-session-owner)
+      ROW_ENV=(-u HT_SESSION_OWNER KENDEX_SESSION_OWNER=predecessor USER=fallback-session)
+      ;;
+    ht-session-owner)
+      ROW_ENV=(-u KENDEX_SESSION_OWNER HT_SESSION_OWNER=predecessor USER=fallback-session)
+      ;;
+    no-jq)
+      # Derive the command path from this host, without the optional parser.
+      # Only the removal process uses it; fixture assertions can still use jq.
+      local path_dir path_exe exe_name
+      local -a path_dirs
+      if [[ ! -d "$TMP_ROOT/no-jq-bin" ]]; then
+        mkdir "$TMP_ROOT/no-jq-bin"
+        IFS=: read -r -a path_dirs <<<"$PATH"
+        for path_dir in "${path_dirs[@]}"; do
+          [[ -d "$path_dir" ]] || continue
+          for path_exe in "$path_dir"/*; do
+            exe_name="${path_exe##*/}"
+            [[ "$exe_name" != jq && -x "$path_exe" && ! -d "$path_exe" ]] || continue
+            [[ ! -e "$TMP_ROOT/no-jq-bin/$exe_name" ]] || continue
+            ln -s "$path_exe" "$TMP_ROOT/no-jq-bin/$exe_name"
+          done
+        done
+      fi
+      ROW_PATH="$ROOT/bin:$TMP_ROOT/bin:$TMP_ROOT/no-jq-bin"
+      if PATH="$ROW_PATH" "$BASH" -c 'command -v jq' >/dev/null 2>&1; then
+        echo 'worktree_remove: fixture=jq-still-available' >&2
+        exit 1
+      fi
+      ;;
+    live-process | remote-host | invalid-pid)
+      local lease_file lease before old replacement
+      lease_file="$(git -C "$WT" rev-parse --absolute-git-dir)/locked"
+      before="$(cat -- "$lease_file")"
+      case "$1" in
+        live-process)
+          # Hold a PID for the recorded writer check. This fixture does not
+          # establish harness liveness or use a reaped child's PID.
+          mkfifo "$ROOT/session.pipe"
+          "$BASH" -c 'read -r token < "$1"' session "$ROOT/session.pipe" &
+          LIVE_PID=$!
+          old="$("$WORKTREE_PACKAGE_DIR/scripts/worktree-session-guard" status "$WT" | jq -r .pid)"
+          replacement="pid=$LIVE_PID"
+          old="pid=$old"
+          ;;
+        remote-host)
+          old="$("$WORKTREE_PACKAGE_DIR/scripts/worktree-session-guard" status "$WT" | jq -r .host)"
+          replacement="host=$old.remote"
+          old="host=$old"
+          ;;
+        invalid-pid)
+          old="$("$WORKTREE_PACKAGE_DIR/scripts/worktree-session-guard" status "$WT" | jq -r .pid)"
+          replacement='pid=unknown'
+          old="pid=$old"
+          ;;
+      esac
+      lease="${before/" $old "/" $replacement "}"
+      [[ "$lease" != "$before" ]] || { echo 'worktree_remove: fixture=unchanged-lease' >&2; exit 1; }
+      printf '%s\n' "$lease" >"$lease_file"
+      ;;
+    absent-process | unread-process | noisy-process)
+      # ps is the real producer of absent/error states. Inject its result
+      # instead of querying liveness against a reaped predecessor's PID.
+      mkdir -p "$ROOT/bin"
+      local ps_rc=1 ps_output=''
+      [[ "$1" != unread-process ]] || ps_rc=2
+      [[ "$1" != noisy-process ]] || ps_output='process table unavailable'
+      printf '#!/usr/bin/env bash\nprintf "%%s" %q\nexit %s\n' "$ps_output" "$ps_rc" >"$ROOT/bin/ps"
+      chmod +x "$ROOT/bin/ps"
+      ROW_PATH="$ROOT/bin:$ROW_PATH"
       ;;
     lock-record)
       LOCK_FILE="$(git -C "$WT" rev-parse --absolute-git-dir)/locked"
@@ -184,6 +274,7 @@ build() {
   MAIN="$ROOT/main"
   WT="$ROOT/trees/topic"
   ROW_PATH="$TMP_ROOT/bin:$PATH"
+  ROW_ENV=(-u KENDEX_SESSION_OWNER -u HT_SESSION_OWNER USER=returning-session)
   MAP_FILE=""
   SIBLING_GIT_DIR=""
   LOCK_FILE=""
@@ -266,8 +357,9 @@ run_remove() {
   read -r -a argv <<<"$1"
   for i in "${!argv[@]}"; do
     [[ "${argv[i]}" == @alias ]] && argv[i]="$ROOT/alias"
+    [[ "${argv[i]}" == @path ]] && argv[i]="$WT"
   done
-  (cd "$MAIN" && PATH="$ROW_PATH" REAL_GIT_BIN="$REAL_GIT_BIN" \
+  (cd "$MAIN" && env "${ROW_ENV[@]}" PATH="$ROW_PATH" REAL_GIT_BIN="$REAL_GIT_BIN" \
     "$WORKTREE_SCRIPT" remove "${argv[@]}" >"$ROOT/out" 2>"$ROOT/err") || rc=$?
   printf 'rc=%s out=%s err=%s %s' "$rc" \
     "$(message_records <"$ROOT/out" | sed -e "s|$WT|<wt>|g" -e "s|$WORKTREE_SCRIPT|<worktree>|g" -e '/^Usage: /q' | paste -s -d ';' -)" \
@@ -305,6 +397,12 @@ remove_err() {
     -) printf '' ;;
     deleted) printf "worktree-branch-deleted: topic" ;;
     released+deleted) printf '%s' 'worktree-lease-released: path=<wt> owner=TOPIC;worktree-branch-deleted: topic' ;;
+    live-process) printf 'worktree-guard-process-live: path=<wt> pid=%s;worktree-lease-release-failed: <wt>' "$LIVE_PID" ;;
+    unverified-process)
+      local info
+      info="$("$WORKTREE_PACKAGE_DIR/scripts/worktree-session-guard" status "$WT" | jq -r '"pid=\(.pid) host=\(.host)"')"
+      printf 'worktree-guard-process-unverified: path=<wt> %s;worktree-lease-release-failed: <wt>' "$info"
+      ;;
     unknown-option) printf '%s' "worktree-remove-option-unknown: --bogus" ;;
     unmerged) unmerged_block ;;
     locked) locked_block ;;
@@ -316,6 +414,11 @@ remove_err() {
 }
 
 LINKS='.env.local-><main>/.env.local,.agents-><main>/.agents,.claude/agents-><main>/.claude/agents,.claude/POINTER.md->../AGENTS.md'
+
+check_remove_row() {
+  local label="$1" args="$2" rc="$3" out="$4" err="$5" want_state="$6"
+  assert_eq "$(run_remove "$args")" "rc=$rc out=$(remove_out "$out") err=$(remove_err "$err") $want_state" "$label"
+}
 
 # label|fixture|args|rc|out|err|state
 REMOVE_ROWS='
@@ -339,6 +442,14 @@ an absent locked worktree keeps its registration, branch and lock|tree lock lock
 an absent worktree with an empty native lock stays registered|tree empty-lock lock-record vanished|TOPIC|1|-|locked|worktree=registered/no branch=present dirs=- links=- lock=intact
 an absent worktree with a foreign lease keeps its registration, branch and lease|tree foreign-lease lock-record vanished|TOPIC|1|-|locked|worktree=registered/no branch=present dirs=- links=- lock=intact
 an absent worktree releases its own lease and is removed|tree own-lease vanished|TOPIC|0|removed|released+deleted|worktree=absent/no branch=absent dirs=- links=-
+a returning session removes its adopted item by path without the old environment or jq|tree adopted-lease item-record absent-process no-jq|@path|0|removed|released+deleted|worktree=absent/no branch=absent dirs=- links=-
+a live recorded writer PID refuses removal by issue ID without jq|tree adopted-lease item-record live-process lock-record no-jq|TOPIC|1|-|live-process|worktree=registered/yes branch=present dirs=topic links=- lock=intact
+a live recorded writer PID refuses removal by path without jq|tree adopted-lease item-record live-process lock-record no-jq|@path|1|-|live-process|worktree=registered/yes branch=present dirs=topic links=- lock=intact
+a foreign lease refuses item-record path removal without jq|tree foreign-lease item-record absent-process lock-record no-jq|@path|1|-|locked|worktree=registered/yes branch=present dirs=topic links=- lock=intact
+a remote-host item lease stays locked|tree adopted-lease item-record remote-host absent-process lock-record|@path|1|-|unverified-process|worktree=registered/yes branch=present dirs=topic links=- lock=intact
+an unreadable process table keeps the item lease|tree adopted-lease item-record unread-process lock-record|@path|1|-|unverified-process|worktree=registered/yes branch=present dirs=topic links=- lock=intact
+a process lookup error with the absent exit code keeps the item lease|tree adopted-lease item-record noisy-process lock-record|@path|1|-|unverified-process|worktree=registered/yes branch=present dirs=topic links=- lock=intact
+an invalid recorded PID keeps the item lease|tree adopted-lease item-record invalid-pid absent-process lock-record|@path|1|-|unverified-process|worktree=registered/yes branch=present dirs=topic links=- lock=intact
 the lane mailbox moves to the main checkout, its stale monitor record dropped|tree mail|TOPIC|0|removed|deleted|worktree=absent/no branch=absent dirs=- links=- mail=main:wt-1,wt-2 wt:absent staged=0
 a removal git refuses puts the lane mailbox back in the worktree whole|tree mail git-refuses|TOPIC|1|-|refused|worktree=registered/yes branch=present dirs=topic links=- mail=main:absent wt:wt-1,wt-2+watch staged=0
 a lane mailbox meeting one in the main checkout adds its lines after the lines there|tree mail main-mail|TOPIC|0|removed|deleted|worktree=absent/no branch=absent dirs=- links=- mail=main:main-1,wt-1,wt-2 wt:absent staged=0
@@ -349,16 +460,74 @@ a carried answer leaves unread a line the main checkout mailbox had not read|tre
 a worktree tmp linked to the tmp of the main checkout leaves its mailbox where it is|tree shared-tmp mail|TOPIC|0|removed|deleted|worktree=absent/no branch=absent dirs=- links=- mail=main:wt-1,wt-2+watch wt:absent staged=0
 '
 
+ADOPTED_OWNER_ROWS='
+an adopted item removes by ID with KENDEX_SESSION_OWNER set and no jq|tree adopted-lease item-record absent-process kendex-session-owner no-jq|TOPIC|0|removed|released+deleted|worktree=absent/no branch=absent dirs=- links=-
+an adopted item removes by path with KENDEX_SESSION_OWNER set and no jq|tree adopted-lease item-record absent-process kendex-session-owner no-jq|@path|0|removed|released+deleted|worktree=absent/no branch=absent dirs=- links=-
+an adopted item removes by ID with HT_SESSION_OWNER set and no jq|tree adopted-lease item-record absent-process ht-session-owner no-jq|TOPIC|0|removed|released+deleted|worktree=absent/no branch=absent dirs=- links=-
+an adopted item removes by path with HT_SESSION_OWNER set and no jq|tree adopted-lease item-record absent-process ht-session-owner no-jq|@path|0|removed|released+deleted|worktree=absent/no branch=absent dirs=- links=-
+a foreign lease stays held with KENDEX_SESSION_OWNER set and no jq|tree foreign-lease item-record absent-process kendex-session-owner lock-record no-jq|@path|1|-|locked|worktree=registered/yes branch=present dirs=topic links=- lock=intact
+a foreign lease stays held with HT_SESSION_OWNER set and no jq|tree foreign-lease item-record absent-process ht-session-owner lock-record no-jq|@path|1|-|locked|worktree=registered/yes branch=present dirs=topic links=- lock=intact
+'
+
+check_remove_rows() {
+  local rows="$1" prefix="$2" n=0 label fixture args rc out err want_state
+  while IFS='|' read -r label fixture args rc out err want_state; do
+    [[ -n "$label$fixture$args$rc$out$err$want_state" ]] || continue
+    n=$((n + 1))
+    # shellcheck disable=SC2086
+    build "$prefix-$n" $fixture
+    want_state="${want_state//LINKS/$LINKS}"
+    check_remove_row "$label" "$args" "$rc" "$out" "$err" "$want_state"
+    finish_session
+  done <<<"$rows"
+}
+
 echo "=== worktree remove ==="
-n=0
-while IFS='|' read -r label fixture args rc out err want_state; do
-  [[ -n "$label$fixture$args$rc$out$err$want_state" ]] || continue
-  n=$((n + 1))
-  # shellcheck disable=SC2086
-  build "remove-$n" $fixture
-  want_state="${want_state//LINKS/$LINKS}"
-  assert_eq "$(run_remove "$args")" "rc=$rc out=$(remove_out "$out") err=$(remove_err "$err") $want_state" "$label"
-done <<<"$REMOVE_ROWS"
+check_remove_rows "$REMOVE_ROWS
+$ADOPTED_OWNER_ROWS" remove
+
+# A copy without the inactive-only release must fail the recorded-PID row.
+# The copy also keeps the owner check, so this control reaches liveness.
+CLOSEOUT_CONTROL="$TMP_ROOT/closeout-control"
+cp -R "$WORKTREE_PACKAGE_DIR/scripts" "$CLOSEOUT_CONTROL"
+INACTIVE_CALL='--owner "$owner" --inactive --repo "$PROJECT_ROOT"'
+[[ "$(grep -cF -- "$INACTIVE_CALL" "$CLOSEOUT_CONTROL/worktree")" == 1 ]] || { echo 'worktree_remove: control=inactive-target-count' >&2; exit 1; }
+CONTROL_TEXT="$(cat -- "$CLOSEOUT_CONTROL/worktree")"
+printf '%s\n' "${CONTROL_TEXT/"$INACTIVE_CALL"/'--owner "$owner" --repo "$PROJECT_ROOT"'}" >"$CLOSEOUT_CONTROL/worktree"
+! cmp -s "$WORKTREE_PACKAGE_DIR/scripts/worktree" "$CLOSEOUT_CONTROL/worktree" || { echo 'worktree_remove: control=inactive-unchanged' >&2; exit 1; }
+build live-control tree adopted-lease item-record live-process lock-record
+control_log="$(PASS=0 FAIL=0 WORKTREE_SCRIPT="$CLOSEOUT_CONTROL/worktree"; check_remove_row live-control TOPIC 1 - live-process 'worktree=registered/yes branch=present dirs=topic links=- lock=intact')"
+finish_session
+assert_eq "$(sed -n 's/^  FAIL  //p' <<<"$control_log")" live-control \
+  'control: the recorded-PID row rejects an unconditional owner release'
+
+# status returns the owner with owner-mismatch exit 75. Rejecting that result
+# must fail the same adopted-item rows while keeping foreign owners refused.
+STATUS_CONTROL="$TMP_ROOT/status-control"
+cp -R "$WORKTREE_PACKAGE_DIR/scripts" "$STATUS_CONTROL"
+STATUS_CASE='0 | 75) ;;'
+[[ "$(grep -cF -- "$STATUS_CASE" "$STATUS_CONTROL/worktree")" == 1 ]] || { echo 'worktree_remove: control=status-target-count' >&2; exit 1; }
+CONTROL_TEXT="$(cat -- "$STATUS_CONTROL/worktree")"
+printf '%s\n' "${CONTROL_TEXT/"$STATUS_CASE"/'0) ;;'}" >"$STATUS_CONTROL/worktree"
+! cmp -s "$WORKTREE_PACKAGE_DIR/scripts/worktree" "$STATUS_CONTROL/worktree" || { echo 'worktree_remove: control=status-unchanged' >&2; exit 1; }
+control_log="$(PASS=0 FAIL=0 WORKTREE_SCRIPT="$STATUS_CONTROL/worktree"; check_remove_rows "$ADOPTED_OWNER_ROWS" status-control)"
+expected_failures="$(awk -F '|' '$4 == 0 { print $1 }' <<<"$ADOPTED_OWNER_ROWS" | paste -s -d ';' -)"
+assert_eq "$(sed -n 's/^  FAIL  //p' <<<"$control_log" | paste -s -d ';' -)" "$expected_failures" \
+  'control: skipping owner-mismatch readback rejects the adopted-item rows only'
+
+# The no-jq rows must reject a parser dependency on the production readback.
+OWNER_CONTROL="$TMP_ROOT/owner-control"
+cp -R "$WORKTREE_PACKAGE_DIR/scripts" "$OWNER_CONTROL"
+OWNER_READ='owner="$("$SESSION_GUARD" status "$wt" --owner-only --repo "$PROJECT_ROOT" 2>/dev/null)"'
+[[ "$(grep -cF -- "$OWNER_READ" "$OWNER_CONTROL/worktree")" == 1 ]] || { echo 'worktree_remove: control=owner-target-count' >&2; exit 1; }
+CONTROL_TEXT="$(cat -- "$OWNER_CONTROL/worktree")"
+PARSER_READ='owner="$("$SESSION_GUARD" status "$wt" --owner-only --repo "$PROJECT_ROOT" 2>/dev/null | jq -Rr .)"'
+printf '%s\n' "${CONTROL_TEXT/"$OWNER_READ"/"$PARSER_READ"}" >"$OWNER_CONTROL/worktree"
+! cmp -s "$WORKTREE_PACKAGE_DIR/scripts/worktree" "$OWNER_CONTROL/worktree" || { echo 'worktree_remove: control=owner-unchanged' >&2; exit 1; }
+build owner-control tree adopted-lease item-record absent-process no-jq
+control_log="$(PASS=0 FAIL=0 WORKTREE_SCRIPT="$OWNER_CONTROL/worktree"; check_remove_row owner-control @path 0 removed released+deleted 'worktree=absent/no branch=absent dirs=- links=-')"
+assert_eq "$(sed -n 's/^  FAIL  //p' <<<"$control_log")" owner-control \
+  'control: the no-jq row rejects a parser dependency during lease removal'
 
 # Control: a remove that leaves the mailbox to git's deletion. The mailbox
 # state above must tell it apart, or no row there proves the move.
