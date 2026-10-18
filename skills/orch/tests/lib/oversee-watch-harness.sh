@@ -515,6 +515,7 @@ case "${1:-}" in
     [[ ! -f "$STUB_DIR/kill-window-fail" ]] || { echo "can't find pane" >&2; exit 1; }
     exit 0 ;;
   capture-pane)
+    format="${*: -1}"
     lane=""; join=0
     while [[ $# -gt 0 ]]; do [[ "$1" == "-t" ]] && lane="$(lane_name "$2")"; [[ "$1" == *J* && "$1" == -* ]] && join=1; shift; done
     n=0; [[ -f "$STUB_DIR/pane-$lane.calls" ]] && n="$(cat "$STUB_DIR/pane-$lane.calls")"
@@ -528,6 +529,7 @@ case "${1:-}" in
     # other case is unaffected.
     w=0; [[ -f "$STUB_DIR/width-$lane.txt" ]] && w="$(cat "$STUB_DIR/width-$lane.txt")"
     if [[ "$w" -gt 0 && "$join" -eq 0 ]]; then fold -w "$w" -- "$src"; else cat "$src"; fi
+    [[ "$format" != 'kendex-pane-dead=#{pane_dead}' ]] || printf '\nkendex-pane-dead=0\n'
     exit 0 ;;
   display-message)
     # `-p [-t <pane>] '#S'` asks which session the caller is in.
