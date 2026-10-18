@@ -9,12 +9,10 @@
 set -euo pipefail
 unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-scratch_parent="$ROOT"
-mkdir -p "$scratch_parent/tmp"
 # HOOK_UNDER_TEST overrides the hook each fixture installs, so a must-fail
 # control runs against these same assertions.
 hook_source="${HOOK_UNDER_TEST:-$ROOT/hooks/command-safety.sh}"
-scratch="$(mktemp -d "$scratch_parent/tmp/command-safety-test.XXXXXX")" || { echo 'command-safety-test: scratch=mktemp-failed' >&2; exit 1; }
+scratch="$(mktemp -d)" || { echo 'command-safety-test: scratch=mktemp-failed' >&2; exit 1; }
 [[ -d $scratch && ! -L $scratch ]] || { echo 'command-safety-test: scratch=not-a-directory' >&2; exit 1; }
 scratch="$(cd -- "$scratch" && pwd -P)" || { echo 'command-safety-test: scratch=resolve-failed' >&2; exit 1; }
 trap 'rm -rf -- "$scratch"' EXIT
@@ -220,6 +218,9 @@ fi
 # verdict. The remaining English is not pinned. Every command below stays
 # fixture data submitted only to the hook, including all planted controls.
 # A JSON escape keeps the coprocess data word out of the Bash syntax lint.
+# Named-method rows use the Jarvis config command and lane-host-ssh settings
+# lookups. Mapping methods, line-end aliases and executable xargs input cover
+# the corresponding whole-object and downstream-receiver restrictions.
 environment_rows() {
   local rows expected command_json label world payload payload_cwd status output
   local want first_key invalid shape_kind before=$((passed + failed))
@@ -1158,6 +1159,134 @@ environment_rows() {
 [2,"bash -c 'cat /proc/$$/fd/$1 3</dev/null | cat' _ 3 3<<'EOF'\nenv\nEOF","final-input-unknown-body-data-control"]
 [2,"bash -c 'cat /proc/$BASH\u0050ID/fd/$1 3</dev/null | bash 3</dev/null' _ 3 3<<'EOF'\nenv\nEOF","final-input-unknown-current-body-cleared-receiver"]
 [2,"bash -c '{ cat /proc/$$/fd/3; } 3</proc/self/environ'","inner_source_candidate"]
+[0,"env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE node <<'NODE'\nconst fs=require('node:fs');\nconst rows=fs.readFileSync('tmp/evidence-VGS-1869/readability-before-edit.log','utf8').trim().split('\\n').map(JSON.parse);\nconst minima=new Map();\nfor(const row of rows){const key=row.fg+'/'+row.bg;if(!minima.has(key)||row.ratio<minima.get(key).ratio)minima.set(key,row);}\nfs.writeFileSync('tmp/evidence-VGS-1869/readability-minima.json',JSON.stringify([...minima.values()],null,2)+'\\n');\nconsole.log(JSON.stringify([...minima.values()].map(({name,fg,bg,ratio,floor})=>({name,fg,bg,ratio,floor}))));\nNODE","receiver-node-incident"]
+[0,"python - <<'PYTHON'\nexpected = {'name'}\nif set(['name']) != expected:\n    raise SystemExit('different keys')\nPYTHON","receiver-python-key-inventory"]
+[2,"python <<'CODE'\nimport os; print(os.environ)\nCODE","receiver-python-heredoc-whole-0"]
+[2,"python <<'CODE'\nimport os; print(dict(os.environ))\nCODE","receiver-python-heredoc-whole-1"]
+[0,"python <<'CODE'\nprint(set(['env']))\nCODE","receiver-python-heredoc-safe"]
+[0,"python <<'CODE'\nimport os; print(os.environ['HOME'])\nCODE","receiver-python-heredoc-named"]
+[2,"python -c 'import os; print(os.environ)'","receiver-python-inline-whole-0"]
+[2,"python -c 'import os; print(dict(os.environ))'","receiver-python-inline-whole-1"]
+[0,"python -c 'print(set(['\\''env'\\'']))'","receiver-python-inline-safe"]
+[0,"python -c 'import os; print(os.environ['\\''HOME'\\''])'","receiver-python-inline-named"]
+[2,"python <<CODE\nimport os; print(os.environ)\nCODE","receiver-python-unquoted-whole-0"]
+[2,"python <<CODE\nimport os; print(dict(os.environ))\nCODE","receiver-python-unquoted-whole-1"]
+[0,"python <<CODE\nprint(set(['env']))\nCODE","receiver-python-unquoted-safe"]
+[0,"python <<CODE\nimport os; print(os.environ['HOME'])\nCODE","receiver-python-unquoted-named"]
+[2,"python3 <<'CODE'\nimport os; print(os.environ)\nCODE","receiver-python3-heredoc-whole-0"]
+[0,"python3 <<'CODE'\nprint(set(['env']))\nCODE","receiver-python3-heredoc-safe"]
+[0,"python3 <<'CODE'\nimport os; print(os.environ['HOME'])\nCODE","receiver-python3-heredoc-named"]
+[2,"python3 -c 'import os; print(os.environ)'","receiver-python3-inline-whole-0"]
+[0,"python3 -c 'print(set(['\\''env'\\'']))'","receiver-python3-inline-safe"]
+[0,"python3 -c 'import os; print(os.environ['\\''HOME'\\''])'","receiver-python3-inline-named"]
+[2,"python3 <<CODE\nimport os; print(os.environ)\nCODE","receiver-python3-unquoted-whole-0"]
+[0,"python3 <<CODE\nprint(set(['env']))\nCODE","receiver-python3-unquoted-safe"]
+[0,"python3 <<CODE\nimport os; print(os.environ['HOME'])\nCODE","receiver-python3-unquoted-named"]
+[2,"node <<'CODE'\nconsole.log(JSON.stringify(process.env))\nCODE","receiver-node-heredoc-whole-0"]
+[0,"node <<'CODE'\nconst env=new Set(); env.add('set'); console.log(env)\nCODE","receiver-node-heredoc-safe"]
+[0,"node <<'CODE'\nconsole.log(process.env.HOME)\nCODE","receiver-node-heredoc-named"]
+[2,"node -e 'console.log(JSON.stringify(process.env))'","receiver-node-inline-whole-0"]
+[0,"node -e 'const env=new Set(); env.add('\\''set'\\''); console.log(env)'","receiver-node-inline-safe"]
+[0,"node -e 'console.log(process.env.HOME)'","receiver-node-inline-named"]
+[2,"node <<CODE\nconsole.log(JSON.stringify(process.env))\nCODE","receiver-node-unquoted-whole-0"]
+[0,"node <<CODE\nconst env=new Set(); env.add('set'); console.log(env)\nCODE","receiver-node-unquoted-safe"]
+[0,"node <<CODE\nconsole.log(process.env.HOME)\nCODE","receiver-node-unquoted-named"]
+[2,"ruby <<'CODE'\nputs ENV.to_h\nCODE","receiver-ruby-heredoc-whole-0"]
+[2,"ruby <<'CODE'\nENV.each { |k,v| puts v }\nCODE","receiver-ruby-heredoc-whole-1"]
+[0,"ruby <<'CODE'\nenv = [1].to_set; puts env\nCODE","receiver-ruby-heredoc-safe"]
+[0,"ruby <<'CODE'\nputs ENV['HOME']\nCODE","receiver-ruby-heredoc-named"]
+[2,"ruby -e 'puts ENV.to_h'","receiver-ruby-inline-whole-0"]
+[2,"ruby -e 'ENV.each { |k,v| puts v }'","receiver-ruby-inline-whole-1"]
+[0,"ruby -e 'env = [1].to_set; puts env'","receiver-ruby-inline-safe"]
+[0,"ruby -e 'puts ENV['\\''HOME'\\'']'","receiver-ruby-inline-named"]
+[2,"ruby <<CODE\nputs ENV.to_h\nCODE","receiver-ruby-unquoted-whole-0"]
+[2,"ruby <<CODE\nENV.each { |k,v| puts v }\nCODE","receiver-ruby-unquoted-whole-1"]
+[0,"ruby <<CODE\nenv = [1].to_set; puts env\nCODE","receiver-ruby-unquoted-safe"]
+[0,"ruby <<CODE\nputs ENV['HOME']\nCODE","receiver-ruby-unquoted-named"]
+[2,"perl <<'CODE'\nprint %ENV;\nCODE","receiver-perl-heredoc-whole-0"]
+[0,"perl <<'CODE'\nmy $env = 'set'; print $env;\nCODE","receiver-perl-heredoc-safe"]
+[0,"perl <<'CODE'\nprint $ENV{'HOME'};\nCODE","receiver-perl-heredoc-named"]
+[2,"perl -e 'print %ENV;'","receiver-perl-inline-whole-0"]
+[0,"perl -e 'my $env = '\\''set'\\''; print $env;'","receiver-perl-inline-safe"]
+[0,"perl -e 'print $ENV{'\\''HOME'\\''};'","receiver-perl-inline-named"]
+[2,"perl <<CODE\nprint %ENV;\nCODE","receiver-perl-unquoted-whole-0"]
+[0,"perl <<CODE\nmy \\$env = 'set'; print \\$env;\nCODE","receiver-perl-unquoted-safe"]
+[0,"perl <<CODE\nprint \\$ENV{'HOME'};\nCODE","receiver-perl-unquoted-named"]
+[2,"unknown <<'CODE'\nset([1])\nCODE","receiver-unknown-conservative"]
+[0,"cat > tmp/helper.sh <<'HELPER'\nshell_env=(env NAME=value)\nHELPER\nunknown <<'DATA'\nordinary\nDATA","receiver-unknown-after-file-data"]
+[2,"node <<CODE\nconsole.log('$(env)')\nCODE","receiver-node-shell-expansion"]
+[0,"python3 -c 'import json,os; print(json.dumps({k:os.environ.get(k,\"\") for k in (\"JARVIS_CONTROL_HOST\",\"JARVIS_LOG_DIR\",\"JARVIS_WAKE_SETTLE_SECS\")}))'","receiver-jarvis-config-named-method"]
+[0,"python3 <<'CODE'\nimport json,os; print(json.dumps({k:os.environ.get(k,\"\") for k in (\"JARVIS_CONTROL_HOST\",\"JARVIS_LOG_DIR\",\"JARVIS_WAKE_SETTLE_SECS\")}))\nCODE","receiver-jarvis-heredoc-named-method"]
+[0,"python -c 'import os; print(os.environ.get('\"'\"'HOME'\"'\"'))'","receiver-python-inline-named-get"]
+[0,"python -c 'import os; print(os.environ.pop('\"'\"'HOME'\"'\"'))'","receiver-python-inline-named-pop"]
+[0,"python -c 'import os; print(os.environ.setdefault('\"'\"'HOME'\"'\"'))'","receiver-python-inline-named-setdefault"]
+[0,"python -c 'import os; print(os.environ.__getitem__('\"'\"'HOME'\"'\"'))'","receiver-python-inline-named-__getitem__"]
+[0,"python -c 'import os; print(os.environ.__contains__('\"'\"'HOME'\"'\"'))'","receiver-python-inline-named-__contains__"]
+[2,"python -c 'import os; print(os.environ.items())'","receiver-python-inline-mapping-items"]
+[2,"python -c 'import os; print(os.environ.keys())'","receiver-python-inline-mapping-keys"]
+[2,"python -c 'import os; print(os.environ.values())'","receiver-python-inline-mapping-values"]
+[2,"python -c 'import os; print(os.environ.copy())'","receiver-python-inline-mapping-copy"]
+[2,"python -c 'import os; print(os.environ.popitem())'","receiver-python-inline-mapping-popitem"]
+[0,"python -c 'import os; print(os.environ.get(\"LANE_HOST_SSH_INVENTORY\", \"\")); print(os.environ.get(\"LANE_HOST_SSH_SOURCE\", os.getcwd()))'","receiver-python-inline-lane-host-named-methods"]
+[2,"python -c 'import os\ne = os.environ\nfor k in e: print(k, e[k])'","receiver-python-inline-whole-line-end"]
+[2,"python -c 'import os; home = os.environ.get('\"'\"'HOME'\"'\"')\ne = os.environ\nfor k in e: print(k, e[k])'","receiver-python-inline-named-then-whole"]
+[0,"python -c 'print(os.environment)'","receiver-python-inline-identifier-suffix"]
+[0,"python <<'CODE'\nimport os; print(os.environ.get('HOME'))\nCODE","receiver-python-heredoc-named-get"]
+[0,"python <<'CODE'\nimport os; print(os.environ.pop('HOME'))\nCODE","receiver-python-heredoc-named-pop"]
+[0,"python <<'CODE'\nimport os; print(os.environ.setdefault('HOME'))\nCODE","receiver-python-heredoc-named-setdefault"]
+[0,"python <<'CODE'\nimport os; print(os.environ.__getitem__('HOME'))\nCODE","receiver-python-heredoc-named-__getitem__"]
+[0,"python <<'CODE'\nimport os; print(os.environ.__contains__('HOME'))\nCODE","receiver-python-heredoc-named-__contains__"]
+[2,"python <<'CODE'\nimport os; print(os.environ.items())\nCODE","receiver-python-heredoc-mapping-items"]
+[2,"python <<'CODE'\nimport os; print(os.environ.keys())\nCODE","receiver-python-heredoc-mapping-keys"]
+[2,"python <<'CODE'\nimport os; print(os.environ.values())\nCODE","receiver-python-heredoc-mapping-values"]
+[2,"python <<'CODE'\nimport os; print(os.environ.copy())\nCODE","receiver-python-heredoc-mapping-copy"]
+[2,"python <<'CODE'\nimport os; print(os.environ.popitem())\nCODE","receiver-python-heredoc-mapping-popitem"]
+[0,"python <<'CODE'\nimport os; print(os.environ.get(\"LANE_HOST_SSH_INVENTORY\", \"\")); print(os.environ.get(\"LANE_HOST_SSH_SOURCE\", os.getcwd()))\nCODE","receiver-python-heredoc-lane-host-named-methods"]
+[2,"python <<'CODE'\nimport os\ne = os.environ\nfor k in e: print(k, e[k])\nCODE","receiver-python-heredoc-whole-line-end"]
+[2,"python <<'CODE'\nimport os; home = os.environ.get('HOME')\ne = os.environ\nfor k in e: print(k, e[k])\nCODE","receiver-python-heredoc-named-then-whole"]
+[0,"python <<'CODE'\nprint(os.environment)\nCODE","receiver-python-heredoc-identifier-suffix"]
+[0,"python3 -c 'import os; print(os.environ.get('\"'\"'HOME'\"'\"'))'","receiver-python3-inline-named-get"]
+[0,"python3 -c 'import os; print(os.environ.pop('\"'\"'HOME'\"'\"'))'","receiver-python3-inline-named-pop"]
+[0,"python3 -c 'import os; print(os.environ.setdefault('\"'\"'HOME'\"'\"'))'","receiver-python3-inline-named-setdefault"]
+[0,"python3 -c 'import os; print(os.environ.__getitem__('\"'\"'HOME'\"'\"'))'","receiver-python3-inline-named-__getitem__"]
+[0,"python3 -c 'import os; print(os.environ.__contains__('\"'\"'HOME'\"'\"'))'","receiver-python3-inline-named-__contains__"]
+[2,"python3 -c 'import os; print(os.environ.items())'","receiver-python3-inline-mapping-items"]
+[2,"python3 -c 'import os; print(os.environ.keys())'","receiver-python3-inline-mapping-keys"]
+[2,"python3 -c 'import os; print(os.environ.values())'","receiver-python3-inline-mapping-values"]
+[2,"python3 -c 'import os; print(os.environ.copy())'","receiver-python3-inline-mapping-copy"]
+[2,"python3 -c 'import os; print(os.environ.popitem())'","receiver-python3-inline-mapping-popitem"]
+[0,"python3 -c 'import os; print(os.environ.get(\"LANE_HOST_SSH_INVENTORY\", \"\")); print(os.environ.get(\"LANE_HOST_SSH_SOURCE\", os.getcwd()))'","receiver-python3-inline-lane-host-named-methods"]
+[2,"python3 -c 'import os\ne = os.environ\nfor k in e: print(k, e[k])'","receiver-python3-inline-whole-line-end"]
+[2,"python3 -c 'import os; home = os.environ.get('\"'\"'HOME'\"'\"')\ne = os.environ\nfor k in e: print(k, e[k])'","receiver-python3-inline-named-then-whole"]
+[0,"python3 -c 'print(os.environment)'","receiver-python3-inline-identifier-suffix"]
+[0,"python3 <<'CODE'\nimport os; print(os.environ.get('HOME'))\nCODE","receiver-python3-heredoc-named-get"]
+[0,"python3 <<'CODE'\nimport os; print(os.environ.pop('HOME'))\nCODE","receiver-python3-heredoc-named-pop"]
+[0,"python3 <<'CODE'\nimport os; print(os.environ.setdefault('HOME'))\nCODE","receiver-python3-heredoc-named-setdefault"]
+[0,"python3 <<'CODE'\nimport os; print(os.environ.__getitem__('HOME'))\nCODE","receiver-python3-heredoc-named-__getitem__"]
+[0,"python3 <<'CODE'\nimport os; print(os.environ.__contains__('HOME'))\nCODE","receiver-python3-heredoc-named-__contains__"]
+[2,"python3 <<'CODE'\nimport os; print(os.environ.items())\nCODE","receiver-python3-heredoc-mapping-items"]
+[2,"python3 <<'CODE'\nimport os; print(os.environ.keys())\nCODE","receiver-python3-heredoc-mapping-keys"]
+[2,"python3 <<'CODE'\nimport os; print(os.environ.values())\nCODE","receiver-python3-heredoc-mapping-values"]
+[2,"python3 <<'CODE'\nimport os; print(os.environ.copy())\nCODE","receiver-python3-heredoc-mapping-copy"]
+[2,"python3 <<'CODE'\nimport os; print(os.environ.popitem())\nCODE","receiver-python3-heredoc-mapping-popitem"]
+[0,"python3 <<'CODE'\nimport os; print(os.environ.get(\"LANE_HOST_SSH_INVENTORY\", \"\")); print(os.environ.get(\"LANE_HOST_SSH_SOURCE\", os.getcwd()))\nCODE","receiver-python3-heredoc-lane-host-named-methods"]
+[2,"python3 <<'CODE'\nimport os\ne = os.environ\nfor k in e: print(k, e[k])\nCODE","receiver-python3-heredoc-whole-line-end"]
+[2,"python3 <<'CODE'\nimport os; home = os.environ.get('HOME')\ne = os.environ\nfor k in e: print(k, e[k])\nCODE","receiver-python3-heredoc-named-then-whole"]
+[0,"python3 <<'CODE'\nprint(os.environment)\nCODE","receiver-python3-heredoc-identifier-suffix"]
+[2,"node -e 'const e = process.env\nfor (const k in e) console.log(k, e[k])'","receiver-node-inline-whole-line-end"]
+[2,"node -e 'const home = process.env.HOME;\nconst e = process.env\nfor (const k in e) console.log(k, e[k])'","receiver-node-inline-named-then-whole"]
+[0,"node -e 'const home = process.env.HOME\nconsole.log(home)'","receiver-node-inline-named-line-end"]
+[2,"node <<'CODE'\nconst e = process.env\nfor (const k in e) console.log(k, e[k])\nCODE","receiver-node-heredoc-whole-line-end"]
+[2,"node <<'CODE'\nconst home = process.env.HOME;\nconst e = process.env\nfor (const k in e) console.log(k, e[k])\nCODE","receiver-node-heredoc-named-then-whole"]
+[0,"node <<'CODE'\nconst home = process.env.HOME\nconsole.log(home)\nCODE","receiver-node-heredoc-named-line-end"]
+[2,"node <<'CODE' | xargs -I{} sh -c {}\nconsole.log('env')\nCODE","receiver-node-unknown-downstream"]
+[2,"python <<'CODE' | xargs -I{} sh -c {}\nprint('env')\nCODE","receiver-python-unknown-downstream"]
+[2,"ruby <<'CODE' | xargs -I{} sh -c {}\nputs('env')\nCODE","receiver-ruby-unknown-downstream"]
+[2,"perl <<'CODE' | xargs -I{} sh -c {}\nprint('env');\nCODE","receiver-perl-unknown-downstream"]
+[2,"node <<'CODE' | cat | xargs -I{} sh -c {}\nconsole.log('env')\nCODE","receiver-indirect-unknown-downstream"]
+[2,"xargs -I{} sh -c {} <<'CODE' | node\nenv\nCODE","receiver-unknown-before-interpreter"]
+[0,"python <<'CODE' | node\nprint('const env = new Set();')\nCODE","receiver-interpreter-only-pipeline"]
+[0,"node <<'JS'; unknown <<'DATA'\nconst env = new Set();\nJS\nordinary\nDATA","receiver-independent-unknown-body"]
 ENVIRONMENT_ROWS
   ) || exit 1
   while IFS=$'\t' read -r expected command_json label world; do
@@ -1330,6 +1459,11 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "systemctl-literal-argument" { swap("[ \"${args[$j]}\" != show-environment ] || mode=dump-lines", "[ \"${arg_kinds[$j]}\" != literal ] || [ \"${args[$j]}\" != show-environment ] || mode=dump-lines") }
       defect == "escaped-argument-pass" { swap("[ \"${arg_kinds[$j]}\" != ansi-escaped ] || { mode=dump-unknown; return; }", "[ \"${arg_kinds[$j]}\" != ansi-escaped ] || :") }
       defect == "escaped-input-pass" { swap("[ -z \"$input_escaped\" ] || { mode=dump-unknown; return; }", "[ -z \"$input_escaped\" ] || :") }
+      defect == "receiver-classification" && $0 == "  environment_receiver" { swap("  environment_receiver", "  receiver=unknown; receiver_pattern=; receiver_option=") }
+      defect == "receiver-evidence" { swap("while [[ $remaining =~ $receiver_pattern ]]; do", "while [[ $remaining =~ a^ ]]; do") }
+      defect == "receiver-named-method" { swap("(get|pop|setdefault|__getitem__|__contains__)", "(get-disabled|pop|setdefault|__getitem__|__contains__)") }
+      defect == "receiver-line-boundary" { swap("if [[ $remaining =~ ^[A-Za-z0-9_]+ ]]; then", "if [[ $remaining =~ ^[[:space:]]*[A-Za-z0-9_]+ ]]; then") }
+      defect == "receiver-body-forwarding" { swap("body_decisions[doc]=fallback", ":") }
       { print }
       END { if (changed != 1) exit 1 }
     ' "$hook_source" >"$mutant" || exit 1
@@ -1355,6 +1489,21 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       printf 'FAIL environment control %s: exit=%s missing=%s\n' "$defect" "$control_status" "$failed_row"; failed=$((failed + 1))
     fi
   done <<'ENVIRONMENT_CONTROLS'
+receiver-named-method|FAIL environment: receiver-jarvis-config-named-method: exit=2 expected=0
+receiver-named-method|FAIL environment: receiver-jarvis-heredoc-named-method: exit=2 expected=0
+receiver-line-boundary|FAIL environment: receiver-python-heredoc-whole-line-end: exit=0 expected=2
+receiver-line-boundary|FAIL environment: receiver-node-heredoc-whole-line-end: exit=0 expected=2
+receiver-body-forwarding|FAIL environment: receiver-node-unknown-downstream: exit=0 expected=2
+receiver-body-forwarding|FAIL environment: receiver-unknown-before-interpreter: exit=0 expected=2
+receiver-classification|FAIL environment: receiver-node-incident: exit=2 expected=0
+receiver-classification|FAIL environment: receiver-python-key-inventory: exit=2 expected=0
+receiver-evidence|FAIL environment: receiver-python-heredoc-whole-0: exit=0 expected=2
+receiver-evidence|FAIL environment: receiver-python-heredoc-whole-1: exit=0 expected=2
+receiver-evidence|FAIL environment: receiver-python3-heredoc-whole-0: exit=0 expected=2
+receiver-evidence|FAIL environment: receiver-node-heredoc-whole-0: exit=0 expected=2
+receiver-evidence|FAIL environment: receiver-ruby-heredoc-whole-0: exit=0 expected=2
+receiver-evidence|FAIL environment: receiver-ruby-heredoc-whole-1: exit=0 expected=2
+receiver-evidence|FAIL environment: receiver-perl-heredoc-whole-0: exit=0 expected=2
 literal-source-veto|FAIL environment: fleet-literal-command-string-setup: exit=2 expected=0
 quoted-data-cut|FAIL environment: quoted-operator-with-heredoc-remains-data: exit=2 expected=0
 no-check|FAIL environment: incident: exit=0 expected=2
@@ -1467,7 +1616,7 @@ suffix-quotes|FAIL environment: wrapper-quoted-bare-env-data: exit=2 expected=0
 suffix-quotes|FAIL environment: wrapper-quoted-set-data: exit=2 expected=0
 quoted-heredoc|FAIL environment: quoted-heredoc-script: exit=2 expected=0
 quoted-heredoc|FAIL environment: double-quoted-heredoc-data: exit=2 expected=0
-file-body-retained|FAIL environment: written-helper-followed-python-body: exit=2 expected=0
+file-body-retained|FAIL environment: receiver-unknown-after-file-data: exit=2 expected=0
 piped-file-body-mask|FAIL environment: redirected-cat-body-piped-to-interpreter: exit=0 expected=2
 heredoc-resume|FAIL environment: dump-after-quoted-heredoc: exit=0 expected=2
 unset-operand|FAIL environment: unset-without-program: exit=0 expected=2
