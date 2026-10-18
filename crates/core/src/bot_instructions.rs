@@ -1,4 +1,4 @@
-//! The installed bot-instructions package owns its render grammar. kendex
+//! The selected configuration package owns its render grammar. kendex
 //! locates and runs that package after it changes a project, then carries the
 //! package's reported output paths into the commit offer. Verification uses a
 //! caller-supplied trusted checker and reads the installed doctrine as data.
@@ -13,6 +13,42 @@ use crate::model::Scope;
 use crate::repo_effects::{ArmError, DeclaredEffects};
 
 const PACKAGE: &str = "bot-instructions";
+const CONFIGURATION_PACKAGE: &str = "github-repository-settings";
+
+/// Select before checking consent: an unarmed new owner cannot license the
+/// old owner's code. Only these configuration effects run automatically.
+pub(crate) fn configuration_owner(env: &Env, scope: &Scope) -> Result<Option<DeclaredEffects>> {
+    select_configuration_owner(|name| {
+        crate::engine::installed_declaration(env, scope, name).transpose()
+    })
+    .transpose()
+}
+
+/// Whole-scope checks keep unreadable declarations as rows so their local
+/// arming records can decide whether a failed read is a lapse. Selecting that
+/// row still prevents fallback to the superseded configuration checker.
+pub(crate) fn select_configuration_owner<T>(
+    mut find: impl FnMut(&'static str) -> Option<T>,
+) -> Option<T> {
+    for name in [CONFIGURATION_PACKAGE, PACKAGE] {
+        if let Some(declared) = find(name) {
+            return Some(declared);
+        }
+    }
+    None
+}
+
+/// The selected effect also judges changes to its superseded dependency.
+pub(crate) fn commit_owner(
+    env: &Env,
+    scope: &Scope,
+    declared: &DeclaredEffects,
+) -> Result<DeclaredEffects> {
+    if declared.name != PACKAGE {
+        return Ok(declared.clone());
+    }
+    Ok(configuration_owner(env, scope)?.unwrap_or_else(|| declared.clone()))
+}
 
 /// Compare bot files through a trusted package supplied for this invocation.
 ///
@@ -95,7 +131,7 @@ fn verify_error(root: &Path, detail: impl std::fmt::Display) -> CoreError {
     }
 }
 
-/// Re-render every enabled bot-instruction surface in this project.
+/// Re-render the selected configuration owner's outputs in this project.
 ///
 /// An absent package is not an error. The scope does not use this package,
 /// so there is no package-owned render to run.
@@ -103,7 +139,7 @@ pub fn render(env: &Env, scope: &Scope) -> Result<RenderedPaths> {
     run(env, scope, Mode::Write)
 }
 
-/// Add every enabled bot-instruction surface to the files a commit offer
+/// Add the selected configuration owner's outputs to the files a commit offer
 /// covers. The package remains the one judge of which flags produce paths.
 pub fn add_to_generated(env: &Env, scope: &Scope, generated: &mut GeneratedPaths) -> Result<()> {
     let paths = run(env, scope, Mode::Discover)?;
@@ -125,7 +161,7 @@ pub fn render_once(
     env: &Env,
     scope: &Scope,
 ) -> std::result::Result<Option<crate::guard::GuardReport>, ArmError> {
-    let Some(declared) = crate::engine::installed_declaration(env, scope, PACKAGE)? else {
+    let Some(declared) = configuration_owner(env, scope)? else {
         return Ok(None);
     };
     let report = crate::repo_effects::run_script(scope, &declared.root, declared.installer()?)?;
@@ -168,10 +204,13 @@ pub struct Skipped {
 impl Skipped {
     /// The line a surface prints for it.
     pub fn line(&self) -> String {
+        let name = &self.declared.name;
         match &self.set_up_in {
-            None => "bot-instructions: render skipped; use Set up on the bot-instructions package page, or remove and add it with --allow-repo-effects, then apply again".to_owned(),
+            None => format!(
+                "{name}: render skipped; use Set up on the {name} package page, or remove and add it with --allow-repo-effects, then apply again"
+            ),
             Some(main) => format!(
-                "bot-instructions: render skipped in this work tree; it is set up in the main checkout at {}, and each work tree is set up on its own: use Set up on the bot-instructions package page, then apply again",
+                "{name}: render skipped in this work tree; it is set up in the main checkout at {}, and each work tree is set up on its own: use Set up on the {name} package page, then apply again",
                 crate::paths::slashed(main)
             ),
         }
@@ -207,7 +246,7 @@ fn run(env: &Env, scope: &Scope, mode: Mode) -> Result<RenderedPaths> {
     let Scope::Project { root } = scope.canonical() else {
         return Ok(RenderedPaths::default());
     };
-    let Some(declared) = crate::engine::installed_declaration(env, scope, PACKAGE)? else {
+    let Some(declared) = configuration_owner(env, scope)? else {
         return Ok(RenderedPaths::default());
     };
     if !crate::repo_effects::armed_here(scope, &declared)? {
