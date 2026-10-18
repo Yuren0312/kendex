@@ -18,7 +18,9 @@ pub use file::{
 // Crate-only: the apply op is `save`'s one sanctioned caller — it checks
 // its precondition first. Anywhere else, a direct save is a whole-file
 // write with no base check, the exact door `read_for_mutation` closes.
+pub(crate) use file::project_manifest_from;
 pub(crate) use file::save;
+pub(crate) use validate::table_key;
 pub use validate::{Finding, joined, output_style_count, validate};
 
 /// Current manifest schema. Each bump supplies a step in `migrate` so an

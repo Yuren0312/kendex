@@ -84,7 +84,7 @@ pub enum Staleness {
 /// changes, or under one of the paths it declares it writes. A package
 /// declaring no installer holds nothing, since no setup could clear the
 /// hold. One not set up here holds the commit without any of its code
-/// running.
+/// running, unless its declared configuring table is absent.
 ///
 /// One set up here that declares a staged checker is judged by it, run
 /// over the commit itself, built once per call in an index of its own. It
@@ -131,20 +131,22 @@ pub fn stale(
             continue;
         }
         let why = match crate::repo_effects::armed_here(scope, &declared)? {
-            false => Staleness::NotSetUp,
+            false => {
+                if let Some(key) = &declared.effects.configured_by {
+                    let built = Candidate::ensure(&mut candidate, &scan.root, generated, carried)?;
+                    if !built.configured(&scan.root, key)? {
+                        continue;
+                    }
+                }
+                Staleness::NotSetUp
+            }
             true => {
                 let working = || crate::repo_effects::status(scope, &declared, Ask::Surface);
                 let holds = match &declared.effects.staged_checker {
                     None => standing(working(), Staleness::OutOfDate),
                     Some(_) => {
-                        let candidate = match &mut candidate {
-                            Some(built) => built,
-                            None => candidate.insert(Candidate::build(
-                                &scan.root,
-                                generated,
-                                &carried.iter().cloned().collect::<Vec<_>>(),
-                            )?),
-                        };
+                        let candidate =
+                            Candidate::ensure(&mut candidate, &scan.root, generated, carried)?;
                         standing(candidate.status(scope, &declared), |said| {
                             standing(working(), Staleness::OutOfDate).unwrap_or_else(|| {
                                 Staleness::Split {
