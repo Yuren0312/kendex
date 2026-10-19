@@ -1817,7 +1817,9 @@ trap 'interrupted TERM' TERM
 trap 'interrupted INT' INT
 trap 'interrupted HUP' HUP
 ol_succession_hook() { SUCC_PANE="$OL_SESSION" SUCC_WINDOW="$OL_WINDOW"; }
+handoff_policy=required
+case "$MODE" in dead|walled) handoff_policy=optional ;; esac
 ol_succession "$CALLER_PANE" "$CALLER_PATH" "$cmd" "$OL_IDENTITY" "$PENDING" \
-  "$lane_var" "$lane_dir" "$LANE_FORM" "$WAIT_SECS" \
+  "$lane_var" "$lane_dir" "$LANE_FORM" "$WAIT_SECS" "$handoff_policy" \
   || die launch-failed "reason=$OL_REASON"
 message successor-working "window=$SUCC_WINDOW" "pane=$SUCC_PANE"

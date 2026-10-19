@@ -63,8 +63,9 @@ fixture_server_allocate() { # SIDE MODE PHASE
   FIXTURE_SOCKET="$TMUX_DIR/tmux-$uid/$FIXTURE_NAME"
 }
 fixture_server_start() {
+  mkdir -p "$TMP_ROOT/work" || return 1
   env PATH="$BIN:$PATH" TMUX_TMPDIR="$TMUX_DIR" ORCH_STATE_DIR="$TMP_ROOT/work/tmp" tmux -L "$FIXTURE_NAME" -f /dev/null \
-    new-session -d -s fleet -x 200 -y 40 'exec sleep 100000' || return 1
+    new-session -d -s fleet -c "$TMP_ROOT/work" -x 200 -y 40 'exec sleep 100000' || return 1
   FIXTURE_SOCKETS+=("$FIXTURE_SOCKET")
   tmux -S "$FIXTURE_SOCKET" set-option -g default-shell /bin/sh || return 1
   tmux -S "$FIXTURE_SOCKET" set-option -g default-command "PATH=$BIN:\$PATH; export PATH; exec /bin/sh" || return 1
@@ -375,7 +376,7 @@ field() { sed -n "s/.* $2=\([^ ]*\).*/\1/p" <<<"$(sed -n 1p <<<"$1")"; }
 layout() { tm list-windows -t fleet -F '#{window_id} #{window_index} #{window_name}' | awk -v keep="$KEEP_WINDOW" '$1 != keep { print $2, $3 }' | tr '\n' ';'; }
 overseers() { tm list-windows -t fleet -F '#{window_name}' | awk '$0 == "overseer"' | wc -l | tr -d ' '; }
 listed() { tm list-panes -a -F '#{pane_id}' | grep -cxF -- "$1" || true; }
-recorded_argv() { controller_fixture_argv "$TMP_ROOT/argv.claude" claude; }
+recorded_argv() { controller_fixture_argv "$TMP_ROOT/argv.claude"; }
 BRIEF='Read .agents/skills/orch/SKILL.md and follow .agents/skills/orch/workflows/oversee-takeover.md with the overseer handoff at tmp/handoffs/OVERSEER-HANDOFF.md'
 
 echo "=== oversee ==="
@@ -557,14 +558,11 @@ assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)" \
 # register: the record for a hand-opened pane, its generation one past the
 # record's, kept where the record already names that pane.
 HAND_GEN=$(( $(recorded generation) + 1 ))
-HAND="$(tm new-window -d -t fleet:4 -n hand -P -F '#{pane_id}' "exec '$BIN/hclaude' 100000")"
+HAND="$(tm new-window -d -c "$TMP_ROOT/work" -t fleet:4 -n hand -P -F '#{pane_id}' "exec '$BIN/hclaude' 100000")"
 run_oversee TMUX="$TMUX_ADDR" TMUX_PANE="$HAND" CLAUDE_CONFIG_DIR="$H/.eclaude" -- register
-assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(keyed registered "$OUT" | sed -n 1p)|$(recorded runtime)|$(recorded account)|$(recorded launch_line)|$(recorded server_start)" \
-  "0|oversee: identity-fallback session=$HAND cause=no-start-row|oversee: registered session=$HAND window=$(tm display-message -p -t "$HAND" '#{window_id}') server=$SERVER_PID generation=$HAND_GEN account=$H/.eclaude retained=lifecycle fresh=account,cwd,generation,harness,home,pane,runtime,server,server_socket,server_start,session_rows,window|tmux|$H/.eclaude|none|$SERVER_START" \
-  "register with no SessionStart row reads the pane as the named fallback, says so, writes the record one generation past it with its server's start, and drops the launch line the record held"
-HAND_IDENTITY="claude|$H/.eclaude|$H/.eclaude|none|none|$(tm display-message -p -t "$HAND" '#{pane_current_path}')|"
-assert_eq "$(identity)" "$HAND_IDENTITY" \
-  "register records the harness the pane runs, its account and directory, and no model or effort"
+assert_eq "$RC|$(grep -c '^oversee: registration-pending ' <<<"$OUT")|$(recorded pane)|$(jq -r '.overseer.lifecycle.state' "$FLEET_STATE")" \
+  "1|1|none|blocked" \
+  "a hand-opened pane without native confirmation remains pending and publishes no controller"
 # A server start that cannot be read writes nothing: a record with no start
 # would name no session.
 run_oversee TMUX="$TMUX_ADDR" TMUX_PANE="$HAND" CLAUDE_CONFIG_DIR="$H/.eclaude" -- register
@@ -593,8 +591,11 @@ assert_eq "$RC|$(sed -n 1p <<<"$OUT" | cut -d' ' -f1-2)|$(identity)$(recorded se
 mv -- "$TMP_ROOT/state.before-row" "$FLEET_STATE"
 : > "$HAND_ROWS"
 run_oversee TMUX="$TMUX_ADDR" TMUX_PANE="$HAND" -- register --account "$H/.claude"
-assert_eq "$RC|$(recorded account)" "0|$H/.claude" \
-  "registering the same pane again takes --account"
+assert_eq "$RC|$(jq -r '.overseer.lifecycle.account' "$FLEET_STATE")|$(recorded pane)" "1|$H/.claude|none" \
+  "pending registration takes --account without publishing the pane"
+hand_start_row
+run_oversee TMUX="$TMUX_ADDR" TMUX_PANE="$HAND" -- register --account "$H/.claude"
+assert_eq "$RC|$(recorded account)" "0|$H/.claude" "the pending session completes after its native row arrives"
 run_oversee -- register
 assert_eq "$RC|$(sed -n 1p <<<"$OUT")" \
   "1|oversee: tmux-missing var=TMUX_PANE" \
@@ -678,7 +679,7 @@ cat > "$BIN/copilot" <<STUB
 #!/bin/sh
 { printf 'home=%s\n' "\${COPILOT_HOME:-}"; printf '%s\n' "\$@"; } > "$TMP_ROOT/argv.copilot"
 echo 'esc to interrupt'
-exec "$BIN/processes/copilot" 100000
+exec "$BIN/processes/copilot" "\$@"
 STUB
 chmod +x "$BIN/copilot"
 mkdir -p "$H/.1copilot"
@@ -715,7 +716,10 @@ controller_fixture_await_ended "$SRC_DIR" "$FLEET_STATE" || exit 1
 mkdir -p "$TMP_ROOT/codex-bin"
 cp "$(command -v sleep)" "$TMP_ROOT/codex-bin/codex"
 PRIVATE_HOME="$H/.codex/lane-launch/work-1/home"
-CODEX_PANE="$(tm new-window -d -t fleet:6 -n codexhand -P -F '#{pane_id}' "exec '$TMP_ROOT/codex-bin/codex' 100000")"
+CODEX_PANE="$(tm new-window -d -c "$TMP_ROOT/work" -t fleet:6 -n codexhand -P -F '#{pane_id}' "exec '$TMP_ROOT/codex-bin/codex' 100000")"
+jq -cn --arg account "$H/.codex" --arg cwd "$WORK_REAL" \
+  '{at:1,event:"SessionStart",harness:"codex",account:$account,session_id:"s1",cwd:$cwd}' \
+  > "$TMP_ROOT/work/tmp/lane-mail/overseer/session-$SERVER_PID-${CODEX_PANE#%}.jsonl"
 register_codex() { # [OVERSEE_BIN]
   OVERSEE_BIN="${1:-}" run_oversee TMUX="$TMUX_ADDR" TMUX_PANE="$CODEX_PANE" CODEX_HOME="$PRIVATE_HOME" -- register
 }
@@ -738,7 +742,7 @@ printf '%s\n' "'$CP/wrap' '$CP/binary.sh'; :" > "$CP/tool.sh"
 printf '%s\n' "'$CP/wrap' '$CP/tool.sh'; :" > "$CP/deep.sh"
 # copilot_pane NAME PROGRAM SCRIPT — a pane whose own process is PROGRAM
 # running SCRIPT.
-copilot_pane() { tm new-window -d -t "fleet:$1" -n "cp$1" -P -F '#{pane_id}' "export COPILOT_HOME='$H/.1copilot'; exec '$CP/$2' '$CP/$3'"; }
+copilot_pane() { tm new-window -d -c "$TMP_ROOT/work" -t "fleet:$1" -n "cp$1" -P -F '#{pane_id}' "export COPILOT_HOME='$H/.1copilot'; exec '$CP/$2' '$CP/$3'"; }
 COPILOT_PANE="$(copilot_pane 7 node binary.sh)"
 # A Claude overseer behind a wrapper with a Copilot run under it: the pane
 # reads wrap, which names no harness and is no Copilot pane.
@@ -749,12 +753,31 @@ DEEP_PANE="$(copilot_pane 9 node deep.sh)"
 # A second Copilot pane, which no record has ever named.
 FRESH_PANE="$(copilot_pane 10 node binary.sh)"
 register_on() { # PANE [OVERSEE_BIN] [ARGS...]
-  local pane="$1" bin="${2:-}"
+  local pane="$1" bin="${2:-}" old harness="" replacement
   shift 2
-  # Identity cases do not claim a second overseer while its holder runs.
-  if [[ "$(recorded pane)" != "$pane" ]]; then
-    jq '.overseer.server_start = 0' "$FLEET_STATE" > "$FLEET_STATE.identity"
-    mv -- "$FLEET_STATE.identity" "$FLEET_STATE"
+  old="$(jq -r '.overseer.pane // .overseer.lifecycle.terminal.pane // "none"' "$FLEET_STATE")"
+  if [[ "$old" != "$pane" && "$old" != none ]] && [[ "$(listed "$old")" != 0 ]]; then
+    tm kill-window -t "$old"
+    if jq -e '.overseer.lifecycle.process != null' "$FLEET_STATE" >/dev/null; then
+      controller_fixture_await_ended "$SRC_DIR" "$FLEET_STATE" || return 1
+    fi
+  fi
+  # Each policy row owns its pane; a previously retired row gets a new one.
+  if [[ "$(listed "$pane")" == 0 ]]; then
+    case "$pane" in
+      "$COPILOT_PANE") replacement="$(copilot_pane 7 node binary.sh)"; COPILOT_PANE="$replacement" ;;
+      "$FRESH_PANE") replacement="$(copilot_pane 10 node binary.sh)"; FRESH_PANE="$replacement" ;;
+      "$WRAPPED_PANE") replacement="$(copilot_pane 8 wrap binary.sh)"; WRAPPED_PANE="$replacement" ;;
+      "$DEEP_PANE") replacement="$(copilot_pane 9 node deep.sh)"; DEEP_PANE="$replacement" ;;
+      *) return 1 ;;
+    esac
+    pane="$replacement"
+  fi
+  case "$pane" in "$COPILOT_PANE" | "$FRESH_PANE") harness=copilot ;; esac
+  if [[ -n "$harness" ]]; then
+    jq -cn --arg harness "$harness" --arg account "$H/.1copilot" --arg cwd "$WORK_REAL" \
+      '{at:1,event:"SessionStart",harness:$harness,account:$account,session_id:"s1",cwd:$cwd}' \
+      > "$TMP_ROOT/work/tmp/lane-mail/overseer/session-$SERVER_PID-${pane#%}.jsonl"
   fi
   OVERSEE_BIN="$bin" run_oversee TMUX="$TMUX_ADDR" TMUX_PANE="$pane" CLAUDE_CONFIG_DIR="$H/.claude" -- register "$@"
 }
@@ -789,11 +812,11 @@ register_on "$FRESH_PANE" ''
 assert_eq "$RC|$(recorded pane)|$(recorded harness)|$(recorded account)" "0|$FRESH_PANE|copilot|$FRESH_ACCOUNT" \
   "register on a copilot pane no record names, with no --account, records the account its Copilot process runs on"
 register_on "$WRAPPED_PANE" ''
-assert_eq "$RC|$(recorded harness)" "0|none" \
-  "a pane reading neither node nor copilot is no copilot pane, whatever runs under it"
+assert_eq "$RC|$(recorded pane)|$(recorded harness)" "1|none|none" \
+  "a pane with neither native identity nor a recognized harness remains unregistered"
 register_on "$DEEP_PANE" ''
-assert_eq "$RC|$(recorded harness)" "0|none" \
-  "a node pane whose Copilot run sits three levels down is not a copilot pane"
+assert_eq "$RC|$(recorded pane)|$(recorded harness)" "1|none|none" \
+  "a nested Copilot process supplies no controller identity for its pane"
 # A running home whose EXTENSIONS flag is false and that sets no statusLine
 # takes no reader: register warns and still records the session.
 cp -- "$H/.1copilot/settings.json" "$TMP_ROOT/settings.before-disabled"
@@ -808,6 +831,8 @@ mv -- "$TMP_ROOT/settings.before-disabled" "$H/.1copilot/settings.json"
 # its COPILOT_HOME: register with no --account takes it, in a pane that reads
 # no Copilot process, and installs the context reader in that home.
 rm -rf -- "${H:?}/.1copilot/extensions"
+HAND="$(tm new-window -d -c "$TMP_ROOT/work" -t fleet -n hand-row -P -F '#{pane_id}' "exec '$BIN/hclaude' 100000")"
+HAND_ROWS="$WORK_REAL/tmp/lane-mail/overseer/session-$SERVER_PID-${HAND#%}.jsonl"
 jq -cn --arg account "$H/.1copilot" --arg cwd "$WORK_REAL" '{at: 1, event: "SessionStart",
   harness: "copilot", session_id: "c0p1", transcript_path: "/t/c0p1/events.jsonl", cwd: $cwd,
   account: $account}' > "$HAND_ROWS"
@@ -816,40 +841,10 @@ register_on "$HAND" ''
 assert_eq "$RC|$(identity)|$(grep -c '^oversee: context-reader=next-start ' <<<"$OUT" || true)" \
   "0|copilot|$H/.1copilot|$H/.1copilot|none|none|$WORK_REAL||1" \
   "register takes a Copilot overseer's account from its SessionStart row and installs the context reader there"
+tm kill-window -t "$HAND"
+controller_fixture_await_ended "$SRC_DIR" "$FLEET_STATE" || exit 1
 mv -- "$TMP_ROOT/state.before-copilot-row" "$FLEET_STATE"
 : > "$HAND_ROWS"
-
-# A hand-opened pane with no SessionStart hook, whose current command names
-# no harness, is register's fallback producer. Only the exact server, start
-# and pane binding lets its unread identity and launch line survive.
-UNNAMED_PANE="$(tm new-window -d -t fleet -n unnamed -P -F '#{pane_id}' 'exec sleep 100000')"
-UNNAMED_CWD="$(tm display-message -p -t "$UNNAMED_PANE" '#{pane_current_path}')"
-UNNAMED_LINE="env COPILOT_HOME='$H/.1copilot' copilot --model gpt-5.3-codex --reasoning-effort high"
-cp -- "$FLEET_STATE" "$TMP_ROOT/state.before-preservation"
-jq --arg server "$SERVER_PID" --argjson start "$SERVER_START" --arg pane "$UNNAMED_PANE" \
-  --arg account "$H/.1copilot" --arg cwd "$UNNAMED_CWD" --arg line "$UNNAMED_LINE" \
-  '.overseer = {runtime: "tmux", server: $server, server_start: $start, pane: $pane,
-    generation: 20, harness: "copilot", account: $account, home: $account,
-    model: "gpt-5.3-codex", effort: "high", cwd: $cwd, launch_line: $line,
-    pending: {harness: "claude"}, exit: {status: 0}}' \
-  "$FLEET_STATE" > "$TMP_ROOT/state.full"
-for row in \
-  "$SERVER_PID|$SERVER_START|$UNNAMED_PANE|copilot|gpt-5.3-codex|high|$UNNAMED_LINE|20|effort,harness,launch_line,model|same pane" \
-  "$SERVER_PID|$SERVER_START|$COPILOT_PANE|none|none|none|none|21|none|different pane" \
-  "1|$SERVER_START|$UNNAMED_PANE|none|none|none|none|21|none|different server" \
-  "$SERVER_PID|$((SERVER_START - 3600))|$UNNAMED_PANE|none|none|none|none|21|none|different server start" \
-  "$SERVER_PID|null|$UNNAMED_PANE|none|none|none|none|21|none|no server start"; do
-  IFS='|' read -r prior_server prior_start prior_pane want_harness want_model want_effort want_line want_gen want_retained what <<<"$row"
-  jq --arg server "$prior_server" --argjson start "$prior_start" --arg pane "$prior_pane" \
-    '.overseer.server = $server | .overseer.server_start = $start | .overseer.pane = $pane' \
-    "$TMP_ROOT/state.full" > "$FLEET_STATE"
-  register_on "$UNNAMED_PANE" ''
-  assert_eq "$RC|$(identity)$(recorded launch_line)|$(recorded generation)|$(recorded pending)|$(recorded exit)|$(field "$(keyed registered "$OUT")" retained)|$(field "$(keyed registered "$OUT")" fresh)" \
-    "0|$want_harness|$H/.claude|$H/.claude|$want_model|$want_effort|$UNNAMED_CWD|$want_line|$want_gen|none|none|$want_retained|account,cwd,generation,home,pane,runtime,server,server_socket,server_start,session_rows,window" \
-    "register with no start row over $what replaces proven fields and retains only that pane's unread fields"
-done
-mv -- "$TMP_ROOT/state.before-preservation" "$FLEET_STATE"
-tm kill-window -t "$UNNAMED_PANE"
 
 # --- a succession through the launch verb --------------------------------
 # --predecessor names the live recorded overseer: the successor opens beside
@@ -868,7 +863,7 @@ assert_eq "$RC|$(sed 's/window=@[0-9]*/window=@N/; s/session=%[0-9]*/session=%N/
 # A predecessor other than the live recorded overseer is refused before
 # anything opens, naming the live one, or none where none is recorded: a pane
 # the fleet never recorded, which the succession would otherwise stop.
-OTHER="$(tm new-window -d -t fleet -n other -P -F '#{pane_id}' 'exec sleep 100000')"
+OTHER="$(tm new-window -d -c "$TMP_ROOT/work" -t fleet -n other -P -F '#{pane_id}' 'exec sleep 100000')"
 run_oversee -- launch --predecessor "$OTHER" --wait-secs 20
 assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)" \
   "1|oversee: predecessor-not-live session=$OTHER live=$SUCC server=$SOCKET|1" \
@@ -894,8 +889,9 @@ assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)" \
 # per way the record tells that server from this one: another server pid, and
 # this pid bound to an earlier server's start, a server a restart handed the
 # same pid.
-STALE="$(tm new-window -d -t fleet -n stale -P -F '#{pane_id}' 'exec sleep 100000')"
+STALE="$(tm new-window -d -c "$TMP_ROOT/work" -t fleet -n stale -P -F '#{pane_id}' 'exec sleep 100000')"
 EARLIER_START=$((SERVER_START - 3600))
+cp -- "$FLEET_STATE" "$TMP_ROOT/state.before-stale"
 stale_record() { # SERVER START
   jq --arg pane "$STALE" --arg server "$1" --arg start "$2" '.overseer.pane = $pane | .overseer.server = $server
     | .overseer.server_start = ($start | tonumber)' "$FLEET_STATE" > "$FLEET_STATE.tmp" \
@@ -911,10 +907,9 @@ for row in "1|$SERVER_START|another server pid" "$SERVER_PID|$EARLIER_START|this
     "a --predecessor naming a pane an earlier server's record names by $row_what is refused and left running"
   run_oversee -- launch --wait-secs 20
   assert_eq "$RC|$(recorded generation)|$(overseers)|$(listed "$STALE")" \
-    "0|$((STALE_GEN + 1))|1|1" \
-    "a launch over an earlier server's record naming $row_what opens the next generation"
-  tm kill-window -t "$(recorded window)"
-controller_fixture_await_ended "$SRC_DIR" "$FLEET_STATE" || exit 1
+    "1|$STALE_GEN|0|1" \
+    "a mismatched lifecycle and root naming $row_what cannot authorize replacement"
+  cp -- "$TMP_ROOT/state.before-stale" "$FLEET_STATE"
 done
 tm kill-window -t "$STALE"
 
@@ -927,14 +922,8 @@ codex_usage() { # USED_PCT
 }
 codex_usage 20
 LAUNCH_PREF=codex:gpt-5.6-sol:high run_oversee ORCH_LANE_DIRS="$H/.claude:$H/.eclaude:$H/.codex" -- launch --wait-secs 20
-codex_words() { # the table's words for a codex launch, one per line
-  printf '%s\n' -m gpt-5.6-sol -c model_reasoning_effort=high
-  eval "printf '%s\n' $(launch_choice_permission_write codex)"
-  printf '%s\n' $(launch_choice_row codex | cut -d'|' -f8) $(launch_choice_compaction_off codex) \
-    $(launch_choice_question_off codex)
-}
-assert_eq "$RC|$(recorded harness)|$(recorded account)|$(sed -n 1p "$TMP_ROOT/argv.codex" | sed "s|^home=$H/.codex/.*|home=codex-account|")|$(sed 1d "$TMP_ROOT/argv.codex" | tr '\n' ';')" \
-  "0|codex|$H/.codex|home=codex-account|$(codex_words | tr '\n' ';')$BRIEF;" \
+assert_eq "$RC|$(recorded harness)|$(recorded account)|$(controller_fixture_argv "$TMP_ROOT/argv.codex" policy)" \
+  "0|codex|$H/.codex|$(controller_fixture_codex_expected "home=$(recorded home)" gpt-5.6-sol "$BRIEF" off)" \
   "a first launch on a codex entry carries the table's model, bypass, settings, compaction and question-tool words"
 tm kill-window -t "$(recorded window)"
 controller_fixture_await_ended "$SRC_DIR" "$FLEET_STATE" || exit 1
@@ -993,7 +982,10 @@ for row in \
   assert_eq "$RC|$chosen_harness|$(grep -c '^preference-deprecated ' <<<"$OUT")|$(grep -c '^preference-deprecated-conversion ' <<<"$OUT")|$(field "$(grep '^preference-deprecated ' <<<"$OUT")" entry)|$(field "$conversion" entry)|$(field "$conversion" replacement)|$(field "$conversion" model)" \
     "$expected_rc|$selected|1|1|$original|$original|$replacement|$native_model" \
     "$case_name keeps the original and resolved conversion paired before the skip"
-  if [[ "$RC" == 0 ]]; then tm kill-window -t "$(recorded window)"; fi
+  if [[ "$RC" == 0 ]]; then
+    tm kill-window -t "$(recorded window)"
+    controller_fixture_await_ended "$SRC_DIR" "$FLEET_STATE" || exit 1
+  fi
 done
 codex_usage 20
 claude_usage 60 20 5 Opus > "$FIXTURE_DIR/.claude.json"
@@ -1063,11 +1055,13 @@ assert_eq "$RC|$(overseers)|$(work_head)|$(unsynced sync-timeout)|$(unsynced '[^
 tm kill-window -t "$(recorded window)"
 controller_fixture_await_ended "$SRC_DIR" "$FLEET_STATE" || exit 1
 echo "=== register asks kendex's inventory for other harnesses ==="
+HAND="$(tm new-window -d -c "$TMP_ROOT/work" -t fleet -n inventory -P -F '#{pane_id}' "exec '$BIN/hclaude' 100000")"
+HAND_ROWS="$WORK_REAL/tmp/lane-mail/overseer/session-$SERVER_PID-${HAND#%}.jsonl"
 # SessionStart is the producer of a harness other than the fallback's three.
 # The inventory table comes from kendex, never a harness-specific hook file.
 for harness in claude codex pi; do
   jq -cn --arg harness "$harness" --arg cwd "$WORK_REAL" --arg account "$H/.claude" \
-    '{at:1,event:"SessionStart",harness:$harness,cwd:$cwd,account:$account}' > "$HAND_ROWS"
+    '{at:1,event:"SessionStart",harness:$harness,cwd:$cwd,account:$account,session_id:"manual-native"}' > "$HAND_ROWS"
   for state in enabled missing disabled fail; do
     run_oversee TMUX="$TMUX_ADDR" TMUX_PANE="$HAND" FIXTURE_HOOK_STATE="$state" -- register
     want=1
@@ -1081,18 +1075,22 @@ done
 # The inventory is the checkout's, so the installed hook reads present.
 for row_cwd in "$TMP_ROOT" "$TMP_ROOT/gone"; do
   jq -cn --arg cwd "$row_cwd" --arg account "$H/.claude" \
-    '{at:1,event:"SessionStart",harness:"claude",cwd:$cwd,account:$account}' > "$HAND_ROWS"
+    '{at:1,event:"SessionStart",harness:"claude",cwd:$cwd,account:$account,session_id:"manual-native"}' > "$HAND_ROWS"
   run_oversee TMUX="$TMUX_ADDR" TMUX_PANE="$HAND" FIXTURE_HOOK_DIR="$WORK_REAL" -- register
   assert_eq "$RC|$(recorded cwd)|$(grep -c '^oversee: turn-end-hook=missing ' <<<"$OUT" || true)" "0|$row_cwd|0" \
     "register asks the checkout's inventory, not the start row's cwd $row_cwd, and finds the installed hook"
 done
 test_register_live_holder() {
   local holder candidate before
+  tm kill-window -t "$HAND"
+  controller_fixture_await_ended "$SRC_DIR" "$FLEET_STATE" || return 1
   cp -- "$FLEET_STATE" "$TMP_ROOT/register-live.saved"
   jq '.overseer = null' "$FLEET_STATE" > "$TMP_ROOT/register-live.state"
   mv -- "$TMP_ROOT/register-live.state" "$FLEET_STATE"
-  holder="$(tm new-window -d -t fleet -n register-holder -P -F '#{pane_id}' 'exec sleep 100000')"
-  candidate="$(tm new-window -d -t fleet -n register-candidate -P -F '#{pane_id}' 'exec sleep 100000')"
+  holder="$(tm new-window -d -c "$TMP_ROOT/work" -t fleet -n register-holder -P -F '#{pane_id}' 'exec sleep 100000')"
+  candidate="$(tm new-window -d -c "$TMP_ROOT/work" -t fleet -n register-candidate -P -F '#{pane_id}' 'exec sleep 100000')"
+  controller_fixture_start "$SRC_DIR" "$TMP_ROOT/work" "$holder" claude "$H/.claude" "$TMUX_ADDR" || return 1
+  controller_fixture_start "$SRC_DIR" "$TMP_ROOT/work" "$candidate" claude "$H/.claude" "$TMUX_ADDR" || return 1
   run_oversee TMUX="$TMUX_ADDR" TMUX_PANE="$holder" -- register
   assert_eq "$RC|$(recorded pane)|$(recorded generation)" "0|$holder|1" "register records the first holder"
   before="$(cat "$FLEET_STATE")"
@@ -1102,9 +1100,11 @@ test_register_live_holder() {
   run_oversee TMUX="$TMUX_ADDR" TMUX_PANE="$holder" -- register
   assert_eq "$RC|$(recorded pane)|$(recorded generation)" "0|$holder|1" "the recorded live pane registers again without a new generation"
   tm kill-pane -t "$holder"
+  controller_fixture_await_ended "$SRC_DIR" "$FLEET_STATE" || return 1
   run_oversee TMUX="$TMUX_ADDR" TMUX_PANE="$candidate" -- register
   assert_eq "$RC|$(recorded pane)|$(recorded generation)" "0|$candidate|2" "register succeeds after the recorded pane ends"
   tm kill-pane -t "$candidate"
+  controller_fixture_await_ended "$SRC_DIR" "$FLEET_STATE" || return 1
   mv -- "$TMP_ROOT/register-live.saved" "$FLEET_STATE"
 }
 test_register_live_holder
@@ -1130,12 +1130,15 @@ test_recorded_server() {
   assert_eq "$holder" "$candidate" "the two servers reuse the same pane id"
   jq '.overseer = null' "$FLEET_STATE" > "$TMP_ROOT/two-server.state"
   mv -- "$TMP_ROOT/two-server.state" "$FLEET_STATE"
+  if [[ "$mode" == register ]]; then
+    controller_fixture_start "$SRC_DIR" "$TMP_ROOT/work" "$holder" claude "$H/.claude" "$a_addr" || return 1
+  fi
   run_oversee TMUX="$a_addr" TMUX_PANE="$holder" -- "$mode" --wait-secs 20
   holder="$(recorded pane)"
   assert_eq "$RC|$(recorded server_socket)" "0|${a_addr%%,*}" "$mode stores the overseer's socket"
   before="$(cat "$FLEET_STATE")"
   if [[ "$mode" == launch ]]; then
-    decoy="$(TMUX_TMPDIR="$TMUX_DIR" tmux -L "$b_name" new-window -d -t fleet -n foreign-predecessor -P -F '#{pane_id}' 'exec sleep 100000')"
+    decoy="$(TMUX_TMPDIR="$TMUX_DIR" tmux -L "$b_name" new-window -d -c "$TMP_ROOT/work" -t fleet -n foreign-predecessor -P -F '#{pane_id}' 'exec sleep 100000')"
     assert_eq "$decoy" "$holder" "B's unrelated pane repeats A's launched overseer number"
     run_oversee TMUX="$b_addr" TMUX_PANE="$candidate" -- launch --predecessor "$holder" --wait-secs 20
     panes="$(TMUX_TMPDIR="$TMUX_DIR" tmux -L "$b_name" list-panes -a -F '#{pane_id}')"
@@ -1174,8 +1177,9 @@ STUB
   # A changed tmux start is a different server identity even at a live pid.
   jq '.overseer.server_start = 0' <<<"$before" > "$FLEET_STATE"
   run_oversee TMUX="$b_addr" TMUX_PANE="$candidate" -- register
-  assert_eq "$RC|$(recorded server)" "0|$b_server" "a different recorded server start permits takeover"
+  assert_eq "$RC|$(recorded server)" "1|$(jq -r '.overseer.server' <<<"$before")" "a mismatched lifecycle binding refuses takeover"
   fixture_server_stop "$a_socket"
+  controller_fixture_await_ended "$SRC_DIR" "$FLEET_STATE" || return 1
   for verb in register launch; do
     # A fresh B repeats A's launched pane number when it opens its overseer.
     fixture_server_stop "$b_socket"
@@ -1185,6 +1189,9 @@ STUB
     b_addr="$(TMUX_TMPDIR="$TMUX_DIR" tmux -L "$b_name" display-message -p '#{socket_path},#{pid},0')"
     b_server="${b_addr#*,}" b_server="${b_server%%,*}"
     candidate="$(TMUX_TMPDIR="$TMUX_DIR" tmux -L "$b_name" display-message -p '#{pane_id}')"
+    if [[ "$verb" == register ]]; then
+      controller_fixture_start "$SRC_DIR" "$TMP_ROOT/work" "$candidate" claude "$H/.claude" "$b_addr" || return 1
+    fi
     for form in socket legacy; do
       snapshot="$before"
       [[ "$form" != legacy ]] || snapshot="$(jq 'del(.overseer.server_socket)' <<<"$before")"
@@ -1195,10 +1202,14 @@ STUB
       if [[ "$verb" == launch && "$RC" == 0 && "$form" == socket && "$mode" == launch ]]; then
         assert_eq "$(recorded pane)" "$holder" "fresh launch verifies its own pane when the prior server used the same number"
       fi
-      [[ "$verb" != launch || "$RC" != 0 || "$form" != socket ]] || TMUX_TMPDIR="$TMUX_DIR" tmux -L "$b_name" kill-window -t "$(recorded window)"
+      if [[ "$verb" == launch && "$RC" == 0 && "$form" == socket ]]; then
+        TMUX_TMPDIR="$TMUX_DIR" tmux -L "$b_name" kill-window -t "$(recorded window)"
+        controller_fixture_await_ended "$SRC_DIR" "$FLEET_STATE" || return 1
+      fi
     done
     if [[ "$verb" == launch && "$RC" == 0 ]]; then
       TMUX_TMPDIR="$TMUX_DIR" tmux -L "$b_name" kill-window -t "$(recorded window)"
+      controller_fixture_await_ended "$SRC_DIR" "$FLEET_STATE" || return 1
     fi
   done
   fixture_server_stop "$b_socket"

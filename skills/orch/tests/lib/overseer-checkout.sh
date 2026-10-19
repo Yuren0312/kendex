@@ -98,41 +98,74 @@ controller_fixture_install() { # HOME SCRIPTS NATIVE_BIN
   done
 }
 
+# Policy cases supply a native event row; launch/receipt assertions use
+# harness.py's real child callback.
+controller_fixture_start() { # SCRIPTS HOME PANE HARNESS ACCOUNT TMUX
+  local scripts="$1" home="$2" pane="$3" harness="$4" account="$5" address="$6" skills payload
+  skills="$(cd -- "$scripts/../.." && pwd -P)" || return 1
+  payload="$(jq -cn --arg cwd "$home" --arg harness "$harness" --arg account "$account" \
+    '{at:now,event:"SessionStart",harness:$harness,account:$account,session_id:"s1",cwd:$cwd}')" || return 1
+  (cd -- "$home" && export TMUX="$address" TMUX_PANE="$pane" \
+      CLAUDE_CONFIG_DIR="$account" CODEX_HOME="$account" COPILOT_HOME="$account" PI_CODING_AGENT_DIR="$account"
+    "$BASH" -c 'source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/mailbox/scripts/lib/mailbox-append.sh";
+      source "$1/orch/scripts/lib/lane-context.sh"; source "$1/orch/scripts/lib/session-rows.sh";
+      key="$(lane_context_caller_key)"; file="$(session_rows_overseer_file "$PWD" "${key%% *}" "${key#* }")";
+      mkdir -p "${file%/*}"; mailbox_append_locked "$file" 2' fixture "$skills" <<<"$payload")
+}
+
 # Register the fixture's hand-opened predecessor through the surviving owner.
 controller_fixture_register() { # SCRIPTS HOME PANE HARNESS ACCOUNT TMUX
-  local scripts="$1" home="$2" pane="$3" harness="$4" account="$5" socket fields record
-  socket="${6%%,*}"
-  fields="$(tmux -S "$socket" display-message -p -t "$pane" '#{pid} #{start_time} #{window_id} #{session_name}')" || return 1
-  local server start window session
-  read -r server start window session <<<"$fields"
-  record="$(jq -cn --arg server "$server" --argjson start "$start" --arg socket "$socket" --arg pane "$pane" \
-    --arg window "$window" --arg session "$session" --arg harness "$harness" --arg account "$account" --arg cwd "$home" \
-    '{runtime:"tmux",server:$server,server_start:$start,server_socket:$socket,pane:$pane,window:$window,tmux_session:$session,
-      harness:$harness,account:$account,home:$account,cwd:$cwd,session_id:"s1",generation:1}')" || return 1
-  (cd -- "$home" && "$scripts/controller-session" register --home "$home" --record "$record" >/dev/null)
+  controller_fixture_start "$@" || return
+  (cd -- "$2" && export TMUX="$6" TMUX_PANE="$3" CLAUDE_CONFIG_DIR="$5" \
+    CODEX_HOME="$5" COPILOT_HOME="$5" PI_CODING_AGENT_DIR="$5"
+    local output rc=0
+    output="$("$1/oversee" register --account "$5" 2>&1)" || rc=$?
+    if [[ "$rc" != 0 ]]; then
+      printf '%s\n' "$output" >&2
+      exit "$rc"
+    fi)
 }
 
 # tmux can acknowledge window removal before its native supervisor exits.
 controller_fixture_await_ended() { # SCRIPTS STATE
   local fields pid start rc deadline=$((SECONDS + 12))
-  fields="$(jq -er '.overseer.lifecycle.process | [.pid,.started_at] | @tsv' "$2")" || return 1
-  IFS=$'\t' read -r pid start <<<"$fields"
+  fields="$(jq -er '[.overseer.lifecycle.process,.overseer.lifecycle.native_process]
+    | map(select(.pid != null and .started_at != null)) | unique_by(.pid,.started_at)
+    | .[] | [.pid,.started_at] | @tsv' "$2")" || return 1
+  while IFS=$'\t' read -r pid start; do
+    while (( SECONDS < deadline )); do
+      rc=0
+      "$BASH" "$1/lib/session-backend.sh" worker-live "$pid" "$start" || rc=$?
+      case "$rc" in 1) break ;; 0) sleep 0.05 ;; *) return 1 ;; esac
+    done
+    [[ "$rc" == 1 ]] || return 1
+  done <<<"$fields"
+}
+
+# A caller retired from its own pane cannot print the successor's receipt.
+controller_fixture_await_running() { # STATE PREDECESSOR_PANE
+  local deadline=$((SECONDS + 45))
   while (( SECONDS < deadline )); do
-    rc=0
-    "$BASH" "$1/lib/session-backend.sh" worker-live "$pid" "$start" || rc=$?
-    case "$rc" in 1) return 0 ;; 0) sleep 0.05 ;; *) return 1 ;; esac
+    if jq -e --arg prior "$2" '.overseer | .pane != null and .pane != $prior
+      and .session_id != null and .lifecycle.state == "running"
+      and .lifecycle.pending.brief_taken != null' "$1" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.05
   done
+  jq -c '.overseer | {pane,generation,lifecycle:(.lifecycle | {state,reason,transfer,worker,terminal,pending,native_process,native_exit})}' "$1" >&2
+  tail -n 40 "${1%/*}/session.log" >&2
   return 1
 }
 
 # Policy assertions observe the real argv and the real pasted brief. Native
 # identity/kickoff fields have separate coverage in the shared lifecycle suite.
-controller_fixture_argv() { # FILE HARNESS
-  python3 - "$1" "$TMP_ROOT/native-events.jsonl" "$2" <<'PY'
+controller_fixture_argv() { # FILE [policy]
+  python3 - "$1" "$TMP_ROOT/native-events.jsonl" "${2:-words}" <<'PY'
 import json
 from pathlib import Path
 import sys
-path, events, harness = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+path, events = Path(sys.argv[1]), Path(sys.argv[2])
 if not path.exists():
     print("none", end="")
     sys.exit(0)
@@ -140,7 +173,7 @@ words = [word for word in path.read_text().splitlines() if not word.startswith("
 prefix = words[:1] if words and words[0].startswith(("lane=", "home=")) else []
 args = words[len(prefix):]
 rows = [json.loads(line) for line in events.read_text().splitlines()] if events.exists() else []
-started = next((row for row in reversed(rows) if row.get("harness") == harness and row.get("argv") == args), None)
+started = next((row for row in reversed(rows) if row.get("argv") == args), None)
 if started:
     own = [row for row in rows if row.get("id") == started["id"]]
     kickoff = next((row["kickoff"] for row in own if "kickoff" in row), None)
@@ -159,6 +192,38 @@ if started:
             selected.append(arg)
     prompt = next((row["prompt"] for row in reversed(own) if "prompt" in row), None)
     args = selected + ([prompt] if prompt is not None else [])
-print("".join(word + ";" for word in prefix + args), end="")
+if sys.argv[3] == "policy":
+    groups = []
+    words = iter(args)
+    for word in words:
+        if word in ("-m", "--model"):
+            groups.append(["model", next(words)])
+        elif word in ("-c", "--config"):
+            key, separator, value = next(words).partition("=")
+            assert separator
+            groups.append(["setting", key, value])
+        elif word in ("--context", "--max-autopilot-continues", "--reasoning-effort"):
+            groups.append([word, next(words)])
+        else:
+            groups.append(["word", word])
+    print(json.dumps({"prefix": prefix, "policy": sorted(groups)}, separators=(",", ":"), sort_keys=True), end="")
+else:
+    print("".join(word + ";" for word in prefix + args), end="")
 PY
+}
+
+# Expected native policy is independent of the launch table and argv parser.
+controller_fixture_codex_expected() { # PREFIX MODEL BRIEF [off|keep]
+  jq -cnS --arg prefix "$1" --arg model "$2" --arg brief "$3" --arg question "${4:-keep}" '
+    {prefix:[$prefix],policy:([
+      ["model",$model], ["setting","model_reasoning_effort","high"],
+      ["setting","check_for_update_on_startup","false"],
+      ["setting","features.daemon_auto_start","false"],
+      ["setting","notice.hide_rate_limit_model_nudge","true"],
+      ["setting","model_auto_compact_token_limit","9223372036854775807"],
+      ["setting","model_auto_compact_token_limit_scope","body_after_prefix"],
+      ["setting","model_post_turn_compact_threshold_percent","0"],
+      ["word","--dangerously-bypass-approvals-and-sandbox"],
+      ["word","--dangerously-bypass-hook-trust"], ["word",$brief]
+    ] + (if $question == "off" then [["setting","features.default_mode_request_user_input","false"]] else [] end) | sort)}'
 }

@@ -93,8 +93,13 @@ lane_session_command() { # HARNESS NATIVE_ID RESUME_FILE [NAME [FLAG...]]
       else printf ' --session-id %q' "$id"; fi
       printf '%s' "$flags" ;;
     (codex)
-      launch_choice_lead_settings codex || return 1
-      printf 'codex%s' "$flags"
+      # Normalize native settings without discarding the selected question policy.
+      local question_policy=() question_words native_words nl=$'\n'
+      question_words="$(launch_choice_question_off codex)" || return 1
+      native_words="$nl$(printf '%s\n' "$@")$nl"
+      [[ "$native_words" != *"$nl${question_words// /$nl}$nl"* ]] || question_policy=(--question-off)
+      launch_choice_lead_settings ${question_policy[@]+"${question_policy[@]}"} codex "$@" || return 1
+      printf 'codex'
       printf ' %q' "${LAUNCH_CHOICE_KEPT[@]}"
       [[ -z "$file" ]] || printf ' resume %q' "$id"
       printf ' %s' "$kickoff" ;;

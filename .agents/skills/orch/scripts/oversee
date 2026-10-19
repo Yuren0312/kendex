@@ -117,7 +117,9 @@
 #            or the record's own where it already names this pane, so
 #            registering twice launches nothing and counts nothing twice.
 #            During native confirmation, `registration-pending` acknowledges
-#            the session without publishing it as the active controller.
+#            the session at exit 1 without publishing it as the controller.
+#            Retry a hand-opened session after its SessionStart row arrives;
+#            a managed launch completes through its native Start receipt.
 #            A server start that cannot be read refuses `record-unwritten`
 #            and writes nothing.
 #            Prints `registered` naming the session and generation, with
@@ -209,7 +211,7 @@ message() { # KEY FIELD=VALUE...
     fleet-log-unwritten) text='The fleet log row for the line the key field names could not be written; that line stands and is printed beside this one. The step field says what failed, and the writer words follow.' ;;
     pane-unreadable) text='This session'\''s own pane could not be read; tmux says why below.' ;;
     registered) text='The session record names this session.' ;;
-    registration-pending) text='Native confirmation is still in progress. The session is acknowledged; controller publication waits for its Start receipt.' ;;
+    registration-pending) text='Native confirmation is incomplete. Retry registration after SessionStart; a managed launch publishes only after its Start receipt.' ;;
     identity-fallback) text='No SessionStart row of this session stands, so its harness, account and directory are read off its pane and environment, the named fallback. No model or effort is read; a record proven to name this same pane keeps fields the fallback cannot read.' ;;
     context-reader=missing) text='The Copilot context reader could not be configured. The running session is registered, but its context mark has no new reader. Repair the named home and register again.' ;;
     context-reader=next-start) text='The configured Copilot reader loads at the next session start. This running session does not load a newly installed extension.' ;;
@@ -328,6 +330,8 @@ register() {
   server="${key%% *}"
   window="$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}' 2>"$DEP_ERR")" \
     || die pane-unreadable "pane=$TMUX_PANE" field=window_id
+  cwd="$(tmux display-message -p -t "$TMUX_PANE" '#{pane_current_path}' 2>"$DEP_ERR")" \
+    || die pane-unreadable "pane=$TMUX_PANE" field=pane_current_path
   # The launch identity a hand-opened session can state, from what its own
   # harness said at its start where its SessionStart row stands
   # (lib/session-rows.sh): the harness its hook install names, the account its
@@ -339,7 +343,8 @@ register() {
   # process and directory are read instead, the named fallback, said as
   # `identity-fallback`, and no model is known.
   model="" start_rc=0
-  session_rows_start "$(session_rows_overseer_file "$PWD" "$server" "$TMUX_PANE")" || start_rc=$?
+  registration_rows="$(session_rows_overseer_file "$cwd" "$server" "$TMUX_PANE")"
+  session_rows_start "$registration_rows" || start_rc=$?
   if (( start_rc == 0 )) && [[ -n "$SR_HARNESS" && -n "$SR_CWD" ]]; then
     cwd="$SR_CWD" model="$SR_MODEL" shape="$SR_HARNESS"
     [[ -n "$ACCOUNT" ]] || ACCOUNT="$SR_ACCOUNT"
@@ -347,8 +352,6 @@ register() {
     cause=no-start-row
     [[ "$start_rc" -ne 2 ]] || cause=unreadable
     message identity-fallback "session=$TMUX_PANE" "cause=$cause" >&2
-    cwd="$(tmux display-message -p -t "$TMUX_PANE" '#{pane_current_path}' 2>"$DEP_ERR")" \
-      || die pane-unreadable "pane=$TMUX_PANE" field=pane_current_path
     cmd="$(tmux display-message -p -t "$TMUX_PANE" '#{pane_current_command}' 2>"$DEP_ERR")" \
       || die pane-unreadable "pane=$TMUX_PANE" field=pane_current_command
     pane_pid="$(tmux display-message -p -t "$TMUX_PANE" '#{pane_pid}' 2>"$DEP_ERR")" \
@@ -377,11 +380,13 @@ register() {
     *) harness="$shape" ;;
   esac
   ol_identity "$harness" "$ACCOUNT" "$home" "$model" "" "$cwd" || die record-unwritten field=overseer step=identity
+  OL_IDENTITY="$(jq -c --arg rows "$registration_rows" '. + {session_rows:$rows}' <<<"$OL_IDENTITY" 2>"$DEP_ERR")" \
+    || die record-unwritten field=overseer step=identity
   ol_record_write tmux "$TMUX_PANE" "$window" "$server" "$OL_IDENTITY" "" \
     || die record-unwritten field=overseer
-  if [[ "$OL_RECORD_STATE" != running ]]; then
+  if [[ "$OL_REGISTRATION" != complete ]]; then
     message registration-pending "session=$TMUX_PANE" "state=$OL_RECORD_STATE"
-    return 0
+    return 1
   fi
   # The writer retains unknown fields only for this same session. Check that
   # resulting identity, not the fallback's empty fields.
@@ -526,7 +531,7 @@ fi
 [[ -z "$live_pane" || -n "$PREDECESSOR" ]] \
   || die overseer-live "session=$live_pane" "server=$SERVER_SOCKET" "generation=$live_generation"
 
-if [[ "$COMMAND" == register ]]; then register; fi
+if [[ "$COMMAND" == register ]]; then register; exit $?; fi
 
 HEADROOM_TRIGGER="${ORCH_OVERSEER_HEADROOM_PCT:-10}"
 matches "$HEADROOM_TRIGGER" '^[0-9]{1,3}$' && (( 10#$HEADROOM_TRIGGER <= 100 )) \

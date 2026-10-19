@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 import shutil
 import signal
-from fixtures.harness import AUTH_MESSAGES, launch_prompt, main as harness_main, native_header, native_launcher
+from fixtures.harness import AUTH_MESSAGES, launch_prompt, main as harness_main, native_header, native_launcher, session_backend
 import shlex
 import subprocess
 import sys
@@ -78,7 +78,9 @@ class LifecycleRecord(type(Path())):
         if self.name not in ("workflow-state-oversee.json", "jarvis-session.json"):
             return text
         value = json.loads(text)
-        return json.dumps(value["overseer"]["lifecycle"]) if "overseer" in value else text
+        if self.name == "workflow-state-oversee.json" or "overseer" in value:
+            return json.dumps((value.get("overseer") or {}).get("lifecycle"))
+        return text
 
     def write_text(self, text, *args, **kwargs):
         if self.name not in ("workflow-state-oversee.json", "jarvis-session.json"):
@@ -103,7 +105,9 @@ class BootReceiptScenario:
 class SessionContract(unittest.TestCase):
     def setUp(self):
         self.owned_workers = []
+        self.observed_workers = {}
         self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
         self.root = Path(self.scratch.name).resolve()
         self.home = self.root / "home"
         self.home.mkdir()
@@ -137,8 +141,15 @@ class SessionContract(unittest.TestCase):
         (self.root / "refuse-teardown").unlink(missing_ok=True)
         try:
             if self.record.exists():
-                self.call("stop")
-                self.wait("off" if json.loads(self.record.read_text()).get("app_off") else "stopped")
+                # A record-location control can leave only workflow metadata.
+                # The owned server cleanup below still releases its resources.
+                lifecycle = json.loads(self.record.read_text())
+                if lifecycle is not None:
+                    self.call("stop")
+                    self.wait("off" if lifecycle.get("app_off") else "stopped", persisted_stop=True)
+                    self.await_worker_ended(json.loads(self.record.read_text()).get("worker"))
+            for identity in self.observed_workers.values():
+                self.await_worker_ended(identity)
         finally:
             for worker in self.owned_workers:
                 worker.terminate()
@@ -147,8 +158,18 @@ class SessionContract(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     worker.kill()
                     worker.wait(timeout=5)
-            subprocess.run(["tmux", "-L", self.label, "kill-server"], capture_output=True, env=self.env)
-            self.scratch.cleanup()
+            self.stop_server(label=self.label)
+
+    def stop_server(self, *, label=None, socket=None):
+        target = ["-S", socket] if socket else ["-L", label]
+        subprocess.run(["tmux", *target, "kill-server"], capture_output=True, env=self.env, timeout=10)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            gone = subprocess.run(["tmux", *target, "list-sessions"], capture_output=True, env=self.env, timeout=10)
+            if gone.returncode != 0:
+                return
+            time.sleep(0.05)
+        self.fail("fixture-server-shutdown")
 
     def call(self, verb, harness="claude", mode="resume", origin="manual", **kwargs):
         argv = [str(SCRIPT), verb, "--home", str(self.home)]
@@ -161,7 +182,8 @@ class SessionContract(unittest.TestCase):
         start = time.monotonic()
         if kwargs.get("own_worker"):
             # The real public owner runs here so its detached worker remains
-            # our child until wait. Observe the real constructor only.
+            # our child until wait. A selected backend shell can inject a
+            # scoped transport refusal without replacing the runtime owner.
             real_popen = subprocess.Popen
             def observe_child(*arguments, **options):
                 child = real_popen(*arguments, **options)
@@ -169,7 +191,7 @@ class SessionContract(unittest.TestCase):
                     self.owned_workers.append(child)
                 return child
             output, errors = io.StringIO(), io.StringIO()
-            with patch.dict(os.environ, self.env | {"JARVIS_BASH": self.env["JARVIS_TEST_BASH"]}, clear=True), \
+            with patch.dict(os.environ, self.env | {"JARVIS_BASH": kwargs.get("backend_bash", self.env["JARVIS_TEST_BASH"])}, clear=True), \
                     patch.object(sys, "argv", argv), patch.object(subprocess, "Popen", observe_child), \
                     redirect_stdout(output), redirect_stderr(errors):
                 runtime = runpy.run_path(str(SKILLS / "orch/scripts/lib/controller-session.py"))
@@ -177,8 +199,18 @@ class SessionContract(unittest.TestCase):
             result = subprocess.CompletedProcess(argv, code, output.getvalue(), errors.getvalue())
         else:
             result = subprocess.run(argv, env=kwargs.get("env", self.env), capture_output=True, text=True, timeout=60)
+        if verb != "status":
+            self.remember_worker()
         self.assertLess(time.monotonic() - start, 60)
         return validate(result.stdout, result.returncode, verb, kwargs.get("duplicate_boot", False)), result.returncode
+
+    def remember_worker(self):
+        if not self.record.exists():
+            return
+        lifecycle = json.loads(self.record.read_text())
+        identity = (lifecycle or {}).get("worker")
+        if identity:
+            self.observed_workers[(identity["pid"], identity["started_at"])] = identity
 
     def wait(self, state="running", reason=None, seconds=20, persisted_stop=False):
         deadline = time.monotonic() + seconds
@@ -190,7 +222,7 @@ class SessionContract(unittest.TestCase):
                 if not persisted_stop:
                     return answer
                 saved = json.loads(self.record.read_text())
-                if saved["state"] == "stopped" and saved["terminal"] is None:
+                if saved and saved.get("state") == state and saved.get("terminal") is None:
                     return answer
             # tmux can disappear between ownership reads during failed-start
             # cleanup. Unknown ownership is a refusal until the final write.
@@ -231,7 +263,7 @@ class SessionContract(unittest.TestCase):
         self.fail("the native fixture did not acknowledge its launch\n" + self.record.read_text() + "\n" + screen + "\n" + self.session_log())
 
     def started(self):
-        return [json.loads(line) for line in self.rows.read_text().splitlines() if "argv" in json.loads(line)]
+        return [json.loads(line) for line in self.rows.read_text().splitlines() if "argv" in json.loads(line)] if self.rows.exists() else []
 
     def observe_inspection(self):
         events = self.root / "inspect-events"
@@ -283,12 +315,29 @@ class SessionContract(unittest.TestCase):
 
     def await_worker_result(self):
         deadline = time.monotonic() + 10
+        identity = None
         while time.monotonic() < deadline:
             record = json.loads(self.record.read_text())
+            identity = record.get("worker") or identity
             if "worker" not in record:
+                self.await_worker_ended(identity)
                 return record
             time.sleep(0.05)
         self.fail("the worker did not publish its final record")
+
+    def await_worker_ended(self, identity):
+        if not identity:
+            return
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            probe = subprocess.run([self.env["JARVIS_TEST_BASH"], str(session_backend(SKILLS)),
+                                    "worker-live", str(identity["pid"]), identity["started_at"]],
+                                   env=self.env, capture_output=True, timeout=10)
+            if probe.returncode == 1:
+                return
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+            time.sleep(0.05)
+        self.fail("fixture-worker-shutdown")
 
     def await_rows(self, events, count):
         deadline = time.monotonic() + 10
@@ -660,20 +709,26 @@ class SessionContract(unittest.TestCase):
                 self.wait("stopped")
 
     def test_trust_dialog_is_refused(self):
-        # Copilot CLI 1.0.88's folder-trust question holds a new home before
-        # its start; the refusal names it well inside the launch bound.
+        # Copilot's captured prompt and orch's Claude launcher question both
+        # hold the native fixture before SessionStart, without any trust grant.
         capture = SKILLS / "orch/tests/fixtures/oversee-watch/copilot-dialog-trust.txt"
-        question = next(re.sub(r"^[\s│]+|[\s│]+$", "", line) for line in capture.read_text().splitlines()
-                        if "Do you trust the files" in line)
+        claude = self.root / "claude-trust.txt"
+        claude.write_text("Do you trust the files in this folder?\n")
         fixture = self.home / ".fixture.json"
-        fixture.write_text(json.dumps(json.loads(fixture.read_text()) | {"trust": str(capture)}))
-        self.call("start", "copilot")
-        answer = self.wait("blocked", "trust-required")
-        self.assertEqual(answer["detail"], question)
-        self.assertIsNone(answer["terminal"])
-        self.assertEqual(subprocess.run(["tmux", "-L", self.label, "has-session", "-t", "=jarvis"],
-                                        capture_output=True, env=self.env).returncode, 1)
-        self.assertFalse(any("prompt" in json.loads(line) for line in self.rows.read_text().splitlines()))
+        for harness, dialog in (("copilot", capture), ("claude", claude)):
+            with self.subTest(harness=harness):
+                question = next(re.sub(r"^[\s│]+|[\s│]+$", "", line) for line in dialog.read_text().splitlines()
+                                if "Do you trust the files" in line)
+                fixture.write_text(json.dumps(json.loads(fixture.read_text()) | {"trust": str(dialog)}))
+                self.call("start", harness)
+                answer = self.wait("blocked", "trust-required")
+                self.assertEqual(answer["detail"], question)
+                self.assertIsNone(answer["terminal"])
+                self.assertEqual(subprocess.run(["tmux", "-L", self.label, "has-session", "-t", "=jarvis"],
+                                                capture_output=True, env=self.env).returncode, 1)
+                self.assertFalse(any("prompt" in json.loads(line) for line in self.rows.read_text().splitlines()))
+                self.call("stop")
+                self.wait("stopped", persisted_stop=True)
 
     def test_resumed_history_is_no_trust_dialog(self):
         # A resumed Copilot session redraws its conversation; the folder-trust
@@ -772,7 +827,7 @@ class SessionContract(unittest.TestCase):
                     "JARVIS_TEST_HARNESS": "claude", "CLAUDE_CONFIG_DIR": str(self.account)}, clear=True), \
                     patch.object(sys, "argv", ["claude", "--resume", confirmed]), \
                     patch.object(sys, "stdin", io.StringIO("")), \
-                    patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)), \
+                    patch("fixtures.harness.native_hook"), \
                     patch("fixtures.harness.select.select", return_value=([], [], [])), \
                     redirect_stdout(io.StringIO()):
                 harness_main()
@@ -920,12 +975,18 @@ class SessionContract(unittest.TestCase):
                     # failures so its log exposes only unexpected failures.
                     with patch.dict(os.environ, self.env | {"JARVIS_BASH": self.env["JARVIS_TEST_BASH"]}, clear=True), redirect_stderr(errors):
                         runtime = runpy.run_path(str(SKILLS / "orch/scripts/lib/controller-session.py"))
+                        owner = runtime["Session"](self.home)
+                        with owner.locked():
+                            owned = owner.read()
+                            owned.update(state="starting", reason="launching", detail="",
+                                         worker=json.loads(owner.backend("process", os.getpid()).stdout))
+                            owner.write(owned)
                         if failure == "brief-write":
                             with patch.object(Path, "open", refuse_brief), self.assertRaises(OSError):
-                                runtime["Session"](self.home).worker("start", request["generation"])
+                                owner.worker("start", request["generation"])
                         else:
                             with patch.object(os, "replace", refuse_first_ownership), self.assertRaises(OSError):
-                                runtime["Session"](self.home).worker("start", request["generation"])
+                                owner.worker("start", request["generation"])
                     diagnostic = re.search(r'jarvis-session: worker-failed operation=("(?:[^"\\]|\\.)*") cause=OSError errno=EIO message=("(?:[^"\\]|\\.)*")', errors.getvalue())
                     self.assertIsNotNone(diagnostic, errors.getvalue())
                     self.assertEqual(json.loads(diagnostic[1]), 'stream.write(launch["brief"])' if failure == "brief-write" else "os.replace(name, self.path)")
@@ -983,10 +1044,14 @@ class SessionContract(unittest.TestCase):
         retained, _ = self.call("start")
         self.assertEqual((retained["state"], retained["reason"], retained["terminal"]),
                          ("starting", "launching", terminal))
-        self.assertNotIn("worker", json.loads(self.record.read_text()))
+        self.assertNotIn("worker", self.await_worker_result())
         flag.unlink()
         self.assertEqual(self.call("start")[0]["state"], "starting")
         self.await_launches(2)
+        old_native = original_record["native_process"]
+        ended = subprocess.run([self.env["JARVIS_TEST_BASH"], str(session_backend(SKILLS)), "worker-live",
+                                str(old_native["pid"]), old_native["started_at"]], env=self.env, capture_output=True, timeout=10)
+        self.assertEqual(ended.returncode, 1, "abandoned-native-retired")
         replacement_record = json.loads(self.record.read_text())
         replacement = replacement_record["worker"]
         self.assertNotEqual(replacement, worker)
@@ -1088,8 +1153,10 @@ class SessionContract(unittest.TestCase):
                 os.mkfifo(gate)
                 jq = shutil.which("jq")
                 wrapper = self.root / "bin/jq"
-                wrapper.write_text("#!/usr/bin/env python3\nimport sys, subprocess\nfrom pathlib import Path\n"
-                    + "data=None if sys.stdin.isatty() else sys.stdin.read()\nack=Path(" + repr(str(acknowledgement)) + ")\n"
+                wrapper.write_text("#!/usr/bin/env python3\nimport os, sys, subprocess\nfrom pathlib import Path\n"
+                    + "ack=Path(" + repr(str(acknowledgement)) + ")\n"
+                    + "if ack.exists(): os.execv(" + repr(jq) + ", [" + repr(jq) + ", *sys.argv[1:]])\n"
+                    + "data=None if sys.stdin.isatty() else sys.stdin.read()\n"
                     + "if 'hold-preparation' in (data or '') and not ack.exists():\n ack.write_text('ready\\n')\n"
                     + " with Path(" + repr(str(gate)) + ").open() as stream: stream.read(1)\n"
                     + "result=subprocess.run([" + repr(jq) + ", *sys.argv[1:]], input=data, text=True, capture_output=True)\n"

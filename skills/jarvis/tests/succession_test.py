@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import patch
 import session_test
 from session_test import SessionContract, SKILLS
-from fixtures.harness import native_launcher
+from fixtures.harness import native_hook, native_launcher
 
 
 class SuccessionContract(SessionContract):
@@ -68,7 +68,7 @@ print(json.dumps({"config_dir": row["account"]}))
                 predecessor["report_started_at"] = 1000
                 self.record.write_text(json.dumps(predecessor))
                 contents = self.handoff()
-                self.configure(retiring=predecessor["process"])
+                self.configure(retiring=predecessor.get("native_process") or predecessor["process"])
                 native_count = len(self.started())
                 answer, code = self.call("succeed")
                 self.assertEqual((answer["state"], answer["reason"], code), ("handing-over", "succession", 0))
@@ -107,6 +107,9 @@ print(json.dumps({"config_dir": row["account"]}))
         self.assertEqual(owner["session_id"], record["pending"]["native_session_id"])
         self.assertEqual(owner["account"], record["account"])
         self.assertEqual(owner["lifecycle"]["state"], "running")
+        self.assertIn("native_process", record, "shared-native-process")
+        self.assertEqual(owner.get("harness_pid"), str(record["native_process"]["pid"]), "shared-native-process")
+        self.assertEqual(owner.get("harness_start"), record["native_process"]["started_at"], "shared-native-process")
         self.assertEqual(list((self.root / "state/kendex/jarvis").rglob("jarvis-session.json")), [], "second-controller-record")
 
     def configure(self, **changes):
@@ -139,10 +142,12 @@ print(json.dumps({"config_dir": row["account"]}))
         try:
             pending = subprocess.run([str(SKILLS / "orch/scripts/oversee"), "register", "--account", str(self.account)],
                                      cwd=self.home, env=env, capture_output=True, text=True, timeout=60)
-            self.assertEqual(pending.returncode, 0, pending.stdout + pending.stderr)
+            self.assertEqual(pending.returncode, 1, "registration-native-pending\n" + pending.stdout + pending.stderr)
             owner = json.loads((self.home / "tmp/workflow-state-oversee.json").read_text())["overseer"]
             self.assertNotIn("pane", owner, "registration-native-pending")
             self.assertEqual(pending.stdout.split()[1], "registration-pending")
+            self.assertNotIn("oversee: overseer-launched", pending.stdout, "registration-dispatch")
+            self.assertNotIn("oversee: name-conflict", pending.stdout + pending.stderr, "registration-dispatch")
         finally:
             with self.gate.open("w") as stream:
                 stream.write("1")
@@ -169,6 +174,9 @@ print(json.dumps({"config_dir": row["account"]}))
         session_cwd.mkdir()
         for name in (".fixture.json", ".fixture-harness.py"):
             shutil.copyfile(self.home / name, session_cwd / name)
+        (session_cwd / "tmp/lane-mail/overseer").mkdir(parents=True)
+        config = session_cwd / ".fixture.json"
+        config.write_text(json.dumps(json.loads(config.read_text()) | {"manual_session": "manual-native"}))
         for index, setting in enumerate((None, "relative-state", str(self.root / "absolute-state"))):
             with self.subTest(state_dir=setting):
                 label = self.label + "-register-" + str(index)
@@ -176,24 +184,29 @@ print(json.dumps({"config_dir": row["account"]}))
                 env.pop("ORCH_STATE_DIR", None)
                 if setting is not None:
                     env["ORCH_STATE_DIR"] = setting
+                env["CLAUDE_CONFIG_DIR"] = str(self.account)
                 selected_dir = Path(setting) if setting is not None else self.home / "tmp"
                 if not selected_dir.is_absolute():
                     selected_dir = self.home / selected_dir
                 selected = selected_dir / "workflow-state-oversee.json"
                 server = subprocess.run(["tmux", "-L", label, "new-session", "-d", "-s", "fleet", "-c", str(session_cwd),
-                                         "-P", "-F", "#{socket_path},#{pid},0 #{pane_id}", str(self.root / "bin/claude")],
+                                         "-P", "-F", "#{socket_path},#{pid},0 #{pane_id}", self.env["JARVIS_TEST_BASH"],
+                                         "--noprofile", "--norc", "-c", shlex.quote(str(self.root / "bin/claude")) + "; exec " + shlex.quote(self.env["JARVIS_TEST_BASH"])],
                                         env=env, capture_output=True, text=True, check=True, timeout=10).stdout.strip()
                 address, pane = server.split()
                 env.update(TMUX=address, TMUX_PANE=pane, CLAUDE_CONFIG_DIR=str(self.account))
                 try:
+                    native_row = session_cwd / "tmp/lane-mail/overseer" / ("session-" + address.split(",")[1] + "-" + pane[1:] + ".jsonl")
                     deadline = time.monotonic() + 10
+                    native_ready = False
                     while time.monotonic() < deadline:
-                        command = subprocess.run(["tmux", "-L", label, "display-message", "-p", "-t", pane,
-                                                  "#{pane_current_command}"], env=env, capture_output=True, text=True, timeout=10)
-                        if command.stdout.strip() == "claude":
+                        text = native_row.read_text() if native_row.exists() else ""
+                        if text.endswith("\n"):
+                            native_ready = any(json.loads(line).get("session_id") == "manual-native" for line in text.splitlines())
+                        if native_ready:
                             break
                         time.sleep(0.05)
-                    self.assertEqual(command.stdout.strip(), "claude", "registration-native-process")
+                    self.assertTrue(native_ready, "registration-native-row")
                     registered = subprocess.run([str(scripts / "oversee"), "register", "--account", str(self.account)],
                                                 cwd=self.home, env=env, capture_output=True, text=True, timeout=60)
                     self.assertEqual(registered.returncode, 0, registered.stdout + registered.stderr)
@@ -206,7 +219,7 @@ print(json.dumps({"config_dir": row["account"]}))
                     self.assertEqual(owner["harness"], "claude")
                     self.assertFalse((session_cwd / "tmp/workflow-state-oversee.json").exists(), "registration-second-record")
                 finally:
-                    subprocess.run(["tmux", "-L", label, "kill-server"], env=env, capture_output=True, timeout=10)
+                    self.stop_server(label=label)
 
     def test_legacy_controller_refuses_replacement(self):
         self.call("start")
@@ -218,7 +231,7 @@ print(json.dumps({"config_dir": row["account"]}))
         legacy.write_text(before)
         try:
             answer, code = self.call("start", mode="new")
-            self.assertEqual((answer["state"], answer["reason"], code), ("blocked", "record-unreadable", 1))
+            self.assertEqual((answer["state"], answer["reason"], code), ("blocked", "record-unreadable", 1), "legacy-controller-authority")
             self.assertEqual(len(self.started()), 1)
             self.assertEqual(self.record.read_text(), before)
             # A previous package's pending worker can acquire more native
@@ -234,6 +247,42 @@ print(json.dumps({"config_dir": row["account"]}))
                 self.assertEqual((held.returncode, json.loads(held.stdout)["reason"]), (1, "record-unreadable"))
                 self.assertTrue(legacy.exists())
             legacy.write_text(json.dumps(json.loads(before) | {"app_off": True}))
+            # An old desktop can issue another Start while its exact prior
+            # controller retires. Its new worker remains an old authority.
+            hold, events = self.root / "legacy-retire-hold", self.root / "legacy-retire-events"
+            hold.touch()
+            real = shutil.which("tmux")
+            wrapper = self.root / "bin/tmux"
+            wrapper.write_text("#!" + self.env["JARVIS_TEST_BASH"] + "\nset -euo pipefail\n"
+                + "for arg in \"$@\"; do if [[ $arg == if-shell && -f " + shlex.quote(str(hold)) + " ]]; then "
+                + "printf 'retiring\\n' >> " + shlex.quote(str(events)) + "; while [[ -f " + shlex.quote(str(hold))
+                + " ]]; do sleep 0.05; done; fi; done\nexec " + shlex.quote(real) + ' "$@"\n')
+            wrapper.chmod(0o755)
+            request = subprocess.Popen([str(SKILLS / "orch/scripts/controller-session"), "retire-legacy", "--home", str(self.home)],
+                                       env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                self.await_rows(events, 1)
+                with subprocess.Popen(["sleep", "60"], env=self.env) as worker:
+                    try:
+                        identity = subprocess.run([self.env["JARVIS_TEST_BASH"], str(SKILLS / "orch/scripts/lib/session-backend.sh"),
+                                                   "process", str(worker.pid)], env=self.env, capture_output=True, text=True, timeout=10, check=True)
+                        renewed = json.loads(before) | {"app_off": True, "worker": json.loads(identity.stdout)}
+                        renewed["generation"] += 1
+                        legacy.write_text(json.dumps(renewed))
+                        hold.unlink()
+                        output, error = request.communicate(timeout=60)
+                        self.assertEqual((request.returncode, json.loads(output)["reason"]),
+                                         (1, "record-unreadable"), "legacy-retirement-generation: " + error)
+                        self.assertEqual(json.loads(legacy.read_text()), renewed)
+                    finally:
+                        worker.terminate()
+                        worker.wait(timeout=10)
+            finally:
+                hold.unlink(missing_ok=True)
+                if request.poll() is None:
+                    request.communicate(timeout=60)
+                wrapper.unlink()
+            legacy.write_text(json.dumps(renewed | {"worker": None}))
             retired = subprocess.run([str(SKILLS / "orch/scripts/controller-session"), "retire-legacy", "--home", str(self.home)],
                                      env=self.env, capture_output=True, text=True, timeout=60)
             self.assertEqual(retired.returncode, 0, retired.stdout + retired.stderr)
@@ -285,6 +334,7 @@ print(json.dumps({"config_dir": row["account"]}))
     def orch_call(self, *args):
         result = subprocess.run([str(self.orch_scripts / args[0]), *args[1:]], cwd=self.home,
                                 env=self.env, capture_output=True, text=True, timeout=90)
+        self.remember_worker()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr + "\n" + self.session_log())
         return result
 
@@ -298,6 +348,11 @@ print(json.dumps({"config_dir": row["account"]}))
     def test_shared_orch_launch_and_recovery(self):
         scripts = self.orch_world()
         self.handoff()
+        tracker = self.root / "fixture-tracker"
+        tracker.write_text("#!" + self.env["JARVIS_TEST_BASH"] + "\nprintf '[]\\n'\n")
+        tracker.chmod(0o755)
+        self.env.update(GH_REPO="fixture/repository", LINEAR_TEAM="FIXTURE", ORCH_OVERSEER_DEAD_PASSES="1",
+                        OVERSEE_WATCH_TRACKER=str(tracker))
         session_cwd = self.home / "subdir"
         (session_cwd / "state").mkdir(parents=True)
         session_handoff = "subdirectory handoff: TASK-ref\n"
@@ -315,11 +370,14 @@ print(json.dumps({"config_dir": row["account"]}))
         self.assertIsNotNone(owner.get("lifecycle"), "shared-controller-record")
         first = json.loads(self.record.read_text())
         self.assert_shared_controller(first)
+        self.assertEqual(json.loads((self.root / "watch-policy.json").read_text()),
+                         {"repo":"fixture/repository", "team":"FIXTURE", "dead_passes":"1", "tracker":str(tracker)},
+                         "watch-policy-environment")
         self.assertEqual(first["home"], str(self.home))
         self.assertEqual(owner["cwd"], str(session_cwd))
         self.assertEqual(Path(first["transfer"]["handoff"]).read_text(), session_handoff, "session-handoff")
         self.handoff()
-        self.configure(retiring=first["process"])
+        self.configure(retiring=first.get("native_process") or first["process"])
         self.orch_call("oversee", "launch", "--predecessor", first["terminal"]["pane"], "--cwd", str(session_cwd),
                        "--handoff", "state/handoff.md", "--wait-secs", "30")
         second = json.loads(self.record.read_text())
@@ -330,7 +388,7 @@ print(json.dumps({"config_dir": row["account"]}))
         # Stop through the shared process identity owner, leaving the recorded
         # command for the production dead-pane entry point to replay.
         stop = subprocess.run([self.env["JARVIS_TEST_BASH"], str(scripts / "lib/session-backend.sh"), "stop-process",
-                               str(second["process"]["pid"]), second["process"]["started_at"], second["harness"]],
+                               str(second["native_process"]["pid"]), second["native_process"]["started_at"], second["harness"]],
                               env=self.env, capture_output=True, text=True, timeout=30)
         self.assertEqual(stop.returncode, 0, stop.stderr)
         command = json.loads(self.watch_state.read_text())["overseer"]["launch_line"]
@@ -342,7 +400,7 @@ print(json.dumps({"config_dir": row["account"]}))
         self.assertEqual(recovered["account"], second["account"])
         fresh = self.root / "fresh-account"
         fresh.mkdir()
-        self.configure(picked=str(fresh), retiring=recovered["process"])
+        self.configure(picked=str(fresh), retiring=recovered.get("native_process") or recovered["process"])
         self.orch_call("oversee-succeed", "--walled-pane", recovered["terminal"]["pane"], "--harness", "claude",
                        "--handoff", "state/handoff.md", "--wait-secs", "30", "--", "--dangerously-skip-permissions")
         walled = json.loads(self.record.read_text())
@@ -352,7 +410,7 @@ print(json.dumps({"config_dir": row["account"]}))
                             if "predecessor_ended" in json.loads(row)]
         self.assertTrue(acknowledgements)
         self.assertTrue(all(acknowledgements), "native-before-retirement")
-        self.configure(idle=True, retiring=walled["process"])
+        self.configure(idle=True, retiring=walled.get("native_process") or walled["process"])
         failed = subprocess.run([str(scripts / "oversee"), "launch", "--predecessor", walled["terminal"]["pane"],
                                  "--cwd", str(session_cwd), "--handoff", "state/handoff.md", "--wait-secs", "8"],
                                 cwd=self.home, env=self.env, capture_output=True, text=True, timeout=60)
@@ -377,12 +435,15 @@ print(json.dumps({"config_dir": row["account"]}))
         for harness in ("claude", "codex", "copilot", "pi"):
             with self.subTest(harness=harness):
                 self.configure(retiring=None, picked=str(self.account))
-                server = subprocess.run(["tmux", "-L", self.label, "new-session", "-d", "-s", "fleet", "-P", "-F", "#{socket_path},#{pid},0",
+                server_label = self.label + "-" + harness
+                self.addCleanup(self.stop_server, label=server_label)
+                server = subprocess.run(["tmux", "-L", server_label, "new-session", "-d", "-s", "fleet", "-P", "-F", "#{socket_path},#{pid},0",
                                          self.env["JARVIS_TEST_BASH"], "--noprofile", "--norc"], env=self.env, capture_output=True,
                                         text=True, timeout=10, check=True).stdout.strip()
                 preference = {"claude":"claude:fable:high", "codex":"codex:gpt-5:high",
                               "copilot":"copilot:gpt-5:high", "pi":"pi:pi-claude/claude-fable-5-1:high"}[harness]
-                self.env.update(TMUX=server, ORCH_TMUX_SESSION="fleet", ORCH_OVERSEER_PREFERENCE=preference)
+                self.env.update(TMUX=server, ORCH_TMUX_SESSION="fleet", ORCH_OVERSEER_PREFERENCE=preference,
+                                ORCH_QUESTION_TOOL="off")
                 if harness == "pi":
                     # Orch's existing permission policy refuses unattended Pi
                     # first launch; the user's explicit desktop Start can use it.
@@ -402,6 +463,9 @@ print(json.dumps({"config_dir": row["account"]}))
                 self.assertIsNotNone(owner.get("lifecycle"), "shared-controller-record")
                 first = json.loads(self.record.read_text())
                 self.assert_shared_controller(first)
+                if harness == "codex":
+                    self.assertIn("features.default_mode_request_user_input=false", self.started()[-1]["argv"],
+                                  "native-question-policy")
                 terminal = first["terminal"]
                 keep = subprocess.run(["tmux", "-S", terminal["server"], "new-window", "-d", "-t", "=" + terminal["session"],
                                        "-P", "-F", "#{pane_id}", self.env["JARVIS_TEST_BASH"], "--noprofile", "--norc"],
@@ -412,9 +476,15 @@ print(json.dumps({"config_dir": row["account"]}))
                 registered = json.loads(self.record.read_text())
                 self.assert_shared_controller(registered)
                 stop = subprocess.run([self.env["JARVIS_TEST_BASH"], str(scripts / "lib/session-backend.sh"), "stop-process",
-                                       str(registered["process"]["pid"]), registered["process"]["started_at"], harness],
+                                       str(registered["native_process"]["pid"]), registered["native_process"]["started_at"], harness],
                                       env=self.env, capture_output=True, text=True, timeout=30)
                 self.assertEqual(stop.returncode, 0, stop.stderr)
+                self.wait("stopped", "ended")
+                # The shipped orch record predates the lifecycle member.
+                # Keep its real completed-run receipt and owned pane intact.
+                self.orch_call("workflow-state", "update", "oversee", ".overseer |= del(.lifecycle)")
+                legacy, _ = self.call("status")
+                self.assertEqual((legacy["state"], legacy["reason"]), ("stopped", "ended"), "legacy-native-exit")
                 line = self.root / "line.txt"
                 line.write_text(json.loads((self.home / "tmp/workflow-state-oversee.json").read_text())["overseer"]["launch_line"])
                 self.orch_call("oversee-succeed", "--dead-pane", terminal["pane"], "--line-file", str(line), "--wait-secs", "30")
@@ -427,7 +497,7 @@ print(json.dumps({"config_dir": row["account"]}))
                 recovered = json.loads(self.record.read_text())
                 fresh = self.root / ("fresh-" + harness)
                 fresh.mkdir()
-                self.configure(retiring=recovered["process"], picked=str(fresh))
+                self.configure(retiring=recovered.get("native_process") or recovered["process"], picked=str(fresh))
                 preference = "pi:pi-claude/claude-fable-5-1:high" if harness == "pi" else "claude:fable:high"
                 self.env["ORCH_OVERSEER_PREFERENCE"] = preference
                 flags = {"claude":["--dangerously-skip-permissions"], "codex":["--yolo"], "copilot":["--allow-all"], "pi":[]}[harness]
@@ -443,7 +513,7 @@ print(json.dumps({"config_dir": row["account"]}))
                 self.call("stop")
                 self.wait("stopped", persisted_stop=True)
                 # The unrelated window has an independent lifetime.
-                subprocess.run(["tmux", "-S", terminal["server"], "kill-server"], env=self.env, capture_output=True, timeout=10)
+                self.stop_server(socket=terminal["server"])
 
     def test_orch_retirement_order(self):
         self.orch_world()
@@ -455,7 +525,106 @@ print(json.dumps({"config_dir": row["account"]}))
         self.env.update(TMUX=terminal["server"] + "," + str(predecessor["server_pid"]) + ",0", TMUX_PANE=terminal["pane"],
                         ORCH_OVERSEER_PREFERENCE="claude:fable:high", ORCH_TMUX_SESSION=terminal["session"])
         self.orch_call("oversee", "register", "--account", str(self.account))
-        self.configure(retiring=predecessor["process"])
+        self.assert_shared_controller(predecessor)
+        # Refuse the exact predecessor stop before it can kill the native
+        # controller. Cleaning the newly acquired pane must preserve it.
+        refused_bash = self.root / "refuse-native-stop-bash"
+        refused_bash.write_text("#!" + self.env["JARVIS_TEST_BASH"] + "\nset -euo pipefail\n"
+            + 'if [[ ${1##*/} == session-backend.sh && ${2:-} == stop-process && ${3:-} == '
+            + str(predecessor["process"]["pid"]) + ' ]]; then exit 1; fi\nexec '
+            + shlex.quote(self.env["JARVIS_TEST_BASH"]) + ' "$@"\n')
+        refused_bash.chmod(0o755)
+        replacement_account = self.root / "refused-account"
+        replacement_account.mkdir()
+        launches = len(self.started())
+        self.call("start", account=replacement_account, own_worker=True, backend_bash=str(refused_bash))
+        self.await_worker_result()
+        native = predecessor["native_process"]
+        alive = subprocess.run([self.env["JARVIS_TEST_BASH"], str(self.orch_scripts / "lib/session-backend.sh"),
+                                "worker-live", str(native["pid"]), native["started_at"]],
+                               env=self.env, capture_output=True, timeout=10)
+        self.assertEqual(alive.returncode, 0, "before-retirement-keeps-native")
+        self.assertEqual(len(self.started()), launches, "native-before-retirement")
+        self.assert_shared_controller(json.loads(self.record.read_text()))
+        refused_runner = self.home / "tmp/oversee-watch.runner.part"
+        refused_runner.mkdir()
+        try:
+            failed = subprocess.run([str(self.orch_scripts / "oversee"), "launch", "--predecessor", terminal["pane"],
+                                     "--handoff", "state/handoff.md", "--wait-secs", "30"],
+                                    cwd=self.home, env=self.env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(failed.returncode, 1, "replacement-failed-retained\n" + failed.stdout + failed.stderr)
+            kept = json.loads(self.record.read_text())
+            self.assert_shared_controller(kept)
+            self.assertEqual(kept["terminal"], terminal, "replacement-failed-retained")
+            self.assertEqual(kept["pending"]["native_session_id"], predecessor["pending"]["native_session_id"])
+            owner = json.loads(self.watch_state.read_text())["overseer"]
+            rows = Path(owner["session_rows"])
+            count = len(rows.read_text().splitlines())
+            callback = ('source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/mailbox/scripts/lib/mailbox-append.sh"; '
+                        'source "$1/orch/scripts/lib/lane-state.sh"; source "$1/orch/scripts/lib/lane-context.sh"; '
+                        'source "$1/orch/scripts/lib/session-rows.sh"; session_rows_write "$PWD" claude Stop')
+            relay = Path(session_test.HARNESS).parent / ("hook-" + str(kept["native_process"]["pid"]) + ".sock")
+            with patch.dict(os.environ, {"JARVIS_TEST_HOOK_SOCKET": str(relay)}):
+                native_hook([self.env["JARVIS_TEST_BASH"], "-c", callback, "fixture", str(self.skills)],
+                            {"session_id": kept["pending"]["native_session_id"]})
+            self.assertEqual(len(rows.read_text().splitlines()), count + 1, "retained-native-row")
+            # Two refused operations retain waiting resources above the live
+            # controller. Its real callbacks still belong to the sole record.
+            flag = self.refuse_teardown()
+            try:
+                failed = subprocess.run([str(self.orch_scripts / "oversee"), "launch", "--predecessor", terminal["pane"],
+                                         "--handoff", "state/handoff.md", "--wait-secs", "30"],
+                                        cwd=self.home, env=self.env, capture_output=True, text=True, timeout=60)
+                self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+                self.call("start", mode="new")
+                held = self.await_worker_result()
+                generation = held["generation"]
+                failed = subprocess.run([str(self.orch_scripts / "oversee"), "launch", "--predecessor", terminal["pane"],
+                                         "--handoff", "state/handoff.md", "--wait-secs", "30"],
+                                        cwd=self.home, env=self.env, capture_output=True, text=True, timeout=60)
+                self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+                held = self.await_worker_result()
+                self.assertEqual(held["generation"], generation + 1, "retained-retry-controller")
+                owner = json.loads(self.watch_state.read_text())["overseer"]
+                self.assertEqual(owner.get("pane"), terminal["pane"], "native-before-retirement")
+                resources = []
+                node = held
+                while node:
+                    resources.extend(node[key] for key in ("process", "native_process") if node.get(key))
+                    node = node.get("predecessor")
+                count = len(rows.read_text().splitlines())
+                with patch.dict(os.environ, {"JARVIS_TEST_HOOK_SOCKET": str(relay)}):
+                    native_hook([self.env["JARVIS_TEST_BASH"], "-c", callback, "fixture", str(self.skills)],
+                                {"session_id": predecessor["pending"]["native_session_id"]})
+                self.assertEqual(len(rows.read_text().splitlines()), count + 1, "retained-native-chain")
+                native = predecessor["native_process"]
+                stopped = subprocess.run([self.env["JARVIS_TEST_BASH"], str(self.orch_scripts / "lib/session-backend.sh"),
+                                          "stop-process", str(native["pid"]), native["started_at"], "claude"],
+                                         env=self.env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    exited = (json.loads(self.watch_state.read_text()).get("overseer") or {}).get("exit") or {}
+                    if (exited.get("run") or {}).get("harness_pid") == str(native["pid"]):
+                        break
+                    time.sleep(0.05)
+                self.assertEqual((exited.get("run") or {}).get("harness_pid"), str(native["pid"]), "retained-native-exit-chain")
+            finally:
+                flag.unlink()
+            self.call("start", mode="new")
+            self.wait()
+            for resource in resources:
+                ended = subprocess.run([self.env["JARVIS_TEST_BASH"], str(self.orch_scripts / "lib/session-backend.sh"),
+                                        "worker-live", str(resource["pid"]), resource["started_at"]],
+                                       env=self.env, capture_output=True, timeout=10)
+                self.assertEqual(ended.returncode, 1, "native-before-retirement")
+            predecessor = json.loads(self.record.read_text())
+            self.assert_shared_controller(predecessor)
+            terminal = predecessor["terminal"]
+            self.env["TMUX_PANE"] = terminal["pane"]
+        finally:
+            refused_runner.rmdir()
+        self.configure(retiring=predecessor.get("native_process") or predecessor["process"])
         result = subprocess.run([str(self.orch_scripts / "oversee"), "launch", "--predecessor", terminal["pane"],
                                  "--cwd", str(self.home), "--handoff", "state/handoff.md", "--wait-secs", "10"],
                                 cwd=self.home, env=self.env, capture_output=True, text=True, timeout=60)
@@ -571,8 +740,8 @@ print(json.dumps({"config_dir": row["account"]}))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             after = json.loads((self.home / "tmp/workflow-state-oversee.json").read_text())["overseer"]
             self.assertEqual(after.get("pane"), terminal["pane"], "watch-controller-owner")
-            self.assertEqual(after.get("session_id"), before["pending"]["native_session_id"], "watch-controller-native")
             self.assert_shared_controller(json.loads(self.record.read_text()))
+            self.assertEqual(after.get("session_id"), before["pending"]["native_session_id"], "watch-controller-native")
 
     def test_succession_identity(self):
         self.handoff()
@@ -688,15 +857,16 @@ print(json.dumps({"config_dir": row["account"]}))
         self.call("start")
         self.wait()
         before = self.record.read_bytes()
-        predecessor = json.loads(before)
+        predecessor = json.loads(self.record.read_text())
         self.handoff()
         orch = self.skills / "orch"
         moved = self.skills / "orch-absent"
         orch.rename(moved)
         try:
-            answer, code = self.call("succeed")
-            self.assertEqual((answer["state"], answer["reason"], code), ("failed", "handover-failed", 1))
-            self.assertEqual(answer["account"], str(self.account))
+            result = subprocess.run([str(self.skills / "jarvis/scripts/jarvis-session"), "succeed", "--home", str(self.home)],
+                                    env=self.env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("dependency=orch", result.stderr)
             self.assertEqual(self.record.read_bytes(), before)
             pid = predecessor["process"]
             result = subprocess.run([self.env["JARVIS_TEST_BASH"], str(SKILLS / "orch/scripts/lib/session-backend.sh"),
@@ -767,7 +937,7 @@ print(json.dumps({"config_dir": row["account"]}))
         pause = self.home / ".succession-pause.json"
         event = self.root / "checkpoint.json"
         release = self.root / "release"
-        phases = ("saved", "waiting", "predecessor-ended", "confirmed", "brief-delivered", "complete")
+        phases = ("saved", "waiting", "retiring", "predecessor-ended", "confirmed", "brief-delivered", "complete")
         with patch.object(session_test, "SCRIPT", script):
             for harness in ("claude", "codex", "copilot", "pi"):
                 for phase in phases:
@@ -800,11 +970,16 @@ print(json.dumps({"config_dir": row["account"]}))
                                 during, _ = self.call("status")
                                 expected = "running" if (phase, edge) in (("saved", "before"), ("complete", "after")) else "handing-over"
                                 self.assertEqual(during["state"], expected)
-                                predecessor = previous["process"]
+                                owner = json.loads(Path(str(self.record)).read_text()).get("overseer") or {}
+                                if edge == "after" and phase in ("predecessor-ended", "confirmed", "brief-delivered"):
+                                    self.assertFalse(owner.get("pane"), "retired-controller-mail")
+                                if (phase, edge) == ("complete", "after"):
+                                    self.assertEqual(owner.get("pane"), persisted["terminal"]["pane"])
+                                predecessor = previous.get("native_process") or previous["process"]
                                 old_live = subprocess.run([self.env["JARVIS_TEST_BASH"], str(skills / "orch/scripts/lib/session-backend.sh"),
                                                            "worker-live", str(predecessor["pid"]), predecessor["started_at"]],
                                                           capture_output=True, env=self.env, timeout=10)
-                                self.assertEqual(old_live.returncode, 0 if phase in ("saved", "waiting") else 1)
+                                self.assertEqual(old_live.returncode, 0 if phase in ("saved", "waiting", "retiring") else 1)
                                 self.assertEqual(len(self.started()) - native_count,
                                                  1 if phase in ("confirmed", "brief-delivered", "complete") else 0)
                                 live = subprocess.run([self.env["JARVIS_TEST_BASH"], str(skills / "orch/scripts/lib/session-backend.sh"),
@@ -814,7 +989,7 @@ print(json.dumps({"config_dir": row["account"]}))
                                 os.kill(identity["pid"], signal.SIGKILL)
                                 request.communicate(timeout=10)
                             pause.unlink()
-                            before_end = phase in ("saved", "waiting")
+                            before_end = phase in ("saved", "waiting", "retiring")
                             completed = (phase, edge) == ("complete", "after")
                             if before_end or completed:
                                 settled = self.wait("running")
@@ -832,9 +1007,11 @@ print(json.dumps({"config_dir": row["account"]}))
                                 start, code = self.call("start", harness=harness)
                                 self.assertEqual((start["state"], start["reason"], code), ("failed", "handover-failed", 1))
                             self.assertIn("TASK-ref", (self.home / "state/handoff.md").read_text())
-                            self.call("succeed")
+                            retry, code = self.call("succeed")
+                            self.assertEqual((retry["state"], code), ("handing-over", 0))
                             self.wait()
                             recovered = json.loads(self.record.read_text())
+                            self.assert_shared_controller(recovered)
                             self.assertNotEqual(recovered["pending"]["native_session_id"], previous["pending"]["native_session_id"])
                             self.assertIn("TASK-ref", Path(recovered["transfer"]["handoff"]).read_text())
                             self.call("stop")

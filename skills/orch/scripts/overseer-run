@@ -11,7 +11,9 @@
 # session whose own launches print their model lines. The foreground Bash
 # child records its own PID and start before exec COMMAND. The parent writes
 # COMMAND status only against that exact run. Failed record operations report
-# their cause and COMMAND still runs. Outside tmux no record is read or written.
+# their cause and direct COMMAND callers still run. A managed candidate must
+# bind its pending run before COMMAND starts. Outside tmux no record is read
+# or written.
 set -euo pipefail
 
 usage() { sed -n '/^# Usage:/,/^# their cause/p' "$0" | sed 's/^# \{0,1\}//'; }
@@ -70,12 +72,16 @@ if [[ -n "$KEY" ]]; then
     if [[ ! -s "$run_file" ]]; then
       printf "overseer-run: start-unrecorded=pending\n" >&2
       cat -- "$DEP_ERR" >&2
+      # A managed candidate has no authority to run before its exact pending
+      # identity is saved. Direct callers retain the advisory contract.
+      [[ -z "${ORCH_CONTROLLER_RUN_REQUEST:-}" ]] || exit 1
     fi
-    unset ORCH_MODEL_LINES_HELD
+    unset ORCH_MODEL_LINES_HELD ORCH_CONTROLLER_RUN_REQUEST
     exec "$@"
   ' overseer-run "$KEY" "$DEP_ERR" "$RUN_FILE" "$@" || rc=$?
 else
   [[ -z "${TMUX:-}" || -z "${TMUX_PANE:-}" ]] || message start-unrecorded pending "$CAUSE"
+  [[ -z "${ORCH_CONTROLLER_RUN_REQUEST:-}" ]] || exit 1
   env -u ORCH_MODEL_LINES_HELD "$@" || rc=$?
 fi
 

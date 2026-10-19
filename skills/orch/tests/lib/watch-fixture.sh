@@ -28,6 +28,9 @@ for arg in "\$@"; do
 done
 [[ -n "\$state" ]]
 if watch_pid_live "\$state"; then watch_stop "\$WATCH_PID" "\$state"; fi
+jq -cn --arg repo "\${GH_REPO:-}" --arg team "\${LINEAR_TEAM:-}" \\
+  --arg passes "\${ORCH_OVERSEER_DEAD_PASSES:-}" --arg tracker "\${OVERSEE_WATCH_TRACKER:-}" \\
+  '{repo:\$repo,team:\$team,dead_passes:\$passes,tracker:\$tracker}' > "$TMP_ROOT/watch-policy.json"
 watch_pid_write "\$state" "\${TMUX_PANE:-none}" "\${OVERSEE_WATCH_ORIGIN:-hand}" "\$0" "\${args[@]}"
 child=""
 finish() {

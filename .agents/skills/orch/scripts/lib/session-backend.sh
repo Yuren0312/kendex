@@ -71,6 +71,19 @@ controller_flags() { # JSON_ARGV
   trap - EXIT
 }
 case "$verb" in
+  worker-launch)
+    source "$SCRIPT_DIR/lib/job-unit.sh"
+    controller_flags "$4" || exit 1
+    job_unit_main launch controller-worker "$1" -- "$BASH" -c '
+      set -euo pipefail
+      backend=$1 acknowledgement=$2 log=$3; shift 3
+      identity="$("$BASH" "$backend" process "$$")" || exit 1
+      [[ -f "$acknowledgement" && ! -L "$acknowledgement" ]] || exit 1
+      printf "%s\n" "$identity" > "$acknowledgement" || exit 1
+      exec "$@" >>"$log" 2>&1' controller-worker "${BASH_SOURCE[0]}" "$2" "$3" "${flags[@]}" ;;
+  worker-cancel)
+    source "$SCRIPT_DIR/lib/job-unit.sh"
+    job_unit_main stop-job "$1" "$2" '*controller-session.py*' ;;
   select)
     source "$ROOT/mailbox/scripts/lib/kendex-env.sh"
     kendex_load_project_env "$3"
@@ -175,7 +188,7 @@ case "$verb" in
   open)
     placement=(--session "$3")
     [[ -z "$2" ]] || placement=(--after "$2")
-    result="$("$SCRIPT_DIR/overseer-host" create --cwd "$4" --name overseer "${placement[@]}" --line "exec $1")" || exit 1
+    result="$("$SCRIPT_DIR/overseer-host" create --cwd "$4" --name overseer "${placement[@]}" --line "$1")" || exit 1
     pane="" window=""
     for word in $result; do case "$word" in session=*) pane="${word#session=}" ;; window=*) window="${word#window=}" ;; esac; done
     [[ -n "$pane" && -n "$window" ]] || exit 1
@@ -190,6 +203,7 @@ case "$verb" in
     controller_flags "$7" || exit 1
     DEP_ERR="$(mktemp)" || exit 1
     trap 'rm -f -- "${DEP_ERR:?}"' EXIT
+    cd -- "$9" || exit 1
     watch_handover "$1" "$2" "$3" "$4" "$5" ${flags[@]+"${flags[@]}"} || { cat -- "$DEP_ERR" >&2; exit 1; }
     printf '%s\n' "$WATCH_HANDOVER_KEY" "${WATCH_HANDOVER_FIELDS[@]}" ;;
   live)
@@ -261,11 +275,11 @@ case "$verb" in
       lane_state state listed "$cmd" "$pid" "$screen" || exit 1
     fi
     if [[ "$LANE_WALL_KIND" == auth ]]; then printf 'auth\n'; exit; fi
-    if [[ "$harness" == copilot && "$6" == pending ]]; then
+    if [[ ( "$harness" == copilot || "$harness" == claude ) && "$6" == pending ]]; then
       # A folder-trust question holds the harness until its owner answers it
-      # natively; Jarvis never answers a native security request. Copilot's
-      # alone, asked before its SessionStart: lane_trust_prepare records the
-      # answer for Claude Code and Codex, and Pi asks none. Read below the
+      # natively; Jarvis never answers a native security request. Preserve
+      # orch's Claude launch verdict when a wrapper bypasses prepared trust;
+      # Copilot can ask before its SessionStart. Read below the
       # last turn, since a resumed session redraws its history. The pane
       # stands in for Copilot's documented `trustedFolders` config list
       # (`copilot help config`), which says what is listed but not how a

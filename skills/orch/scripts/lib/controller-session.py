@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -72,6 +73,9 @@ class Session:
         self.label = "jarvis-" + key[:32]
         self.deadline = time.monotonic() + CALL_SECONDS
         self.env = environment()
+        # Worker and watch policy belongs to the caller. Only native harness
+        # startup uses the selected-account environment above.
+        self.service_env = dict(os.environ)
         self.emitted = False
         self._path = None
 
@@ -106,8 +110,8 @@ class Session:
 
     def backend(self, verb, *args, check=True):
         env = self.env
-        if verb in ("open", "watch"):
-            env = dict(env, **{key: os.environ[key] for key in ("TMUX", "TMUX_PANE", "TMUX_TMPDIR", "ORCH_TMUX_SESSION") if key in os.environ})
+        if verb in ("select", "open", "watch", "worker-launch", "worker-cancel"):
+            env = self.service_env
         return self.run([BASH, str(BACKEND), verb, *map(str, args)], check=check, env=env)
 
     def tmux(self, *args, check=True, socket=None):
@@ -137,7 +141,7 @@ class Session:
             detail = record.get("detail", "")
             if not clean(detail) or len(detail) > 200:
                 raise ValueError("detail")
-            if record["state"] == "running":
+            if record["state"] == "running" and not record.get("native_exit"):
                 terminal = record.get("terminal") or {}
                 if (owner.get("pane") != terminal.get("pane") or not owner.get("pane")
                         or str(owner.get("server")) != str(record.get("server_pid"))
@@ -164,16 +168,28 @@ class Session:
                 "controller_generation": owner.get("generation", 1),
                 "state": "running", "reason": "existing", "detail": "", "registered": True,
                 "server_pid": int(owner["server"]), "server_started_at": owner["server_start"],
-                "effective_home": owner.get("home"), "process": {"pid": int(owner["harness_pid"]),
+                "native_exit": owner.get("exit"),
+                "effective_home": owner.get("home"), "native_process": {"pid": int(owner["harness_pid"]),
                     "started_at": owner["harness_start"]} if owner.get("harness_pid") else None,
                 "pending": {"generation": owner.get("generation", 1), "native_session_id": owner.get("session_id")}}
+
+    def controller(self, record, *, include_ended=False):
+        # Failed retries retain their owned waiting panes too. Only a verified
+        # controller before the first retired boundary can receive mail.
+        while record:
+            if record["state"] == "running":
+                return record if include_ended or not record.get("native_exit") else None
+            if (record.get("transfer") or {}).get("retired"):
+                return None
+            record = record.get("predecessor")
+        return None
 
     def write(self, record):
         # The workflow-state lock also protects native callbacks and registration.
         with self.path.open() as stream:
             state = json.load(stream)
         owner = state.get("overseer") or {}
-        active = record if record["state"] == "running" else record.get("predecessor")
+        active = self.controller(record)
         retired = (record.get("transfer") or {}).get("retired", False)
         if active and active.get("terminal") and active["state"] == "running" and (record["state"] == "running" or not retired):
             terminal = active["terminal"]
@@ -190,14 +206,17 @@ class Session:
             if active.get("identity"):
                 owner.update(active["identity"])
                 owner["launch_line"] = active["launch_line"]
-            if active.get("process"):
-                owner.update(harness_pid=str(active["process"]["pid"]), harness_start=active["process"]["started_at"])
+            process = active.get("native_process")
+            if active.get("native_exit"):
+                owner.pop("harness_pid", None)
+                owner.pop("harness_start", None)
+            elif process:
+                owner.update(harness_pid=str(process["pid"]), harness_start=process["started_at"])
         elif retired or not active:
             # A retired identity never authorizes mail, even while its successor starts.
             owner = {key: value for key, value in owner.items() if key in ("generation", "pending")}
         if record["state"] == "running":
-            if record.get("predecessor"):
-                owner.pop("pending", None)
+            owner.pop("pending", None)
         if record.get("intent") == "launch" and record.get("identity") and record.get("state") != "running":
             owner["pending"] = dict(record["identity"], launch_line=record["launch_line"])
         owner["lifecycle"] = record
@@ -243,6 +262,11 @@ class Session:
             lock.stdout.close()
             lock.stderr.close()
 
+    def staging(self, record):
+        # The waiting ownership write precedes its tmux generation mark.
+        return (not record.get("native_process") and not (record.get("pending") or {}).get("started_at")
+                and (record.get("transfer") or {}).get("phase") in ("saved", "waiting"))
+
     def terminal(self, record):
         terminal = record.get("terminal") if record else None
         if not terminal:
@@ -252,7 +276,7 @@ class Session:
         native_generation = (record.get("pending") or {}).get("generation", record["generation"])
         live = self.backend("live", terminal["server"], record["server_pid"], record["server_started_at"],
                             terminal["pane"], native_generation, terminal["window"],
-                            "registered" if record.get("registered") else "staging" if not record.get("process") and not (record.get("pending") or {}).get("started_at") else "native", check=False)
+                            "registered" if record.get("registered") else "staging" if self.staging(record) else "native", check=False)
         if live.returncode == 1:
             return None
         if live.returncode:
@@ -268,9 +292,15 @@ class Session:
                 terminal = self.terminal(view)
         except (Refusal, subprocess.TimeoutExpired):
             if state is None:
-                raise
-            terminal = None
-            view = record
+                view = self.controller(record)
+                if not view or view is record:
+                    raise
+                terminal = self.terminal(view)
+                if not terminal:
+                    raise
+            else:
+                terminal = None
+                view = record
         if state is None:
             if not record:
                 state, reason = "stopped", "never-started"
@@ -286,7 +316,7 @@ class Session:
                 # A refused cleanup can retain an unconfirmed terminal after
                 # releasing its worker. Start reports that retained ownership.
                 if (record.get("intent") in ("start", "succeed", "launch") and state in ("handing-over", "starting")
-                        and (record.get("worker") or not terminal)):
+                        and (record.get("worker") or not terminal or self.controller(record))):
                     if self.worker_live(record):
                         if record.get("intent") == "succeed":
                             state, reason = "handing-over", "succession"
@@ -296,12 +326,24 @@ class Session:
                         current = self.read()
                         if current != record:
                             return self.answer(current)
-                        if self.terminal(record.get("predecessor")):
+                        controller = self.controller(record)
+                        if controller and self.terminal(controller):
                             state, reason, detail = "running", "existing", ""
+                            view = controller
+                            terminal = self.terminal(view)
+                        elif self.terminal(record.get("predecessor")) and not (record.get("transfer") or {}).get("retired"):
                             view = record["predecessor"]
+                            state, reason, detail = "starting", "launching", ""
                             terminal = self.terminal(view)
                         else:
                             state, reason, detail = "failed", "handover-failed" if record.get("intent") == "succeed" else "launch-failed", "The controller worker ended before startup completed."
+        if state == "starting" and (view or {}).get("native_exit") and (record or {}).get("request_failure"):
+            failure = record["request_failure"]
+            state, reason, detail, terminal = failure["state"], failure["reason"], failure["detail"], None
+        if state == "running" and (view or {}).get("native_exit"):
+            state, reason, detail, terminal = "stopped", "ended", "", None
+        if state == "failed" and ((view or {}).get("native_exit") or not (view or {}).get("native_process")):
+            terminal = None
         if state == "running" and not ((view or {}).get("pending") or {}).get("native_session_id"):
             state, reason, detail = "blocked", "record-unreadable", ""
         return {"v": 1, "state": state, "reason": reason,
@@ -325,9 +367,9 @@ class Session:
         self.emitted = True
         return None, result.returncode
 
-    def _current_request(self, record, generation, intent):
+    def _current_request(self, record, generation, intent, *, report=True):
         current = record and record["generation"] == generation and record.get("intent") == intent
-        if not current:
+        if not current and report:
             # Operators read session.log to distinguish a cancelled launch
             # from a pending native identity or a failed dependency.
             print("jarvis-session: worker=cancelled generation=" + str(generation), flush=True)
@@ -336,12 +378,43 @@ class Session:
     def detach(self, verb, record):
         generation = record["generation"]
         log = self.path.parent / "session.log"
+        argv = [sys.executable, "-B", "-c",
+                "import runpy, sys; runtime = runpy.run_path(sys.argv[1], run_name='jarvis_worker'); runtime['Session'](sys.argv[3]).worker(sys.argv[2], int(sys.argv[4]))",
+                os.path.abspath(__file__), verb, self.home, str(generation)]
+        if record.get("external"):
+            # A watch's TERM fence walks descendants, and a unit also owns its
+            # cgroup. The existing orch job runner releases both lifetimes.
+            fd, acknowledgement = tempfile.mkstemp(dir=self.path.parent, prefix=".worker-")
+            os.close(fd)
+            runner = self.path.parent / "session-worker.runner"
+            identity = None
+            try:
+                self.backend("worker-launch", runner, acknowledgement, log, json.dumps(argv))
+                while time.monotonic() < self.deadline:
+                    value = Path(acknowledgement).read_text()
+                    if value.endswith("\n"):
+                        identity = json.loads(value)
+                        if not self.worker_live({"worker": identity}):
+                            raise Refusal("launch-failed", "The controller worker ended during acquisition.", "failed")
+                        record["worker"] = identity
+                        self.write(record)
+                        return identity
+                    time.sleep(0.05)
+                raise Refusal("launch-failed", "The controller worker did not acknowledge acquisition.", "failed")
+            except (Refusal, OSError, ValueError, subprocess.TimeoutExpired):
+                try:
+                    stopped = self.backend("worker-cancel", runner, identity["pid"] if identity else 0, check=False)
+                    if stopped.returncode > 1:
+                        print("controller-session: worker-cleanup=unavailable", file=sys.stderr)
+                except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as cleanup:
+                    self.failure_log("worker-cleanup-failed", cleanup)
+                raise
+            finally:
+                Path(acknowledgement).unlink()
         with log.open("a") as stream:
-            child = subprocess.Popen([sys.executable, "-B", "-c",
-                                      "import runpy, sys; runtime = runpy.run_path(sys.argv[1], run_name='jarvis_worker'); runtime['Session'](sys.argv[3]).worker(sys.argv[2], int(sys.argv[4]))",
-                                      os.path.abspath(__file__), verb, self.home, str(generation)],
+            child = subprocess.Popen(argv,
                                      stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
-                                     env=dict(self.env, JARVIS_BASH=BASH, **({key: os.environ[key] for key in ("TMUX", "TMUX_PANE", "TMUX_TMPDIR", "ORCH_TMUX_SESSION") if key in os.environ} if record.get("external") else {})), start_new_session=True)
+                                     env=dict(self.service_env, JARVIS_BASH=BASH), start_new_session=True)
         try:
             identity = json.loads(self.backend("process", child.pid).stdout)
             record["worker"] = identity
@@ -393,7 +466,9 @@ class Session:
             boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip() + ":" + os.environ.get("XDG_SESSION_ID", "")
         with self.locked():
             record = self.read()
-            if record and record.get("intent") == "succeed" and record["state"] != "running":
+            if (record and record["state"] != "running"
+                    and (record.get("intent") == "succeed" or (record.get("intent") != "stop"
+                         and (record.get("transfer") or {}).get("phase") == "retiring" and self.worker_live(record)))):
                 # Boot reads the transition, never history from its retired owner.
                 answer = self.answer(record)
                 return answer, 1 if answer["state"] == "failed" else 0
@@ -416,12 +491,15 @@ class Session:
                     if record["state"] == "off":
                         record.update(state="stopped", reason="stopped", detail="")
                 self.write(record)
+            # Saved Off wins while the Stop worker is still retiring resources.
             if record and record.get("app_off") and args.origin != "app-on":
                 if boot:
                     record["boot"] = boot
                     self.write(record)
                     return self.answer(record), 0
                 return self.answer(record, state="blocked", reason="app-off"), 1
+            if record and record["state"] == "stopping" and self.worker_live(record):
+                raise Refusal("record-unreadable")
             if not shutil.which("tmux"):
                 raise Refusal("tmux-missing")
             if not shutil.which(args.harness):
@@ -430,23 +508,7 @@ class Session:
             if record and not record.get("terminal"):
                 self.end_owned(record)
             matching = record and record.get("harness") == args.harness and record.get("account") == account
-            if record and record["state"] == "starting" and not self.worker_live(record):
-                # A completed worker no longer owns a launch. Release only its
-                # recorded terminal before retrying, and retain confirmed history.
-                try:
-                    self.end_owned(record)
-                except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as failure:
-                    self.failure_log("abandoned-cleanup-failed", failure)
-                    if not self.terminal(record):
-                        raise
-                    record = self.retain_live(record, record)
-                    self.write(record)
-                    return self.answer(record), 0
-                record.update(history=self.confirmed_history(record), terminal=None,
-                              state="failed", reason="launch-failed",
-                              detail="Jarvis's launch worker ended before Start completed.")
-                self.write(record)
-            if matching and record["state"] in ("starting", "running") and (self.worker_live(record) if record["state"] == "starting" else self.terminal(record)):
+            if matching and record["state"] in ("starting", "running") and not record.get("native_exit") and (self.worker_live(record) if record["state"] == "starting" else self.terminal(record)):
                 record.setdefault("report_started_at", int(time.time()))
                 record["app_off"] = False
                 if boot:
@@ -460,13 +522,20 @@ class Session:
             predecessor = record if self.terminal(record) else (record.get("predecessor") if record else None)
             if predecessor and not self.terminal(predecessor):
                 predecessor = None
-            if predecessor is not record and predecessor and predecessor["state"] == "running" and predecessor["harness"] == args.harness and predecessor["account"] == account:
+            if (predecessor is not record and predecessor and not record.get("terminal")
+                    and not record.get("process") and not record.get("native_process")
+                    and not (record.get("transfer") or {}).get("retired")
+                    and predecessor["state"] == "running" and not predecessor.get("native_exit") and predecessor["harness"] == args.harness and predecessor["account"] == account):
                 # Requests advance generation. A cancelled replacement keeps
                 # the live session's binding in pending.generation.
                 restored = dict(predecessor, generation=record["generation"] + 1, intent="start", app_off=False,
                                 boot=boot or record.get("boot"))
                 self.write(restored)
                 return self.answer(restored, state="running", reason="existing"), 0
+            # A missing immediate pane does not erase deeper owned resources.
+            # The next waiting worker must retire every retained identity.
+            predecessor = record if record and any(record.get(key) for key in
+                ("terminal", "predecessor", "process", "native_process")) else None
             brief = START_BRIEF
             if args.brief_file:
                 private = Path(args.brief_file).read_text().strip()
@@ -522,26 +591,32 @@ class Session:
         return str(saved)
 
     def succeed(self):
-        if not (BACKEND.parents[3] / "orch/scripts").is_dir():
-            # Without the lifecycle owner, refuse before taking or ending control.
-            raise Refusal("handover-failed", "Orch is not installed. The recorded account cannot start a successor.", "failed")
+        with self.locked():
+            previous = self.read()
+            if not previous or previous.get("app_off"):
+                raise Refusal("app-off" if previous and previous.get("app_off") else "record-unreadable")
+            retry = previous.get("intent") == "succeed" and previous["state"] != "running"
+            if retry:
+                if self.worker_live(previous):
+                    return self.answer(previous), 0
+            elif previous["state"] != "running" or previous.get("native_exit") or not self.terminal(previous):
+                raise Refusal("record-unreadable")
+        if retry:
+            # Native exit callbacks complete outside the record lock. Retain
+            # the exact predecessor facts until this candidate is confirmed ended.
+            self.end_owned(previous, window=True)
         with self.locked():
             record = self.read()
-            if not record or record.get("app_off"):
-                raise Refusal("app-off" if record and record.get("app_off") else "record-unreadable")
-            if record.get("intent") == "succeed" and record["state"] != "running":
-                if self.worker_live(record):
-                    return self.answer(record), 0
-                # End an abandoned waiting or native successor before retrying.
-                # Its predecessor remains the only possible controller.
-                self.end_owned(record, window=True)
-                predecessor = record.get("predecessor")
+            if not self._current_request(record, previous["generation"], previous.get("intent"), report=False):
+                raise Refusal("record-unreadable")
+            if record.get("app_off"):
+                raise Refusal("app-off")
+            if retry:
+                predecessor = None if record["transfer"].get("retired") else record.get("predecessor")
                 if not self.terminal(predecessor):
                     self.end_task_session()
                 saved_handoff = record["transfer"]["handoff"]
             else:
-                if record["state"] != "running" or not self.terminal(record):
-                    raise Refusal("record-unreadable")
                 predecessor = record
                 saved_handoff = None
             choice = record.get("choice") or {}
@@ -585,26 +660,27 @@ class Session:
             predecessor = record
             if record and not record.get("terminal"):
                 self.end_owned(record)
+            named = self.controller(record, include_ended=True) or record
             if args.predecessor:
-                if not record or not record.get("terminal") or record["terminal"]["pane"] != args.predecessor:
+                if not named or not named.get("terminal") or named["terminal"]["pane"] != args.predecessor:
                     raise Refusal("record-unreadable")
-            elif record and self.terminal(record):
+            elif self.controller(record) and self.terminal(self.controller(record)):
                 raise Refusal("name-conflict")
             self.backend("assert-record", self.path, args.expected, args.recovery)
             generation = record["generation"] + 1 if record else 1
             transfer = {"phase": "saved"}
-            handoff = spec.get("handoff", args.handoff)
+            handoff = spec.get("handoff") or args.handoff
             if handoff:
                 path = Path(handoff)
                 if not path.is_absolute():
                     path = Path(identity.get("cwd") or self.home) / path
-                if path.exists() or predecessor and predecessor.get("terminal"):
+                if path.exists() or args.handoff_policy == "required" and predecessor and predecessor.get("terminal"):
                     transfer["handoff"] = self.save_handoff(path, generation)
             next_record = {"v": 1, "home": self.home, "harness": identity["harness"], "account": identity.get("account"),
                            "origin": "manual", "boot": record.get("boot") if record else None, "app_off": False,
                            "generation": generation, "intent": "launch", "state": "starting", "reason": "launching", "detail": "",
                            "terminal": None, "predecessor": predecessor, "transfer": transfer,
-                           "external": True, "placement": {"predecessor": args.predecessor if self.terminal(predecessor) else "",
+                           "external": True, "placement": {"predecessor": args.predecessor if self.terminal(named) and not (named or {}).get("native_exit") else "",
                                "session": args.session_name or ((predecessor or {}).get("terminal") or {}).get("session", "")},
                            "identity": identity, "launch_line": args.line,
                            "launch": {"id": spec.get("id") if spec.get("file") else str(uuid.uuid4()), "file": spec.get("file", ""), "reason": "new-requested",
@@ -617,8 +693,14 @@ class Session:
         while time.monotonic() < self.deadline:
             current = self.read()
             answer = self.answer(current)
+            failure = (current or {}).get("request_failure")
+            if failure and failure["generation"] == generation:
+                return self.answer(current, state=failure["state"], reason=failure["reason"], detail=failure["detail"]), 1
             if answer["state"] not in ("starting", "handing-over"):
-                return answer, 0 if answer["state"] == "running" and current["generation"] == generation else 1
+                pending = (current or {}).get("pending") or {}
+                complete = (answer["state"] == "running" and current["generation"] == generation
+                            and pending.get("generation") == generation and pending.get("brief_taken"))
+                return answer, 0 if complete else 1
             time.sleep(0.2)
         raise Refusal("launch-failed", "The controller launch did not finish within its bound.", "failed")
 
@@ -631,25 +713,35 @@ class Session:
             terminal = current.get("terminal") if current else None
             same = terminal and terminal["pane"] == owner["pane"] and str(current["server_pid"]) == owner["server"]
             if current and current.get("state") in ("starting", "handing-over", "stopping"):
-                if same and (current.get("pending") or {}).get("started_at"):
-                    return self.answer(current), 0
+                if same:
+                    return dict(self.answer(current), registration="pending"), 0
                 raise Refusal("record-unreadable")
             if not same and self.terminal(current):
                 raise Refusal("name-conflict")
+            if current and not same:
+                self.end_owned(current, window=True)
             fresh = self.registered(owner)
             if current:
                 fresh["generation"] = current["generation"] if same else current["generation"] + 1
             if not fresh["terminal"]["session"]:
                 fresh["terminal"]["session"] = self.tmux("display-message", "-p", "-t", owner["pane"], "#{session_name}",
                                                           socket=owner["server_socket"]).stdout.strip()
-            if same and current.get("pending"):
+            if same and current.get("pending") and current["pending"].get("native_session_id") == fresh["pending"].get("native_session_id"):
+                if current.get("native_exit"):
+                    raise Refusal("record-unreadable")
                 fresh["pending"] = current["pending"]
+                fresh.update({key: current[key] for key in
+                              ("native_process", "effective_home", "account_var", "choice", "history", "external", "placement") if key in current})
             fresh["process"] = json.loads(self.backend("pane-process", owner["server_socket"], owner["pane"]).stdout)
             fresh.update({key: current[key] for key in ("boot", "app_off") if current and key in current})
             fresh["identity"] = {key: owner.get(key) for key in ("harness", "account", "home", "model", "effort", "cwd", "launch_spec", "session_rows")}
+            fresh["identity"]["home"] = fresh["effective_home"]
             fresh["launch_line"] = owner.get("launch_line", "")
+            complete = bool((fresh.get("pending") or {}).get("native_session_id"))
+            if not complete:
+                fresh.update(state="blocked", reason="record-unreadable")
             self.write(fresh)
-            return self.answer(fresh), 0
+            return dict(self.answer(fresh), registration="complete" if complete else "pending"), 0
 
     def retire_legacy(self):
         with self.locked(), self.locked(self.legacy):
@@ -667,8 +759,15 @@ class Session:
                 print("controller-session: legacy-worker-live=" + str(legacy["worker"]["pid"])
                       + " operation=retire-legacy", file=sys.stderr)
                 raise Refusal("record-unreadable")
-            self.end_owned(legacy, window=True)
-            self.end_owned(legacy.get("predecessor"), window=True)
+        self.end_owned(legacy, window=True, predecessors=True)
+        with self.locked(), self.locked(self.legacy):
+            with self.legacy.open() as stream:
+                current_legacy = json.load(stream)
+            # A still-installed old desktop can issue Start during retirement.
+            # Native callback fields may change; a new request identity cannot.
+            if any(current_legacy.get(key) != legacy.get(key) for key in ("generation", "terminal", "worker")):
+                raise Refusal("record-unreadable")
+            legacy = current_legacy
             off = legacy.get("app_off", False)
             policy = {"v": 1, "home": self.home, "harness": None, "account": None, "origin": None,
                       "generation": legacy.get("generation", 0) + 1, "app_off": off, "boot": legacy.get("boot"),
@@ -696,9 +795,12 @@ class Session:
             return
         # The waiting process is already inside its new pane. The native
         # identity hook needs that pane's tmux binding, not the caller's.
-        native_env = dict(self.env, **{key: os.environ[key] for key in ("TMUX", "TMUX_PANE", "TMUX_TMPDIR", "ORCH_TMUX_SESSION") if key in os.environ})
+        native_env = dict(self.env, JARVIS_RECORD=str(self.path), JARVIS_GENERATION=str(generation),
+                          ORCH_CONTROLLER_RUN_REQUEST=str(generation),
+                          ORCH_STATE_DIR=str(self.path.parent),
+                          **{key: os.environ[key] for key in ("TMUX", "TMUX_PANE", "TMUX_TMPDIR", "ORCH_TMUX_SESSION") if key in os.environ})
         identity = json.loads(self.backend("process", os.getpid()).stdout)
-        native = subprocess.Popen([BASH, "--noprofile", "--norc", "-c", command + '; result=$?; exit "$result"'],
+        native = subprocess.Popen([str(BACKEND.parent.parent / "overseer-run"), BASH, "--noprofile", "--norc", "-c", command],
                                   cwd=(record.get("identity") or {}).get("cwd") or self.home, env=native_env)
         try:
             while native.poll() is None:
@@ -737,7 +839,8 @@ class Session:
             record["intent"] = "stop"
             record["app_off"] = origin == "app-off" or record.get("app_off", False)
             self.write(record)
-            if self.terminal(record) or self.terminal(record.get("predecessor")) or record.get("state") == "starting":
+            if (self.terminal(record) or record.get("predecessor") or record.get("state") == "starting"
+                    or record.get("process") or record.get("native_process")):
                 record.update(state="stopping", reason="stop-requested", detail="")
                 self.write(record)
                 self.detach("stop", record)
@@ -747,7 +850,7 @@ class Session:
                 self._emit(answer)
                 return answer, 0
             record.update(state="off" if record["app_off"] else "stopped",
-                          reason="app-off" if record["app_off"] else "stopped", detail="")
+                          reason="app-off" if record["app_off"] else "stopped", detail="", terminal=None)
             self.end_task_session()
             self.write(record)
             return self.answer(record), 0
@@ -769,19 +872,28 @@ class Session:
         except (OSError, subprocess.TimeoutExpired) as failure:
             self.failure_log("task-session-end-failed", failure)
 
-    def end_owned(self, record, *, window=False):
+    def end_owned(self, record, *, window=False, predecessors=False):
+        if predecessors:
+            # Repeated refused retries retain each waiting pane. Retirement
+            # and Stop must end all of them; candidate cleanup ends only itself.
+            while record:
+                self.end_owned(record, window=window)
+                record = record.get("predecessor")
+            return
         if not record:
             return
         terminal = self.terminal(record)
-        if not terminal and record.get("process") and self.worker_live({"worker": record["process"]}):
-            raise Refusal("handover-failed", "The recorded process is still alive without its bound pane.", "failed")
+        if not terminal:
+            for key in ("process", "native_process"):
+                if record.get(key) and self.worker_live({"worker": record[key]}):
+                    raise Refusal("handover-failed", "The recorded process is still alive without its bound pane.", "failed")
         if terminal:
             pane = record["terminal"]["pane"]
             # tmux evaluates ownership and closes the pane's session in one
             # server command, before another client can reuse that pane id.
             native_generation = (record.get("pending") or {}).get("generation", record["generation"])
             binding = "1" if record.get("registered") else "#{==:#{@jarvis-generation}," + str(native_generation) + "}"
-            if not record.get("process") and not (record.get("pending") or {}).get("started_at"):
+            if self.staging(record):
                 binding = "#{||:" + binding + ",#{==:#{@jarvis-generation},}}"
             condition = "#{&&:" + binding + ",#{==:#{pid}," + str(record["server_pid"]) + "}}"
             if window and record.get("process"):
@@ -791,36 +903,43 @@ class Session:
                 stopped = self.backend("stop-process", identity["pid"], identity["started_at"], record["harness"], check=False)
                 if stopped.returncode:
                     raise Refusal("handover-failed", "The predecessor identity changed. Check the session record before retrying.", "failed")
-                if not self.terminal(record):
-                    return
                 condition = "#{&&:" + condition + ",#{==:#{pane_pid}," + str(identity["pid"]) + "}}"
-            action = "kill-window" if window or record.get("registered") else "kill-session"
-            self.tmux("if-shell", "-F", "-t", pane, condition, action + " -t " + pane, socket=record["terminal"]["server"])
+            if self.terminal(record):
+                action = "kill-window" if window or record.get("registered") else "kill-session"
+                self.tmux("if-shell", "-F", "-t", pane, condition, action + " -t " + pane, socket=record["terminal"]["server"])
             if (window or record.get("registered")) and self.terminal(record):
                 raise Refusal("handover-failed", "The predecessor window remains open. Retry jarvis-session succeed for this home.", "failed")
-            if window and record.get("process"):
-                while self.worker_live({"worker": identity}):
-                    time.sleep(0.1)
+            for key in ("process", "native_process"):
+                if record.get(key):
+                    while self.worker_live({"worker": record[key]}):
+                        time.sleep(0.1)
         elif not window:
             self.end_task_session()
 
     def worker(self, verb, generation):
         self.deadline = time.monotonic() + CALL_SECONDS
+        record = None
         acquired = None
         transferred = False
         try:
-            record = self.read()
-            if not self._current_request(record, generation, verb):
-                return
+            with self.locked():
+                record = self.read()
+                if (not self._current_request(record, generation, verb)
+                        or (record.get("worker") or {}).get("pid") != os.getpid()
+                        or not self.worker_live(record)):
+                    return
             if verb == "stop":
+                # Native exit and the caller's signal trap both write this
+                # state. They must finish before retirement can be confirmed.
+                self.end_owned(record, predecessors=True)
                 with self.locked():
                     record = self.read()
                     if not self._current_request(record, generation, "stop"):
                         return
-                    self.end_owned(record)
-                    self.end_owned(record.get("predecessor"))
                     record.update(state="off" if record["app_off"] else "stopped",
                                   reason="app-off" if record["app_off"] else "stopped", terminal=None)
+                    for key in ("predecessor", "process", "native_process"):
+                        record.pop(key, None)
                     self.write(record)
                 return
             launch = record["launch"]
@@ -852,18 +971,27 @@ class Session:
                 if record.get("external"):
                     runner_env = dict(self.env, JARVIS_BASH=BASH, ORCH_STATE_DIR=str(self.path.parent))
                     runner = ["env", *[key + "=" + value for key, value in runner_env.items()], sys.executable, "-B", "-c", "import runpy,sys; sys.exit(runpy.run_path(sys.argv[1],run_name='controller_runner')['Session'](sys.argv[2]).successor(int(sys.argv[3])))", os.path.abspath(__file__), self.home, str(generation)]
-                    import shlex
                     placement = record["placement"]
                     created = self.backend("open", shlex.join(runner), placement.get("predecessor") or "", placement.get("session") or "", session_cwd)
                     socket, server, started, session_name, window, pane = created.stdout.strip().split("\t")
                 else:
                     existing = self.tmux("has-session", "-t", "=jarvis", check=False)
                     if existing.returncode == 0:
-                        if not succeeding or not self.terminal(record.get("predecessor")):
+                        predecessor = record.get("predecessor")
+                        # A cancelled preparation can precede the bound native
+                        # resource; its request alone cannot authorize placement.
+                        while predecessor and not self.terminal(predecessor):
+                            if (predecessor.get("transfer") or {}).get("retired"):
+                                predecessor = None
+                                break
+                            predecessor = predecessor.get("predecessor")
+                        if not succeeding or not predecessor:
                             raise Refusal("name-conflict")
                     # A prompt-free shell keeps the pane alive before SessionStart.
                     creation = ["new-window", "-d", "-t", "=jarvis"] if succeeding and existing.returncode == 0 else ["new-session", "-d", "-s", "jarvis"]
                     runner = [sys.executable, "-B", "-c", "import runpy,sys; sys.exit(runpy.run_path(sys.argv[1],run_name='jarvis_runner')['Session'](sys.argv[2]).successor(int(sys.argv[3])))", os.path.abspath(__file__), self.home, str(generation)] if succeeding else [BASH, "--noprofile", "--norc"]
+                    if succeeding:
+                        runner = [BASH, "--noprofile", "--norc", "-c", shlex.join(runner) + "; exec " + shlex.join([BASH, "--noprofile", "--norc"])]
                     created = self.tmux(*creation, "-c", self.home,
                                         "-P", "-F", "#{socket_path}\t#{pid}\t#{start_time}\t#{window_id}\t#{pane_id}", *runner)
                     socket, server, started, window, pane = created.stdout.strip().split("\t")
@@ -887,28 +1015,44 @@ class Session:
                 self.tmux("set-option", "-p", "-t", pane, "@jarvis-generation", generation, socket=socket)
                 if not succeeding:
                     command = prepared["line"]
-                    # The account observer reads descendants of the pane shell.
-                    # A tail keeps that shell from exec-replacing itself.
+                    record["transfer"].update(phase="predecessor-ended", retired=True)
+                    self.write(record)
+                    native = ["env", "JARVIS_RECORD=" + str(self.path), "JARVIS_GENERATION=" + str(generation),
+                              "ORCH_CONTROLLER_RUN_REQUEST=" + str(generation),
+                              "ORCH_STATE_DIR=" + str(self.path.parent), str(BACKEND.parent.parent / "overseer-run"),
+                              BASH, "--noprofile", "--norc", "-c", command]
+                    # Keep the pane shell after the native command ends. The
+                    # existing run receipt identifies that command separately.
                     self.tmux("respawn-pane", "-k", "-t", pane, "-c", self.home,
-                              BASH, "--noprofile", "--norc", "-c", command + '; result=$?; exit "$result"')
+                              BASH, "--noprofile", "--norc", "-c", shlex.join(native) + "; exec " + shlex.join([BASH, "--noprofile", "--norc"]))
                     process = self.tmux("display-message", "-p", "-t", pane, "#{pane_pid}", socket=socket).stdout.strip()
                     record["process"] = json.loads(self.backend("process", process).stdout)
                     self.write(record)
             if succeeding:
                 watch_receipt = None
                 if record.get("external"):
-                    watch_receipt = self.backend("watch", ((record.get("predecessor") or {}).get("terminal") or {}).get("pane", ""),
+                    watch_receipt = self.backend("watch", record["placement"].get("predecessor") or "",
                                  pane, prepared["var"], prepared["effective_home"], record["harness"],
-                                 record.get("handoff_path") or "", json.dumps(launch.get("flags", [])), socket).stdout.splitlines()
+                                 record.get("handoff_path") or "", json.dumps(launch.get("flags", [])), socket, session_cwd).stdout.splitlines()
                 with self.locked():
                     record = self.read()
                     if not self._current_request(record, generation, verb):
                         return
                     if watch_receipt:
                         record["watch_receipt"] = watch_receipt
-                    self.end_owned(record.get("predecessor"), window=True)
+                    record["transfer"]["phase"] = "retiring"
+                    self.write(record)
+                    predecessor = record.get("predecessor")
+                self.end_owned(predecessor, window=True, predecessors=True)
+                with self.locked():
+                    record = self.read()
+                    if not self._current_request(record, generation, verb):
+                        return
                     record["transfer"]["retired"] = True
                     record["transfer"]["phase"] = "predecessor-ended"
+                    # These exact identities are now confirmed ended. Drop
+                    # their authority; saved handoff and conversation history stay.
+                    record["predecessor"] = None
                     record.update(state="starting", reason="launching")
                     self.write(record)
             # One bound covers native identity and the taking of the Start brief.
@@ -943,6 +1087,8 @@ class Session:
                     if not self._current_request(record, generation, verb):
                         return
                     # The pane answered for the record it was read against.
+                    if record.get("native_exit"):
+                        raise Refusal("launch-failed", "The native controller ended before Start completed.", "failed")
                     if any(record.get(key) != inspected.get(key) for key in ("pending", "brief_delivered")):
                         continue
                     if observed == "auth":
@@ -991,38 +1137,62 @@ class Session:
             if verb == "start" and (isinstance(failure, subprocess.TimeoutExpired) or time.monotonic() >= self.deadline):
                 failure = Refusal("launch-failed", "Jarvis did not complete Start within its launch bound.", "failed")
             self.deadline = time.monotonic() + CALL_SECONDS
+            cleanup_failed = False
+            cleanup_window = verb in ("succeed", "launch") or bool((acquired or record or {}).get("predecessor"))
+            # Native exit callbacks take the same record lock. Cleanup,
+            # like retirement and Stop, waits for them outside that lock.
+            if acquired and not transferred:
+                try:
+                    self.end_owned(acquired, window=cleanup_window)
+                except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as teardown:
+                    cleanup_failed = True
+                    self.failure_log("cleanup-failed", teardown)
             with self.locked():
-                if acquired and not transferred:
-                    try:
-                        self.end_owned(acquired, window=verb in ("succeed", "launch"))
-                    except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as teardown:
-                        self.failure_log("cleanup-failed", teardown)
+                record = self.read()
+                if not self._current_request(record, generation, verb):
+                    return
+                cleanup = (acquired or record) if verb in ("start", "succeed", "launch") and (not acquired or transferred) else None
+            if cleanup:
+                try:
+                    self.end_owned(cleanup, window=cleanup_window)
+                except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as teardown:
+                    cleanup_failed = True
+                    self.failure_log("cleanup-failed", teardown)
+            with self.locked():
                 record = self.read()
                 if not self._current_request(record, generation, verb):
                     return
                 record["history"] = self.confirmed_history(record)
-                if verb in ("start", "succeed", "launch") and (not acquired or transferred):
-                    try:
-                        self.end_owned(acquired or record, window=verb in ("succeed", "launch"))
-                    except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as teardown:
-                        self.failure_log("cleanup-failed", teardown)
-                if acquired and self.terminal(acquired):
+                if acquired and not transferred and cleanup_failed:
+                    # Once published, the record owns newer native callbacks.
+                    # Only an unpublished acquisition needs its local facts saved.
                     record.update({key: acquired[key] for key in
-                                   ("terminal", "server_pid", "server_started_at", "pending", "effective_home", "account_var")})
+                                   ("terminal", "server_pid", "server_started_at", "pending", "effective_home", "account_var",
+                                    "process", "native_process", "session_rows", "registered", "identity", "launch_line") if key in acquired})
                 predecessor = record.get("predecessor")
-                live = record if self.terminal(record) else predecessor if self.terminal(predecessor) else None
+                try:
+                    controller = self.controller(record)
+                    live = (record if cleanup_failed or self.terminal(record) else predecessor if self.terminal(predecessor)
+                            else record if controller and self.terminal(controller) else None)
+                except Refusal:
+                    # Unknown binding never grants permission to drop a PID.
+                    live = record
                 if live:
                     record = self.retain_live(record, live)
+                    record["request_failure"] = {"generation": generation,
+                        "state": failure.state if isinstance(failure, Refusal) else "failed",
+                        "reason": failure.reason if isinstance(failure, Refusal) else "launch-failed",
+                        "detail": failure.detail if isinstance(failure, Refusal) else "The replacement failed. Check the session log."}
+                elif verb == "stop":
+                    self.end_task_session()
+                    record.update(state="failed", reason="handover-failed", terminal=None,
+                                  detail="The recorded controller could not be confirmed stopped. Check the session log before retrying.")
                 else:
                     self.end_task_session()
-                    if verb == "stop":
-                        record.update(state="off" if record["app_off"] else "stopped",
-                                      reason="app-off" if record["app_off"] else "stopped", detail="", terminal=None)
-                    else:
-                        record.update(state=failure.state if isinstance(failure, Refusal) else "failed",
-                                      reason=failure.reason if isinstance(failure, Refusal) else "launch-failed",
-                                      detail=failure.detail if isinstance(failure, Refusal) else "Jarvis could not start. Check the session log.",
-                                      terminal=None)
+                    record.update(state=failure.state if isinstance(failure, Refusal) else "failed",
+                                  reason=failure.reason if isinstance(failure, Refusal) else "launch-failed",
+                                  detail=failure.detail if isinstance(failure, Refusal) else "Jarvis could not start. Check the session log.",
+                                  terminal=None)
                     if verb == "succeed":
                         record.update(state="failed", reason="handover-failed", history=None,
                                       detail="Retry jarvis-session succeed for this home. Check the session log if it fails again.")
@@ -1058,6 +1228,7 @@ def main():
     command.add_argument("--predecessor", default="")
     command.add_argument("--session-name", default="")
     command.add_argument("--handoff", default="")
+    command.add_argument("--handoff-policy", choices=("required", "optional"), default="required")
     command.add_argument("--wait-secs", type=int, default=55)
     command.add_argument("--expected", default="null")
     command.add_argument("--recovery", default="null")

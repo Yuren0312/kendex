@@ -23,7 +23,7 @@ CONTROLS = [
     ("live harness before brief", "orch/scripts/lib/pane-write.sh", 'pane_write_expect "$expect" || return', 'true || { pane_write_expect "$expect" || return; }', "test_identity_before_private_brief"),
     ("account before brief", "orch/scripts/lib/session-backend.sh", 'if [[ "$6" == confirmed ]]; then', 'if [[ "$state" == working ]]; then', "test_account_is_checked_before_private_brief"),
     ("kickoff turn before the start", "orch/scripts/lib/session-backend.sh", 'if [[ "$6" == confirmed ]]; then', 'if [[ "$state" == working || "$6" == confirmed ]]; then', "test_session_start_at_first_prompt"),
-    ("Copilot kickoff", "orch/scripts/lib/lane-launch.sh", "printf ' -i %s' \"$kickoff\"", 'true', "test_session_start_at_first_prompt"),
+    ("Copilot kickoff", "orch/scripts/lib/lane-launch.sh", "printf '%s -i %s' \"$flags\" \"$kickoff\"", 'printf \'%s\' "$flags"', "test_session_start_at_first_prompt"),
     ("Codex kickoff", "orch/scripts/lib/lane-launch.sh", "printf ' %s' \"$kickoff\"", 'true', "test_session_start_at_first_prompt"),
     ("observed account acknowledgement", "orch/scripts/lib/session-backend.sh", 'lane_account_equivalent "${7:-}" "$account" ||', 'true || { lane_account_equivalent "${7:-}" "$account"; } ||', "test_account_is_checked_before_private_brief"),
     ("fixture EOF is not delivery", "jarvis/tests/fixtures/harness.py", 'if prompt == "":', 'if False and prompt == "":', "test_account_is_checked_before_private_brief"),
@@ -39,9 +39,11 @@ CONTROLS = [
     ("Pi text-only brief on main", "orch/scripts/lib/session-rows.sh", 'Stop:pi) due=completed ;;', 'Stop:pi) return 0 ;;', "test_pi_text_only_brief"),
     ("Pi errored brief", "orch/scripts/lib/session-rows.sh", 'select($due != "completed" or .pi_run_outcome == "completed")', 'select(true)', "test_pi_text_only_brief"),
     ("Pi idle before the brief", "orch/scripts/lib/session-backend.sh", 'if [[ "$harness" == pi && "$6" == confirmed && "$brief" == undelivered ]]; then', 'if false; then', "test_pi_contract"),
+    ("Claude trust boundary", "orch/scripts/lib/session-backend.sh", 'if [[ ( "$harness" == copilot || "$harness" == claude ) && "$6" == pending ]]; then',
+     'if [[ "$harness" == copilot && "$6" == pending ]]; then', "test_trust_dialog_is_refused"),
     ("trust refusal", "orch/scripts/lib/session-backend.sh", "0) printf 'trust\\n%s\\n' \"$dialog\"; exit ;;", '0) ;;', "test_trust_dialog_is_refused"),
     ("trust below the last turn", "orch/scripts/lib/session-backend.sh", 'dialog="$(pane_trust_dialog "$slice")"', 'dialog="$(pane_trust_dialog "$screen")"', "test_resumed_history_is_no_trust_dialog"),
-    ("trust before the start", "orch/scripts/lib/session-backend.sh", 'if [[ "$harness" == copilot && "$6" == pending ]]; then', 'if [[ "$harness" == copilot ]]; then', "test_resumed_history_is_no_trust_dialog"),
+    ("trust before the start", "orch/scripts/lib/session-backend.sh", 'if [[ ( "$harness" == copilot || "$harness" == claude ) && "$6" == pending ]]; then', 'if [[ "$harness" == copilot || "$harness" == claude ]]; then', "test_resumed_history_is_no_trust_dialog"),
     ("pane refusal snapshot", "orch/scripts/lib/controller-session.py", '                with self.locked():\n                    inspected = record', '                if observed == "trust":\n                    raise Refusal("trust-required", dialog_question(dialog))\n                with self.locked():\n                    inspected = record', "test_resumed_history_is_no_trust_dialog"),
     ("stamped pane read", "orch/scripts/lib/controller-session.py", 'observed = self.backend(', 'observed = "" if taken else self.backend(', "test_sign_in_wall_after_the_stamp"),
     ("current-turn authentication", "orch/scripts/lib/session-backend.sh", 'lane_state state listed "$cmd" "$pid" "$screen" || exit 1', 'if lane_auth_failure "$screen"; then printf \'auth\\n\'; exit; fi\n    lane_state state listed "$cmd" "$pid" "$screen" || exit 1', "test_sign_in_failure"),
@@ -61,8 +63,8 @@ CONTROLS = [
     ("stop request identity", "orch/scripts/lib/controller-session.py", 'record["generation"] += 1', 'record["generation"] += 0', "test_cancelled_replacement_keeps_the_live_owner"),
     ("stop failure result", "orch/scripts/lib/controller-session.py", 'if live:\n                    record = self.retain_live(record, live)', 'if live:\n                    if verb == "stop":\n                        return\n                    record = self.retain_live(record, live)', "test_cancelled_replacement_keeps_the_live_owner"),
     ("replacement cancellation", "orch/scripts/lib/controller-session.py", 'dict(predecessor, generation=record["generation"] + 1, intent=', 'dict(predecessor, generation=record["generation"], intent=', "test_cancelled_replacement_keeps_the_live_owner"),
-    ("confirmed cancellation", "orch/scripts/lib/controller-session.py", 'predecessor["state"] == "running" and predecessor["harness"]', 'True and predecessor["harness"]', "test_cancelled_replacement_keeps_the_live_owner"),
-    ("Stop intent before probe", "orch/scripts/lib/controller-session.py", 'self.write(record)\n            if self.terminal(record) or self.terminal(record.get("predecessor"))', 'if False:\n                self.write(record)\n            if self.terminal(record) or self.terminal(record.get("predecessor"))', "test_off_and_boot_receipt"),
+    ("confirmed cancellation", "orch/scripts/lib/controller-session.py", 'predecessor["state"] == "running" and not predecessor.get("native_exit") and predecessor["harness"]', 'True and not predecessor.get("native_exit") and predecessor["harness"]', "test_cancelled_replacement_keeps_the_live_owner"),
+    ("Stop intent before probe", "orch/scripts/lib/controller-session.py", 'self.write(record)\n            if (self.terminal(record) or record.get("predecessor")', 'if False:\n                self.write(record)\n            if (self.terminal(record) or record.get("predecessor")', "test_off_and_boot_receipt"),
     ("boot scenario applicability", "jarvis/tests/session_controls.py", 'if boot_scenario.applicable:\n        controls.extend(boot_scenario.controls)', 'if True:\n        controls.extend(boot_scenario.controls)', "test_off_and_boot_receipt"),
 ]
 
@@ -143,10 +145,19 @@ def main():
                 assert result.returncode != 0, name + " passed its planted defect"
                 # The test runner's outcome distinguishes a red assertion from
                 # an import, fixture setup or command-launch failure.
-                assert "FAILED (failures=" in result.stderr, result.stdout + result.stderr
+                outcome = next((line for line in reversed(result.stderr.splitlines()) if line.startswith("FAILED (")), "")
+                assert outcome.startswith("FAILED (failures=") and "errors=" not in outcome, result.stdout + result.stderr
                 print("control: rejected=" + name, flush=True)
             finally:
                 path.write_text(original)
+        for test in clean:
+            started = time.monotonic()
+            print("control: start=stability name=" + test, flush=True)
+            stable = subprocess.run([os.environ["JARVIS_TEST_BASH"], str(skills / "jarvis/tests/session.test.sh"),
+                                     "SessionContract." + test], env=env, capture_output=True, text=True, timeout=90)
+            print(f"control: elapsed=stability seconds={time.monotonic() - started:.3f} name={test}", flush=True)
+            assert stable.returncode == 0, "stability failed: " + test + "\n" + stable.stdout + stable.stderr
+            print("control: stable=" + test, flush=True)
     print("pass: " + str(len(controls)) + " fail: 0")
 
 
