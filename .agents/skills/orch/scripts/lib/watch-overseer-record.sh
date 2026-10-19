@@ -173,7 +173,7 @@ overseer_command_record() {
     overseer_record_notice "$(cat -- "$DEP_ERR")" "$held" overseer-unrecorded "pane=$pane" "step=state-path"
     return 0
   }
-  detail="$(ORCH_STATE_DIR="${path%/*}" "$SCRIPT_DIR/controller-session" register --home "$PWD" --record "$record" 2>&1)" \
+  detail="$(ORCH_STATE_DIR="${path%/*}" "$SCRIPT_DIR/controller-session" register --home "${PROJECT_ROOT:-$PWD}" --record "$record" 2>&1)" \
     || overseer_record_notice "$detail" "$held" overseer-unrecorded "pane=$pane" "step=write"
   )
   return 0

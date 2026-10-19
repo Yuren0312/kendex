@@ -330,6 +330,7 @@ BARRIER
     fi
     model_env "$BASH" -euo pipefail -c '
       SCRIPT_DIR=$1 SUCCEED=$1/oversee-succeed WORKFLOW_STATE=$1/workflow-state
+      PROJECT_ROOT=$(git rev-parse --show-toplevel)
       HANDOFF=$3 OVERSEER_HARNESS=claude
       WORKFLOW_STATE_ARGS=() OVERSEER_FLAGS=(--model "$6" --effort high "$5")
       DEP_ERR=$2

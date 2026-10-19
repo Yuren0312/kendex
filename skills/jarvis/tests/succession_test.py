@@ -101,7 +101,8 @@ print(json.dumps({"config_dir": row["account"]}))
     def assert_shared_controller(self, record):
         shared = self.home / "tmp/workflow-state-oversee.json"
         self.assertTrue(shared.is_file(), "shared-controller-record")
-        owner = json.loads(shared.read_text())["overseer"]
+        owner = json.loads(shared.read_text()).get("overseer") or {}
+        self.assertIsInstance(owner.get("lifecycle"), dict, "shared-controller-record")
         self.assertEqual(owner["pane"], record["terminal"]["pane"])
         self.assertEqual(owner["session_id"], record["pending"]["native_session_id"])
         self.assertEqual(owner["account"], record["account"])
@@ -122,7 +123,31 @@ print(json.dumps({"config_dir": row["account"]}))
                 self.wait("stopped", persisted_stop=True)
 
     def test_shared_registration(self):
+        self.configure(hold_prompt=True)
+        os.mkfifo(self.gate)
         self.call("start")
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            before = json.loads(self.record.read_text())
+            if (before.get("pending") or {}).get("started_at"):
+                break
+            time.sleep(0.05)
+        self.assertTrue((before.get("pending") or {}).get("started_at"), self.session_log())
+        terminal = before["terminal"]
+        env = self.env | {"TMUX": terminal["server"] + "," + str(before["server_pid"]) + ",0",
+                          "TMUX_PANE": terminal["pane"], "CLAUDE_CONFIG_DIR": str(self.account)}
+        try:
+            pending = subprocess.run([str(SKILLS / "orch/scripts/oversee"), "register", "--account", str(self.account)],
+                                     cwd=self.home, env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(pending.returncode, 0, pending.stdout + pending.stderr)
+            owner = json.loads((self.home / "tmp/workflow-state-oversee.json").read_text())["overseer"]
+            self.assertNotIn("pane", owner, "registration-native-pending")
+            self.assertEqual(pending.stdout.split()[1], "registration-pending")
+        finally:
+            with self.gate.open("w") as stream:
+                stream.write("1")
+            self.gate.unlink()
+            self.configure(hold_prompt=False)
         self.wait()
         before = json.loads(self.record.read_text())
         self.assert_shared_controller(before)
@@ -137,6 +162,51 @@ print(json.dumps({"config_dir": row["account"]}))
             self.assert_shared_controller(after)
             self.assertEqual(after["pending"]["native_session_id"], before["pending"]["native_session_id"])
             self.assertEqual(after["terminal"], before["terminal"])
+
+    def test_registration_selected_record(self):
+        scripts = self.orch_world()
+        session_cwd = self.root / "session cwd"
+        session_cwd.mkdir()
+        for name in (".fixture.json", ".fixture-harness.py"):
+            shutil.copyfile(self.home / name, session_cwd / name)
+        for index, setting in enumerate((None, "relative-state", str(self.root / "absolute-state"))):
+            with self.subTest(state_dir=setting):
+                label = self.label + "-register-" + str(index)
+                env = dict(self.env)
+                env.pop("ORCH_STATE_DIR", None)
+                if setting is not None:
+                    env["ORCH_STATE_DIR"] = setting
+                selected_dir = Path(setting) if setting is not None else self.home / "tmp"
+                if not selected_dir.is_absolute():
+                    selected_dir = self.home / selected_dir
+                selected = selected_dir / "workflow-state-oversee.json"
+                server = subprocess.run(["tmux", "-L", label, "new-session", "-d", "-s", "fleet", "-c", str(session_cwd),
+                                         "-P", "-F", "#{socket_path},#{pid},0 #{pane_id}", str(self.root / "bin/claude")],
+                                        env=env, capture_output=True, text=True, check=True, timeout=10).stdout.strip()
+                address, pane = server.split()
+                env.update(TMUX=address, TMUX_PANE=pane, CLAUDE_CONFIG_DIR=str(self.account))
+                try:
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        command = subprocess.run(["tmux", "-L", label, "display-message", "-p", "-t", pane,
+                                                  "#{pane_current_command}"], env=env, capture_output=True, text=True, timeout=10)
+                        if command.stdout.strip() == "claude":
+                            break
+                        time.sleep(0.05)
+                    self.assertEqual(command.stdout.strip(), "claude", "registration-native-process")
+                    registered = subprocess.run([str(scripts / "oversee"), "register", "--account", str(self.account)],
+                                                cwd=self.home, env=env, capture_output=True, text=True, timeout=60)
+                    self.assertEqual(registered.returncode, 0, registered.stdout + registered.stderr)
+                    self.assertTrue(selected.is_file(), "registration-selected-record")
+                    owner = json.loads(selected.read_text()).get("overseer") or {}
+                    self.assertEqual(owner.get("pane"), pane, "registration-selected-record")
+                    self.assertIsInstance(owner.get("lifecycle"), dict, "shared-controller-record")
+                    self.assertEqual(owner["lifecycle"]["home"], str(self.home))
+                    self.assertEqual(owner["cwd"], str(session_cwd))
+                    self.assertEqual(owner["harness"], "claude")
+                    self.assertFalse((session_cwd / "tmp/workflow-state-oversee.json").exists(), "registration-second-record")
+                finally:
+                    subprocess.run(["tmux", "-L", label, "kill-server"], env=env, capture_output=True, timeout=10)
 
     def test_legacy_controller_refuses_replacement(self):
         self.call("start")
@@ -227,23 +297,34 @@ print(json.dumps({"config_dir": row["account"]}))
 
     def test_shared_orch_launch_and_recovery(self):
         scripts = self.orch_world()
+        self.handoff()
+        session_cwd = self.home / "subdir"
+        (session_cwd / "state").mkdir(parents=True)
+        session_handoff = "subdirectory handoff: TASK-ref\n"
+        (session_cwd / "state/handoff.md").write_text(session_handoff)
+        (session_cwd / ".fixture.json").symlink_to(self.home / ".fixture.json")
+        shutil.copyfile(self.home / ".fixture-harness.py", session_cwd / ".fixture-harness.py")
         # Keep an unrelated window alive on the fixture-owned server. A dead
         # controller must never take that process as its replacement identity.
         server = subprocess.run(["tmux", "-L", self.label, "new-session", "-d", "-s", "fleet", "-P", "-F", "#{socket_path},#{pid},0",
                                  self.env["JARVIS_TEST_BASH"], "--noprofile", "--norc"], env=self.env, capture_output=True,
                                 text=True, timeout=10, check=True).stdout.strip()
         self.env.update(TMUX=server, ORCH_TMUX_SESSION="fleet", ORCH_OVERSEER_PREFERENCE="claude:fable:high")
-        self.orch_call("oversee", "launch", "--session", "fleet", "--cwd", str(self.home), "--handoff", "state/handoff.md", "--wait-secs", "30")
+        self.orch_call("oversee", "launch", "--session", "fleet", "--cwd", str(session_cwd), "--handoff", "state/handoff.md", "--wait-secs", "30")
         owner = json.loads((self.home / "tmp/workflow-state-oversee.json").read_text())["overseer"]
         self.assertIsNotNone(owner.get("lifecycle"), "shared-controller-record")
         first = json.loads(self.record.read_text())
         self.assert_shared_controller(first)
+        self.assertEqual(first["home"], str(self.home))
+        self.assertEqual(owner["cwd"], str(session_cwd))
+        self.assertEqual(Path(first["transfer"]["handoff"]).read_text(), session_handoff, "session-handoff")
         self.handoff()
         self.configure(retiring=first["process"])
-        self.orch_call("oversee", "launch", "--predecessor", first["terminal"]["pane"], "--cwd", str(self.home),
+        self.orch_call("oversee", "launch", "--predecessor", first["terminal"]["pane"], "--cwd", str(session_cwd),
                        "--handoff", "state/handoff.md", "--wait-secs", "30")
         second = json.loads(self.record.read_text())
         self.assert_shared_controller(second)
+        self.assertEqual(Path(second["transfer"]["handoff"]).read_text(), session_handoff, "session-handoff")
         self.assertNotEqual(first["pending"]["native_session_id"], second["pending"]["native_session_id"])
         self.configure(retiring=None)
         # Stop through the shared process identity owner, leaving the recorded
@@ -271,6 +352,24 @@ print(json.dumps({"config_dir": row["account"]}))
                             if "predecessor_ended" in json.loads(row)]
         self.assertTrue(acknowledgements)
         self.assertTrue(all(acknowledgements), "native-before-retirement")
+        self.configure(idle=True, retiring=walled["process"])
+        failed = subprocess.run([str(scripts / "oversee"), "launch", "--predecessor", walled["terminal"]["pane"],
+                                 "--cwd", str(session_cwd), "--handoff", "state/handoff.md", "--wait-secs", "8"],
+                                cwd=self.home, env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+        stopped = json.loads(self.record.read_text())
+        self.assertEqual(stopped["state"], "failed")
+        self.assertTrue(stopped["transfer"]["retired"])
+        self.assertNotIn("pane", json.loads(self.watch_state.read_text())["overseer"], "retired-controller")
+        self.assertNotEqual((stopped.get("history") or {}).get("pending", {}).get("native_session_id"),
+                            walled["pending"]["native_session_id"], "retired-history")
+        self.assertEqual(Path(stopped["transfer"]["handoff"]).read_text(), session_handoff, "session-handoff")
+        self.configure(idle=False, retiring=None)
+        self.orch_call("oversee", "launch", "--session", "fleet", "--cwd", str(session_cwd),
+                       "--handoff", "state/handoff.md", "--wait-secs", "30")
+        fresh = json.loads(self.record.read_text())
+        self.assert_shared_controller(fresh)
+        self.assertNotEqual(fresh["pending"]["native_session_id"], walled["pending"]["native_session_id"])
 
     def test_shared_recovery_harnesses(self):
         scripts = self.orch_world()
@@ -453,7 +552,11 @@ print(json.dumps({"config_dir": row["account"]}))
         unrelated = subprocess.run(["tmux", "-S", terminal["server"], "new-window", "-d", "-t", "=" + terminal["session"],
                                     "-P", "-F", "#{pane_id}", self.env["JARVIS_TEST_BASH"], "--noprofile", "--norc"],
                                    env=self.env, capture_output=True, text=True, timeout=10, check=True).stdout.strip()
-        line = json.loads((self.home / "tmp/workflow-state-oversee.json").read_text())["overseer"]["launch_line"]
+        # Both revisions expose this public command; a migrated record field
+        # cannot be a prerequisite for exercising the baseline watch writer.
+        self.env["ORCH_OVERSEER_PREFERENCE"] = "claude:fable:high"
+        line = self.orch_call("oversee-succeed", "--print-launch-line", "--handoff", "state/handoff.md",
+                              "--", "--dangerously-skip-permissions").stdout.strip()
         printer = self.root / "print-line"
         printer.write_text("#!" + self.env["JARVIS_TEST_BASH"] + "\nprintf '%s\\n' " + shlex.quote(line) + "\n")
         printer.chmod(0o755)
@@ -467,8 +570,8 @@ print(json.dumps({"config_dir": row["account"]}))
                                     cwd=self.home, env=env | {"TMUX_PANE": pane}, capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             after = json.loads((self.home / "tmp/workflow-state-oversee.json").read_text())["overseer"]
-            self.assertEqual(after["pane"], terminal["pane"], "watch-controller-owner")
-            self.assertEqual(after["session_id"], before["pending"]["native_session_id"])
+            self.assertEqual(after.get("pane"), terminal["pane"], "watch-controller-owner")
+            self.assertEqual(after.get("session_id"), before["pending"]["native_session_id"], "watch-controller-native")
             self.assert_shared_controller(json.loads(self.record.read_text()))
 
     def test_succession_identity(self):

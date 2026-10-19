@@ -155,8 +155,6 @@ class Session:
     def registered(self, owner):
         if not owner.get("pane"):
             return None
-        if owner.get("cwd") and str(Path(owner["cwd"]).resolve()) != self.home:
-            raise Refusal("record-unreadable")
         terminal = {"server": owner.get("server_socket"), "session": owner.get("tmux_session", ""),
                     "window": owner.get("window"), "pane": owner["pane"]}
         if not terminal["server"]:
@@ -571,8 +569,6 @@ class Session:
 
     def launch(self, args):
         identity = json.loads(args.identity)
-        if identity.get("cwd") and str(Path(identity["cwd"]).resolve()) != self.home:
-            raise Refusal("record-unreadable")
         spec = identity.get("launch_spec")
         if spec is not None and not isinstance(spec, dict):
             raise Refusal("record-unreadable")
@@ -601,7 +597,7 @@ class Session:
             if handoff:
                 path = Path(handoff)
                 if not path.is_absolute():
-                    path = Path(self.home) / path
+                    path = Path(identity.get("cwd") or self.home) / path
                 if path.exists() or predecessor and predecessor.get("terminal"):
                     transfer["handoff"] = self.save_handoff(path, generation)
             next_record = {"v": 1, "home": self.home, "harness": identity["harness"], "account": identity.get("account"),
@@ -703,7 +699,7 @@ class Session:
         native_env = dict(self.env, **{key: os.environ[key] for key in ("TMUX", "TMUX_PANE", "TMUX_TMPDIR", "ORCH_TMUX_SESSION") if key in os.environ})
         identity = json.loads(self.backend("process", os.getpid()).stdout)
         native = subprocess.Popen([BASH, "--noprofile", "--norc", "-c", command + '; result=$?; exit "$result"'],
-                                  cwd=self.home, env=native_env)
+                                  cwd=(record.get("identity") or {}).get("cwd") or self.home, env=native_env)
         try:
             while native.poll() is None:
                 record = self.read()
@@ -829,8 +825,12 @@ class Session:
                 return
             launch = record["launch"]
             choice = record.get("choice") or {}
+            session_cwd = self.home
+            if record.get("external"):
+                session_cwd = (record.get("identity") or {}).get("cwd") or (
+                    ((record.get("predecessor") or {}).get("identity") or {}).get("cwd") or self.home)
             self.deadline = time.monotonic() + record.get("wait_secs", CALL_SECONDS)
-            prepared = json.loads(self.backend("prepare", record["harness"], record.get("account") or "", self.home,
+            prepared = json.loads(self.backend("prepare", record["harness"], record.get("account") or "", session_cwd,
                                                launch["id"], launch["file"], self.path, generation,
                                                json.dumps(launch.get("flags", [])), "external" if record.get("external") else "jarvis",
                                                launch.get("account_var", ""), launch.get("agent_home", ""),
@@ -839,7 +839,7 @@ class Session:
             if not record.get("identity"):
                 record["launch_line"] = prepared["line"]
                 record["identity"] = {"harness": record["harness"], "account": record["account"],
-                    "home": prepared["effective_home"], "model": choice.get("model") or None, "effort": choice.get("effort") or None, "cwd": self.home,
+                    "home": prepared["effective_home"], "model": choice.get("model") or None, "effort": choice.get("effort") or None, "cwd": session_cwd,
                     "launch_spec": {"brief": launch["brief"], "flags": launch.get("flags", []), "handoff": "state/handoff.md", "line": prepared["line"],
                                     "id": launch["id"], "file": launch["file"], "account_var": prepared["var"]}}
             with self.locked():
@@ -854,7 +854,7 @@ class Session:
                     runner = ["env", *[key + "=" + value for key, value in runner_env.items()], sys.executable, "-B", "-c", "import runpy,sys; sys.exit(runpy.run_path(sys.argv[1],run_name='controller_runner')['Session'](sys.argv[2]).successor(int(sys.argv[3])))", os.path.abspath(__file__), self.home, str(generation)]
                     import shlex
                     placement = record["placement"]
-                    created = self.backend("open", shlex.join(runner), placement.get("predecessor") or "", placement.get("session") or "")
+                    created = self.backend("open", shlex.join(runner), placement.get("predecessor") or "", placement.get("session") or "", session_cwd)
                     socket, server, started, session_name, window, pane = created.stdout.strip().split("\t")
                 else:
                     existing = self.tmux("has-session", "-t", "=jarvis", check=False)
@@ -874,7 +874,7 @@ class Session:
                                        "native_session_id": launch["id"] if record["harness"] != "codex" or launch["file"] else None})
                 # The acquisition remains locally owned until saved, including
                 # failures of the first ownership write or later setup writes.
-                record["session_rows"] = self.backend("rows", self.home, server, pane).stdout.strip()
+                record["session_rows"] = self.backend("rows", session_cwd, server, pane).stdout.strip()
                 record["registered"] = bool(record.get("external"))
                 acquired = record
                 if succeeding:

@@ -1151,9 +1151,10 @@ ol_succession() { # PREDECESSOR CWD LINE IDENTITY PENDING LANE_VAR LANE_DIR FORM
 }
 
 ol_controller_launch() { # CWD LINE IDENTITY PREDECESSOR SESSION WAIT_SECS
-  local out record fields receipt_lines field receipt=()
+  local out record fields receipt_lines field path receipt=()
   ol_checkout_sync "$1" || ol_checkout_notice
-  out="$("$SCRIPT_DIR/controller-session" launch --home "$1" --line "$2" --identity "$3" \
+  path="$(ol_record_path)" || return 1
+  out="$(ORCH_STATE_DIR="${path%/*}" "$SCRIPT_DIR/controller-session" launch --home "${PROJECT_ROOT:-$PWD}" --line "$2" --identity "$3" \
     --predecessor "$4" --session-name "$5" --handoff "${HANDOFF:-}" --wait-secs "$6" \
     --expected "${OL_PRIOR:-null}" --recovery "${OL_RECOVERY_RECORD:-null}" 2>"$DEP_ERR")" || {
       OL_REASON=controller-launch-failed
@@ -1221,6 +1222,13 @@ OL_PRIOR=""
 ol_record_read() {
   ol_record_get OL_PRIOR || { OL_PRIOR=""; return 1; }
 }
+ol_record_path() {
+  if [[ -n "${PROJECT_ROOT:-}" ]]; then
+    source "$SCRIPT_DIR/workflow-state" && workflow_state_path oversee
+  else
+    "$SCRIPT_DIR/workflow-state" path oversee
+  fi
+}
 # The record into OUT_VAR, or stdout when omitted, null where the state carries
 # none. An initialized caller resolves through the state owner without its CLI
 # startup. Standalone overseer-run has no PROJECT_ROOT and needs the
@@ -1228,13 +1236,9 @@ ol_record_read() {
 # unreadable JSON in an initialized caller, with detail in DEP_ERR.
 ol_record_get() { # [OUT_VAR]
   local state_file _org_record
-  if [[ -n "${PROJECT_ROOT:-}" ]]; then
-    state_file="$( { source "$SCRIPT_DIR/workflow-state" && workflow_state_path oversee; } 2>/dev/null)" || return 1
-    [[ -f "$state_file" ]] || return 1
-    _org_record="$(jq -r '.overseer // null' "$state_file" 2>"$DEP_ERR")" || return 2
-  else
-    _org_record="$("$SCRIPT_DIR/workflow-state" get oversee '.overseer // null' 2>"$DEP_ERR")" || return 1
-  fi
+  state_file="$(ol_record_path 2>/dev/null)" || return 1
+  [[ -f "$state_file" ]] || return 1
+  _org_record="$(jq -r '.overseer // null' "$state_file" 2>"$DEP_ERR")" || return 2
   if [[ -n "${1:-}" ]]; then printf -v "$1" '%s' "${_org_record:-null}"
   else printf '%s\n' "${_org_record:-null}"; fi
 }
@@ -1270,10 +1274,10 @@ ol_record_get() { # [OUT_VAR]
 # afresh, as sorted comma-separated lists, or `none`, for register's report.
 # All three are empty where the write failed. Returns 1 with the writer's
 # words in DEP_ERR.
-OL_GENERATION="" OL_RECORD_RETAINED="" OL_RECORD_FRESH=""
+OL_GENERATION="" OL_RECORD_RETAINED="" OL_RECORD_FRESH="" OL_RECORD_STATE=""
 ol_record_write() { # RUNTIME SESSION WINDOW SERVER IDENTITY [LINE]
-  local prior="${OL_PRIOR:-null}" result record cwd rows="" start="" socket="" fields
-  OL_GENERATION="" OL_RECORD_RETAINED="" OL_RECORD_FRESH=""
+  local prior="${OL_PRIOR:-null}" result record cwd rows="" start="" socket="" fields path answer
+  OL_GENERATION="" OL_RECORD_RETAINED="" OL_RECORD_FRESH="" OL_RECORD_STATE=""
   if [[ "$1" == tmux ]]; then
     cwd="$(jq -r '.cwd // empty' <<<"$5" 2>"$DEP_ERR")" || return 1
     rows="$(session_rows_overseer_file "${cwd:-$PWD}" "$4" "$2")"
@@ -1306,7 +1310,9 @@ ol_record_write() { # RUNTIME SESSION WINDOW SERVER IDENTITY [LINE]
          fresh: ($fresh | field_names)}' 2>"$DEP_ERR")" || return 1
   record="$(jq -c '.record' <<<"$result" 2>"$DEP_ERR")" || return 1
   fields="$(jq -r '[.record.generation, .retained, .fresh] | @tsv' <<<"$result" 2>"$DEP_ERR")" || return 1
-  "$SCRIPT_DIR/controller-session" register --home "${cwd:-$PWD}" --record "$record" >/dev/null 2>"$DEP_ERR" || return 1
+  path="$(ol_record_path)" || return 1
+  answer="$(ORCH_STATE_DIR="${path%/*}" "$SCRIPT_DIR/controller-session" register --home "${PROJECT_ROOT:-$PWD}" --record "$record" 2>"$DEP_ERR")" || return 1
+  OL_RECORD_STATE="$(jq -er '.state' <<<"$answer" 2>"$DEP_ERR")" || return 1
   IFS=$'\t' read -r OL_GENERATION OL_RECORD_RETAINED OL_RECORD_FRESH <<<"$fields"
 }
 

@@ -175,7 +175,7 @@ case "$verb" in
   open)
     placement=(--session "$3")
     [[ -z "$2" ]] || placement=(--after "$2")
-    result="$("$SCRIPT_DIR/overseer-host" create --cwd "$PWD" --name overseer "${placement[@]}" --line "exec $1")" || exit 1
+    result="$("$SCRIPT_DIR/overseer-host" create --cwd "$4" --name overseer "${placement[@]}" --line "exec $1")" || exit 1
     pane="" window=""
     for word in $result; do case "$word" in session=*) pane="${word#session=}" ;; window=*) window="${word#window=}" ;; esac; done
     [[ -n "$pane" && -n "$window" ]] || exit 1
