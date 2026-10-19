@@ -339,11 +339,13 @@ print(json.dumps({"config_dir": row["account"]}))
         return result
 
     def tearDown(self):
-        if hasattr(self, "watch_state") and self.watch_state.exists():
-            shell = 'source "$1/skills/orch/tests/lib/watch-fixture.sh"; fixture_watch_stop "$2"'
-            subprocess.run([self.env["JARVIS_TEST_BASH"], "-c", shell, "fixture", str(session_test.ROOT), str(self.watch_state)],
-                           env=self.env, capture_output=True, timeout=30)
-        super().tearDown()
+        try:
+            if hasattr(self, "watch_state") and self.watch_state.exists():
+                shell = 'source "$1/skills/orch/tests/lib/watch-fixture.sh"; fixture_watch_stop "$2"'
+                subprocess.run([self.env["JARVIS_TEST_BASH"], "-c", shell, "fixture", str(session_test.ROOT), str(self.watch_state)],
+                               env=self.env, capture_output=True, timeout=30)
+        finally:
+            super().tearDown()
 
     def test_shared_orch_launch_and_recovery(self):
         scripts = self.orch_world()
