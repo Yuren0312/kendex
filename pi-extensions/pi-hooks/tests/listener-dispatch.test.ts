@@ -68,8 +68,8 @@ function customCommand(log: string, stderr: string, exitCode: number): string {
 }
 
 /** The `Stop` payload one `agent_before_settle` dispatch writes to a hook's stdin. */
-function stopPayload(stopHookActive: boolean): string {
-	return JSON.stringify({ hook_event_name: "Stop", stop_hook_active: stopHookActive, working_agents: 0, session_id: SESSION_ID });
+function stopPayload(stopHookActive: boolean, outcome = "completed"): string {
+	return JSON.stringify({ hook_event_name: "Stop", stop_hook_active: stopHookActive, working_agents: 0, pi_run_outcome: outcome, session_id: SESSION_ID });
 }
 
 /** The `StopFailure` payload an errored settle writes to a hook's stdin, over
@@ -191,7 +191,7 @@ describe("pi-hooks registry dispatch on the listeners Pi gives no verdict to", (
 			registerRendered(join(project, ".pi"), TURN_END_LISTENER, undefined, `cat >> ${JSON.stringify(log)}; exit 0`);
 			registerRendered(join(project, ".pi"), TOOL_RESULT_LISTENER, undefined, `cat >> ${JSON.stringify(log)}; exit 0`);
 			const listeners: { run: (ctx: Record<string, unknown>) => Promise<unknown>; payload: Record<string, unknown> }[] = [
-				{ run: (ctx) => installCarrier().handler(SETTLE_LISTENER)(boundary(), ctx), payload: { hook_event_name: "Stop", stop_hook_active: false, working_agents: 0 } },
+				{ run: (ctx) => installCarrier().handler(SETTLE_LISTENER)(boundary(), ctx), payload: { hook_event_name: "Stop", stop_hook_active: false, working_agents: 0, pi_run_outcome: "completed" } },
 				{
 					run: (ctx) => installCarrier().handler(TOOL_RESULT_LISTENER)(toolResultEvent("bash", { command: "ls" }, "ok"), ctx),
 					payload: { hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "ls" }, tool_response: "ok" },
@@ -231,7 +231,7 @@ describe("pi-hooks registry dispatch on the listeners Pi gives no verdict to", (
 			expect(readLog(failed)).toBe("");
 			delete process.env.PI_SUBAGENT_CHILD_AGENT;
 			await installCarrier().handler(SETTLE_LISTENER)({ ...boundary(), outcome: "error" }, trusted(project));
-			expect(readLog(log)).toBe(stopPayload(false));
+			expect(readLog(log)).toBe(stopPayload(false, "error"));
 			expect(readLog(failed)).toBe(failurePayload);
 		} finally {
 			delete process.env.PI_SUBAGENT_CHILD_AGENT;
@@ -293,10 +293,10 @@ describe("pi-hooks registry dispatch on the listeners Pi gives no verdict to", (
 	 * the context whatever the outcome, and only an errored run hands it on.
 	 */
 	for (const row of [
-		{ outcome: "error", ui: true, logged: stopPayload(false) + failedRunPayload + failedRunPayload, notified: ["warning audit=stop", "warning failure=noted", "warning failure=recorded"], stderr: [] },
-		{ outcome: "error", ui: false, logged: stopPayload(false) + failedRunPayload + failedRunPayload, notified: [], stderr: ["failure=noted\n", "failure=recorded\n"] },
+		{ outcome: "error", ui: true, logged: stopPayload(false, "error") + failedRunPayload + failedRunPayload, notified: ["warning audit=stop", "warning failure=noted", "warning failure=recorded"], stderr: [] },
+		{ outcome: "error", ui: false, logged: stopPayload(false, "error") + failedRunPayload + failedRunPayload, notified: [], stderr: ["failure=noted\n", "failure=recorded\n"] },
 		{ outcome: "completed", ui: true, logged: stopPayload(false), notified: ["warning audit=stop"], stderr: [] },
-		{ outcome: "aborted", ui: true, logged: stopPayload(false), notified: ["warning audit=stop"], stderr: [] },
+		{ outcome: "aborted", ui: true, logged: stopPayload(false, "aborted"), notified: ["warning audit=stop"], stderr: [] },
 	]) {
 		test(`a registered StopFailure hook on a run whose outcome is ${row.outcome}, ${row.ui ? "with" : "without"} a UI`, async () => {
 			const project = initCleanRustRepo("pi-hooks-stop-failure-");
@@ -350,6 +350,26 @@ describe("pi-hooks registry dispatch on the listeners Pi gives no verdict to", (
 				rmSync(project, { recursive: true, force: true });
 			}
 		});
+	}
+
+	for (const outcome of ["completed", "error", "aborted"]) {
+		for (const control of [false, true]) {
+			test(`Stop carries the run outcome ${outcome}, dropped-field control=${control}`, async () => {
+				const project = initCleanRustRepo("pi-hooks-stop-outcome-");
+				const log = join(project, "stop.log");
+				try {
+					registerRendered(join(project, ".pi"), TURN_END_LISTENER, undefined, `cat >> ${JSON.stringify(log)}; exit 0`);
+					const extension = control ? (await import(mutatedCarrier(project, "stop-outcome", "hooks.ts",
+						"pi_run_outcome: event.outcome,", "...{},"))).default : undefined;
+					await installCarrier(undefined, extension).handler(SETTLE_LISTENER)({ ...boundary(), outcome }, trusted(project));
+					const check = () => expect(JSON.parse(readLog(log)).pi_run_outcome).toBe(outcome);
+					if (control) expect(check).toThrow();
+					else check();
+				} finally {
+					rmSync(project, { recursive: true, force: true });
+				}
+			});
+		}
 	}
 
 	/**
@@ -614,7 +634,7 @@ describe("pi-hooks registry dispatch on the listeners Pi gives no verdict to", (
 					}
 					if (on) expect(JSON.parse(readLog(log))).toEqual(listener === SESSION_START_LISTENER
 						? { hook_event_name: "SessionStart", source: "resume", session_id: SESSION_ID }
-						: { hook_event_name: "Stop", stop_hook_active: false, working_agents: 0, session_id: SESSION_ID });
+						: { hook_event_name: "Stop", stop_hook_active: false, working_agents: 0, pi_run_outcome: "completed", session_id: SESSION_ID });
 					else expect(readLog(log)).toBe("");
 				}
 			}

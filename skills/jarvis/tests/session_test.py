@@ -172,7 +172,10 @@ class SessionContract(unittest.TestCase):
             # tmux can disappear between ownership reads during failed-start
             # cleanup. Unknown ownership is a refusal until the final write.
             transient_cleanup = reason != "record-unreadable" and (answer["state"], answer["reason"]) == ("blocked", "record-unreadable")
-            if answer["state"] in ("blocked", "failed") and not transient_cleanup:
+            # A launch expected to fail must never accept the brief. Running
+            # cannot become launch-failed without another Start request.
+            unexpected_running = state == "failed" and answer["state"] == "running"
+            if (answer["state"] in ("blocked", "failed") and not transient_cleanup) or unexpected_running:
                 self.fail(str(answer) + "\n" + self.record.read_text() + "\n" + self.session_log())
             time.sleep(0.05)
         target = (json.loads(self.record.read_text()).get("terminal") or {}).get("pane", "")
@@ -567,6 +570,25 @@ class SessionContract(unittest.TestCase):
                 self.call("stop")
                 self.wait("stopped")
                 wrapper.unlink()
+
+    def test_pi_text_only_brief(self):
+        fixture = self.home / ".fixture.json"
+        for outcome, state, reason in (("completed", "running", "new-no-record"),
+                                       ("error", "failed", "launch-failed")):
+            with self.subTest(outcome=outcome):
+                fixture.write_text(json.dumps(json.loads(fixture.read_text())
+                                              | {"turn": "text-only", "outcome": outcome}))
+                self.call("start", "pi", mode="new")
+                answer = self.wait(state, reason, seconds=70)
+                record = json.loads(self.record.read_text())
+                if state == "running":
+                    self.assertIsNotNone(answer["terminal"])
+                    self.assertIs(record["pending"].get("brief_taken"), True)
+                else:
+                    self.assertIsNone(answer["terminal"])
+                    self.assertIsNone(record["history"]["pending"].get("brief_taken"))
+                self.call("stop")
+                self.wait("stopped")
 
     def test_session_start_at_first_prompt(self):
         # Copilot CLI and Codex fire SessionStart only once the first prompt is
