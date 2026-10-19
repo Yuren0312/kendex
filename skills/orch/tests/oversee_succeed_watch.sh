@@ -9,6 +9,9 @@
 # oversee_watch_lifecycle.sh's.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/git-env.sh"
+if [[ -z "${ORCH_TEST_NATIVE:-}" ]]; then
+  exec python3 "${BASH_SOURCE[0]%/*}/../../jarvis/tests/fixtures/harness.py" --run-script "$BASH" "${BASH_SOURCE[0]}" "$@"
+fi
 # shellcheck source=lib/lanes-fixture.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/lanes-fixture.sh"
 # mutant_scripts, for the one must-fail control below.
@@ -39,11 +42,13 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/assertions.sh"
 
 BIN="$TMP_ROOT/bin"
 mkdir -p "$BIN" "$TMP_ROOT/work/tmp" "$TMP_ROOT/fixture"
+source "$TEST_DIR/lib/overseer-checkout.sh"
+controller_fixture_install "$TMP_ROOT/work" "$SRC_DIR" "$BIN/processes" || exit 1
 # The successor's harness: it shows a running turn and holds its pane.
-cat > "$BIN/claude" <<'STUB'
+cat > "$BIN/claude" <<STUB
 #!/bin/sh
 echo 'esc to interrupt'
-exec sleep 100000
+exec "$BIN/processes/claude" "\$@"
 STUB
 chmod +x "$BIN/claude"
 
@@ -120,6 +125,7 @@ SETSID_LINE='runner=setsid reason=probe-failed detail=Failed to connect to bus: 
 # host's user manager; any other value runs behind the failing systemd-run.
 ROW_PATH="" ROW_LAUNCH="" ROW_MANAGER=""
 run_succeed() {
+  controller_fixture_register "$SRC_DIR" "$TMP_ROOT/work" "$CALLER_PANE" claude "$H/.claude" "$TMUX_ADDR" || exit 1
   fixture_succession_handoff "$FLEET_STATE" "$TMP_ROOT/work/tmp/handoffs/OVERSEER-HANDOFF.md"
   local manager=(PATH="${ROW_PATH:+$ROW_PATH:}$NO_MANAGER:$BIN:$PATH")
   [[ "$ROW_MANAGER" != unit ]] || manager=(PATH="${ROW_PATH:+$ROW_PATH:}$LINGERING:$BIN:$PATH"

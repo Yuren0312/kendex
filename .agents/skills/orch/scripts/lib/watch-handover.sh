@@ -1,11 +1,7 @@
 # shellcheck shell=bash
 #
-# The fleet watch handed from a stopped overseer's pane to its successor's.
-# Both overseer launchers run it: `oversee launch` and `oversee-succeed`,
-# each on the
-# `verified` step of lib/overseer-launch.sh § ol_succession, before the stop
-# that commits the succession. One owner, so neither launcher can leave the
-# watch reading a pane the other would have handed on.
+# The shared controller worker prepares watch transfer before retiring its
+# predecessor. The existing helper restarts it from the successor's pane.
 #
 #   watch_job_launch  a command started through the orch job runner, its
 #                     output appended beside the fleet state

@@ -11,6 +11,9 @@
 # oversee_succeed_watch.sh's.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/git-env.sh"
+if [[ -z "${ORCH_TEST_NATIVE:-}" ]]; then
+  exec python3 "${BASH_SOURCE[0]%/*}/../../jarvis/tests/fixtures/harness.py" --run-script "$BASH" "${BASH_SOURCE[0]}" "$@"
+fi
 # shellcheck source=lib/lanes-fixture.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/lanes-fixture.sh"
 # Private script layouts hold the stand-in watch beside the real launcher.
@@ -54,6 +57,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/assertions.sh"
 
 BIN="$TMP_ROOT/bin"
 mkdir -p "$BIN" "$TMP_ROOT/work/tmp" "$TMP_ROOT/fixture"
+source "$TEST_DIR/lib/overseer-checkout.sh"
+controller_fixture_install "$TMP_ROOT/work" "$SRC_DIR" "$BIN/processes" || exit 1
 # A checkout, which the real watch's mailbox reads resolve their root in.
 git init -q "$TMP_ROOT/work"
 git -C "$TMP_ROOT/work" config gc.auto 0
@@ -63,18 +68,10 @@ git -C "$TMP_ROOT/work" config maintenance.auto false
 # pane to the shell the launch line was typed into.
 HARNESS_PIDS="$TMP_ROOT/harness"
 mkdir -p "$HARNESS_PIDS"
+controller_fixture_install "$TMP_ROOT/work" "$SRC_DIR" "$BIN/processes" || exit 1
 cat > "$BIN/claude" <<STUB
 #!/bin/sh
-echo 'esc to interrupt'
-(
-  while [ ! -f "$HARNESS_PIDS/wall-\${TMUX_PANE#%}" ]; do sleep 0.1; done
-  echo "You've hit your limit"
-) &
-wall_writer=\$!
-trap 'kill "\$wall_writer" 2>/dev/null || true' 0
-sleep 100000 &
-echo \$! > "$HARNESS_PIDS/\${TMUX_PANE#%}"
-wait \$!
+exec "$BIN/processes/claude" "\$@"
 STUB
 chmod +x "$BIN/claude"
 
@@ -111,6 +108,7 @@ SETSID_LINE='runner=setsid reason=probe-failed detail=Failed to connect to bus: 
 ROW_ENV=()
 ROW_LAUNCH=""
 run_oversee() {
+  fixture_succession_handoff "$FLEET_STATE" "$TMP_ROOT/work/tmp/handoffs/OVERSEER-HANDOFF.md" || exit 1
   local bin="$OVERSEE"
   [[ "$1" == -- ]] || { bin="$1"; shift; }
   shift

@@ -2541,7 +2541,7 @@ session_gate() {
   # The fleet state is what names the overseer, so this is the first step that
   # can ask. A session that is not it has no marks of this hook's to meet.
   if [ "$NO_LANE_ITEM" -eq 1 ]; then
-    if ! overseer_identified && jarvis_identified; then
+    if jarvis_identified && [ "$JARVIS_REGISTERED" != true ]; then
       ROLE=jarvis
       return 0
     fi
@@ -2560,9 +2560,9 @@ jarvis_identified() {
   { [ -n "${JARVIS_RECORD:-}" ] && [ -n "$SESSION" ]; } || return 1
   resolve_reader || return 1
   JARVIS_SCRIPTS="${MAILBOX_SCRIPTS%/mailbox/scripts}/jarvis/scripts"
-  [ -f "$JARVIS_SCRIPTS/lib/session.py" ] || return 1
+  [ -f "$SCRIPTS/lib/controller-session.py" ] || return 1
   local binding socket="${TMUX:-}"
-  if ! binding=$(env JARVIS_BASH="$BASH" python3 - "$JARVIS_SCRIPTS/lib/session.py" \
+  if ! binding=$(env JARVIS_BASH="$BASH" python3 - "$SCRIPTS/lib/controller-session.py" \
       "$LANE_DIR" "$JARVIS_RECORD" "${JARVIS_GENERATION:-}" "$HARNESS" "$SESSION" \
       "${socket%%,*}" "${TMUX_PANE:-}" 2>"$WORK_DIR/jarvis.err" <<'PY'
 import json
@@ -2582,9 +2582,10 @@ terminal = record.get("terminal") or {}
 if (str(identity.get("generation")) != sys.argv[4]
         or identity.get("native_session_id") != sys.argv[6]
         or terminal.get("server") != sys.argv[7] or terminal.get("pane") != sys.argv[8]
-        or not session.terminal(record)):
+        or session.answer(record)["state"] != "running"):
     sys.exit(1)
-print(json.dumps({"home": session.home, "account_home": record.get("effective_home") or record.get("account")}))
+print(json.dumps({"home": session.home, "account_home": record.get("effective_home") or record.get("account"),
+                  "registered": bool(record.get("registered"))}))
 PY
   ); then
     [ ! -s "$WORK_DIR/jarvis.err" ] || message jarvis-record-unread "$JARVIS_RECORD" "$(cat -- "$WORK_DIR/jarvis.err")"
@@ -2592,6 +2593,7 @@ PY
   fi
   JARVIS_HOME=$(jq -r .home <<<"$binding") || return 1
   JARVIS_ACCOUNT_HOME=$(jq -r '.account_home // ""' <<<"$binding") || return 1
+  JARVIS_REGISTERED=$(jq -r .registered <<<"$binding") || return 1
   return 0
 }
 

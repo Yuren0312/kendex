@@ -9,6 +9,9 @@
 set -euo pipefail
 case "${OSTYPE:-}" in msys*|mingw*) export MSYS=winsymlinks:nativestrict ;; esac
 source "$(dirname "${BASH_SOURCE[0]}")/lib/git-env.sh"
+if [[ -z "${ORCH_TEST_NATIVE:-}" ]]; then
+  exec python3 "${BASH_SOURCE[0]%/*}/../../jarvis/tests/fixtures/harness.py" --run-script "$BASH" "${BASH_SOURCE[0]}" "$@"
+fi
 # shellcheck source=lib/copilot-context-world.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/copilot-context-world.sh"
 # shellcheck source=lib/lanes-fixture.sh
@@ -64,13 +67,14 @@ mkdir -p "$BIN/processes" "$TMP_ROOT/work"
 # shellcheck source=lib/overseer-checkout.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/overseer-checkout.sh"
 checkout_world "$TMP_ROOT/work" || { echo "fixture: the work checkout could not be made" >&2; exit 1; }
+source "$TEST_DIR/lib/overseer-checkout.sh"
+controller_fixture_install "$TMP_ROOT/work" "$TEST_DIR/../scripts" "$BIN/processes" || exit 1
 # The claude stub asks the folder-trust question the real harness asks: with
 # no `hasTrustDialogAccepted` for its working directory in the .claude.json
 # of the config dir it runs under, it draws the dialog line and waits, which
 # is what a successor launched without the entry meets. The codex stub asks
 # none, its trust being the launch-home rows' subject.
 for harness in claude codex copilot; do
-  cp "$(command -v sleep)" "$BIN/processes/$harness"
   case "$harness" in
     claude) lane_var=CLAUDE_CONFIG_DIR ;;
     codex) lane_var=CODEX_HOME ;;
@@ -88,7 +92,7 @@ $(checkout_stub_line)
 $trust_gate
 if [ -f "$TMP_ROOT/idle" ]; then echo 'FIXTURE successor startup waiting'; else echo 'esc to interrupt'; fi
 [ ! -f "$TMP_ROOT/asking" ] || echo 'Do you want to proceed?'
-exec "$BIN/processes/$harness" 100000
+exec "$BIN/processes/$harness" "\$@"
 STUB
 done
 # A caller pane whose foreground process NAMES a harness, which is what
@@ -360,6 +364,19 @@ chmod +x "$TMP_ROOT/succeed-env" "$TMP_ROOT/in-pane"
 # the script, so a background launch's pid is the script's own.
 exec_succeed() {
   fixture_watch_neighbor "${SUCCEED_BIN:-$SUCCEED}"
+  case " $* " in
+    *' --check-marks '*|*' --print-launch-line '*|*' --dead-pane '*|*' --walled-pane '*) ;;
+    *)
+      if [[ "${HANDOFF_FIXTURE:-on}" == on && -f "$FLEET_STATE" ]] && ! jq -e --arg pane "$CALLER_PANE" '.overseer.pane == $pane' "$FLEET_STATE" >/dev/null; then
+        local fixture_harness fixture_account
+        fixture_harness="$(jq -r '.harness // "claude"' "$OVERSEER_RECORD")" || return 1
+        fixture_account="$H/.claude"
+        [[ "$fixture_harness" != codex ]] || fixture_account="$H/.codex"
+        [[ "${CALLER_LANE:-}" != *=* ]] || fixture_account="${CALLER_LANE#*=}"
+        [[ "${CALLER_LANE:-}" != none ]] || fixture_account=""
+        controller_fixture_register "$SRC_DIR" "$TMP_ROOT/work" "$CALLER_PANE" "$fixture_harness" "$fixture_account" "$TMUX_ADDR" || return 1
+      fi ;;
+  esac
   exec env TMUX="$TMUX_ADDR" TMUX_PANE="$CALLER_PANE" "$TMP_ROOT/succeed-env" "$@"
 }
 
@@ -407,7 +424,7 @@ overseers() { tm list-windows -t fleet -F '#{window_name}' | awk '$0 == "oversee
 # adds how it was INVOKED, which only the launcher rows ask about: under the
 # environment prefix `env` hands the harness its bare name, and under the
 # launcher form the pane runs the absolute path the judge resolved.
-recorded() { if [[ -f "$TMP_ROOT/argv.$1" ]]; then grep -v '^argv0=' "$TMP_ROOT/argv.$1" | tr '\n' ';'; else printf 'none'; fi; }
+recorded() { controller_fixture_argv "$TMP_ROOT/argv.$1" "$1"; }
 recorded_argv0() { sed -n 's/^argv0=//p' "$TMP_ROOT/argv.$1" 2>/dev/null || true; }
 # One brief on every harness: the plain sentence each of them reads as its
 # opening prompt.
@@ -1136,251 +1153,8 @@ assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(caller_open)|$(overseers)|$(recorded cla
   "3|oversee-succeed: no-lane-qualifies entries=1 fallback=none walled=1 unmeasured=0 mark=context|yes|0|none" \
   "control: without the fallback the same preference refuses with the caller's harness unwalked"
 
-# SCHED_SLACK — the seconds a loaded runner adds to a figure taken off the
-# clock, over whatever the script under test decided. Every wait below is
-# counted in whole seconds and ends on a `sleep 1`, so a runner late to
-# schedule the last iteration moves the figure by one while the budgeting
-# stands still, and the macOS runner is regularly that late. A row pinning the
-# exact second therefore pins the runner's load, and reddens a gate every
-# branch and every orch pull request must pass. Each row below pins the
-# interval its claim is about instead. Lateness is the whole of what this pays
-# for: a row measuring wall clock around a whole run carries work the script
-# did besides waiting, and names its own term for that.
-SCHED_SLACK=2
-
-# The refusal reports how long the run waited, and the budget it spent is what
-# that figure is about: never less than --wait-secs, since the loop abandons
-# only once the budget is gone, and never more than a late schedule can add.
-IDLE_WAIT=2
-# idle_log — the fleet log rows the refusal left, `kind item text`, its window
-# and wait normalized.
-idle_log() { jq -r '(.fleet_log // [])[] | "\(.kind) \(.item) \(.text)"' "$FLEET_STATE" | sed 's/window=@[0-9]*/window=@N/; s/waited=[0-9]*/waited=N/'; }
-new_caller "$MARK"
-fleet_state
-tm swap-window -d -s "$CALLER_WINDOW" -t "$KEEP_WINDOW"
-IDLE_LAYOUT="$(tm list-windows -t fleet -F '#{window_id} #{window_index}')"
-touch "$TMP_ROOT/idle"
-VIRTUAL_CLOCK=1 run_succeed idle 'claude:fable:high' --wait-secs "$IDLE_WAIT"
-rm -f "$TMP_ROOT/idle"
-idle_waited="$(keyed successor-not-working "$OUT" | sed -n 1p | sed 's/.*waited=//')"
-idle_budget="$(in_range spent "$idle_waited" "$IDLE_WAIT" "$((IDLE_WAIT + SCHED_SLACK))")"
-assert_eq "$RC|$(keyed successor-not-working "$OUT" | sed -n 1p | sed 's/window=@[0-9]*/window=@N/; s/waited=[0-9]*/waited=N/')|$idle_budget|$(grep -cF 'FIXTURE successor startup waiting' <<<"$OUT")|$(caller_open)|$(overseers)|$(grep -c '^oversee-succeed: watch-' <<<"$OUT")|$(idle_log)" \
-  "1|oversee-succeed: successor-not-working window=@N waited=N|spent|1|yes|0|0|close overseer oversee-succeed: successor-not-working window=@N waited=N mark=context" \
-  "never working: refused after its whole budget, caller kept, successor closed, no watch handed over, the refusal in the fleet log"
-assert_eq "$(tm list-windows -t fleet -F '#{window_id} #{window_index}')" "$IDLE_LAYOUT" \
-  "an abandoned succession restores the base-index caller and unrelated windows"
-# Its control: an abandon that writes no fleet log row leaves the session that
-# reads the log next with no word that the succession failed.
-IDLECTL="$(mutant_scripts idlectl oversee-succeed)" || exit 1
-mutate_file "$IDLECTL/oversee-succeed" '    if ! ol_fleet_log "$dir/notice" "$dir/record" "$dir/err"; then' '    if ! :; then'
-new_caller "$MARK"
-fleet_state
-touch "$TMP_ROOT/idle"
-VIRTUAL_CLOCK=1 SUCCEED_BIN="$IDLECTL/oversee-succeed" run_succeed idlectl 'claude:fable:high' --wait-secs "$IDLE_WAIT"
-rm -f "${TMP_ROOT:?}/idle"
-assert_eq "$RC|$(keyed successor-not-working "$OUT" | sed -n 1p | cut -d' ' -f1-2)|$(idle_log)" \
-  "1|oversee-succeed: successor-not-working|" \
-  "control: an abandon that skips the fleet log row leaves no row"
-# A fleet log that refuses the row: the refusal still closes the successor,
-# keeps the caller and exits 1, and the notice names the refusal and the step
-# after the refusal's own line. The stand-in refuses `append-file` alone, so
-# every record write the succession makes still lands.
-LOGFAIL="$(mutant_scripts logfail)" || exit 1
-rm -f -- "${LOGFAIL:?}/workflow-state"
-cat > "$LOGFAIL/workflow-state" <<STUB
-#!/usr/bin/env bash
-if [[ "\${BASH_SOURCE[0]}" != "\$0" ]]; then source "$SRC_DIR/workflow-state"; return \$?; fi
-[[ "\$1" != append-file ]] || { echo 'fixture: append refused' >&2; exit 1; }
-exec "$SRC_DIR/workflow-state" "\$@"
-STUB
-chmod +x "$LOGFAIL/workflow-state"
-new_caller "$MARK"
-fleet_state
-touch "$TMP_ROOT/idle"
-VIRTUAL_CLOCK=1 SUCCEED_BIN="$LOGFAIL/oversee-succeed" run_succeed logfail 'claude:fable:high' --wait-secs "$IDLE_WAIT"
-rm -f "${TMP_ROOT:?}/idle"
-assert_eq "$RC|$(grep -e '^oversee-succeed: fleet-log-unwritten ' -e '^oversee-succeed: successor-not-working ' -e '^fixture: ' <<<"$OUT" | sed 's/window=@[0-9]*/window=@N/; s/waited=[0-9]*/waited=N/' | tr '\n' ';')|$(caller_open)|$(overseers)|$(idle_log)" \
-  "1|oversee-succeed: successor-not-working window=@N waited=N;oversee-succeed: fleet-log-unwritten key=successor-not-working step=append;fixture: append refused;|yes|0|" \
-  "a fleet log that refuses the row leaves the refusal standing: successor closed, caller kept, the notice keyed"
-
-# The wait asks the turn-in-flight predicate, not the lane_state judge beside
-# it. A successor drawing a dialog line in its very first turn is a launched
-# successor, and the judge would call that pane `asking` — not `working` — and
-# abandon a succession that had in fact taken.
-new_caller "$MARK"
-touch "$TMP_ROOT/asking"
-run_succeed asking 'claude:fable:high'
-rm -f "$TMP_ROOT/asking"
-assert_eq "$RC|$(layout)|$(caller_open)" \
-  "0|0 overseer;|no" \
-  "a first turn that also prints a dialog line is a launched successor, not an abandoned one"
-
-# A shell tool that times out sends TERM mid-wait. The harness stub writes its
-# argv only once the launch is typed, which is after the traps are set.
-new_caller "$MARK"
-touch "$TMP_ROOT/idle"
-rm -f "${TMP_ROOT:?}"/argv.*
-( exec_succeed interrupted 'claude:fable:high' --wait-secs 30 ) > "$TMP_ROOT/interrupted.out" 2>&1 &
-succ_pid=$!
-for _ in $(seq 1 50); do [[ ! -f "$TMP_ROOT/argv.claude" ]] || break; sleep 0.2; done
-kill -TERM "$succ_pid"
-RC=0
-wait "$succ_pid" || RC=$?
-rm -f "${TMP_ROOT:?}/idle"
-assert_eq "$RC|$(keyed interrupted "$(cat "$TMP_ROOT/interrupted.out")" | sed -n 1p | sed 's/window=@[0-9]*/window=@N/')|$(caller_open)|$(overseers)" \
-  "1|oversee-succeed: interrupted window=@N signal=TERM|yes|0" \
-  "interrupted mid-wait: refused, caller kept, successor closed"
-
-# A signal that lands while the runtime's create runs, the window the script
-# header names: the successor window is open and its id lives only in the
-# provider's answer, not yet in SUCC_PANE. The close-out must read the session
-# off that answer and stop it, or two overseers run. A tmux shim on PATH
-# holds load-buffer, the first write the provider's pane_write makes, until
-# the test sends the group signal and releases it. The kill therefore lands
-# between new-window and the provider's answer, regardless of runner load;
-# the shim is on PATH for these rows alone.
-REAL_TMUX="$(command -v tmux)"
-# int_create_run BIN — the script launched in its own process group so the
-# group kill reaches the provider too, run until load-buffer is held, then
-# TERMed and released. Sets INT_OVERSEERS to the count after it exits.
-int_create_run() { # SUCCEED_BIN
-  new_caller "$MARK"
-  local before after=""
-  before="$(overseers)"
-  rm -f -- "$TMP_ROOT/intcreate.ready" "$TMP_ROOT/intcreate.release"
-  setsid env TMUX="$TMUX_ADDR" TMUX_PANE="$CALLER_PANE" SUCCEED_BIN="$1" \
-    "$TMP_ROOT/succeed-env" intcreate 'claude:fable:high' --wait-secs 30 \
-    > "$TMP_ROOT/intcreate.out" 2>&1 &
-  local pgid=$!
-  # Poll only for the barrier; a timeout refuses the fixture, never a row pass.
-  for _ in $(seq 1 100); do [[ -f "$TMP_ROOT/intcreate.ready" ]] && break; sleep 0.2; done
-  if [[ ! -f "$TMP_ROOT/intcreate.ready" ]]; then
-    kill -TERM -"$pgid" 2>/dev/null || true
-    touch "$TMP_ROOT/intcreate.release"
-    wait "$pgid" 2>/dev/null || true
-    echo 'oversee-succeed-test: intcreate=barrier-not-reached' >&2
-    exit 1
-  fi
-  kill -TERM -"$pgid"
-  touch "$TMP_ROOT/intcreate.release"
-  wait "$pgid" 2>/dev/null || true
-  for _ in $(seq 1 25); do after="$(overseers)"; [[ "$after" -le "$before" ]] && break; sleep 0.2; done
-  INT_OVERSEERS="$after"
-}
-if command -v setsid >/dev/null 2>&1; then
-  cat > "$BIN/tmux" <<SHIM
-#!/bin/sh
-if [ "\$1" = load-buffer ]; then
-  : > "$TMP_ROOT/intcreate.ready"
-  # Wait for the test's release after TERM, not for a fixed create duration.
-  while [ ! -f "$TMP_ROOT/intcreate.release" ]; do sleep 0.2; done
-fi
-exec "$REAL_TMUX" "\$@"
-SHIM
-  chmod +x "$BIN/tmux"
-  int_create_run "$SUCCEED"
-  assert_eq "$INT_OVERSEERS" \
-    "0" \
-    "a signal during create closes the successor read off the provider's answer"
-  # The provider's control: without its signal guard it dies between
-  # new-window and its answer, and the window leaks.
-  INTHOST="$(mutant_scripts int-create-host overseer-host-tmux)" || exit 1
-  mutate_file "$INTHOST/overseer-host-tmux" "    trap '' HUP INT TERM" '    :'
-  int_create_run "$INTHOST/oversee-succeed"
-  assert_eq "$INT_OVERSEERS" \
-    "1" \
-    "control: a provider without its signal guard leaks the successor"
-  # The library's control: ol_session_abandon recovers the session from the
-  # provider's answer where the caller never assigned it. Drop that recovery
-  # and the window leaks.
-  INTCTL="$(mutant_scripts int-create-ctl lib/overseer-launch.sh)" || exit 1
-  mutate_file "$INTCTL/lib/overseer-launch.sh" '  [[ -n "$OL_SESSION" ]] || ol_session_from_out' '  :'
-  int_create_run "$INTCTL/oversee-succeed"
-  assert_eq "$INT_OVERSEERS" \
-    "1" \
-    "control: without the recovery a signal during create leaks the successor"
-  rm -f -- "${BIN:?}/tmux"
-  tm kill-window -a -t "$KEEP_WINDOW" 2>/dev/null || true
-  tm move-window -r -t fleet
-else
-  echo "  skip  a signal during create closes the successor (no setsid)"
-fi
-
-# The caller's own record is put back WHOLE when a launch is abandoned, its own
-# launch line included: the read runs before the successor's line is written,
-# so a later dead-overseer relaunch never replays the line this run refused.
-# Seed a prior generation, run an abandon (never-working), and read the record.
-SEED_LINE='env CLAUDE_CONFIG_DIR=/seed/.claude claude -n overseer --seeded'
-seed_overseer() {
-  fleet_state
-  jq --arg line "$SEED_LINE" \
-    '.overseer = {runtime: "tmux", generation: 5, server: "7000", pane: "%900", window: "@900", account: "/seed/.claude", launch_line: $line}' \
-    "$FLEET_STATE" > "$FLEET_STATE.tmp" && mv -- "$FLEET_STATE.tmp" "$FLEET_STATE"
-}
-seed_overseer
-new_caller "$MARK"
-touch "$TMP_ROOT/idle"
-VIRTUAL_CLOCK=1 run_succeed restore 'claude:fable:high' --wait-secs "$IDLE_WAIT"
-rm -f "$TMP_ROOT/idle"
-assert_eq "$RC|generation=$(orec generation) pane=$(orec pane) account=$(orec account) line=$(recorded_line)" \
-  "1|generation=5 pane=%900 account=/seed/.claude line=$SEED_LINE" \
-  "an abandoned succession puts the caller's whole record back, its own line included"
-
-# A signal that lands while the session record's writer runs is taken only
-# once the writer returns, and the writer may have committed: the abandon then
-# has to put the caller's record back although ol_record_write never returned.
-# A workflow-state stand-in commits the successor's record, TERMs the script
-# and exits 0, once; every other call is the real writer's. The private launch
-# wrapper records its PID before exec, so the signal targets the launcher and
-# never the command-substitution child collecting the atomic writer's reply.
-# record_commit_run SCRIPTS_DIR — the run over that tree; sets OUT and RC.
-record_commit_run() { # SCRIPTS_DIR
-  rm -f -- "$1/workflow-state" "$1/oversee-succeed" "$1/oversee-succeed.real" "$TMP_ROOT/record-commit.fired" "$TMP_ROOT/record-commit.target"
-  cp -- "$SRC_DIR/oversee-succeed" "$1/oversee-succeed.real"
-  cat > "$1/oversee-succeed" <<STUB
-#!/usr/bin/env bash
-printf '%s\n' "\$\$" > "$TMP_ROOT/record-commit.target"
-exec "$1/oversee-succeed.real" "\$@"
-STUB
-  chmod +x "$1/oversee-succeed"
-  cat > "$1/workflow-state" <<STUB
-#!/usr/bin/env bash
-if [[ "\${BASH_SOURCE[0]}" != "\$0" ]]; then source "$SRC_DIR/workflow-state"; return \$?; fi
-"$SRC_DIR/workflow-state" "\$@" || exit
-if [[ "\$1 \$2 \$4 \$5 \$6" == "update-report oversee --arg operation current" && ! -e "$TMP_ROOT/record-commit.fired" ]]; then
-  : > "$TMP_ROOT/record-commit.fired"
-  target="\$(cat "$TMP_ROOT/record-commit.target")" || exit 1
-  kill -TERM "\$target"
-fi
-STUB
-  chmod +x "$1/workflow-state"
-  seed_overseer
-  new_caller "$MARK"
-  touch "$TMP_ROOT/idle"
-  SUCCEED_BIN="$1/oversee-succeed" run_succeed recordcommit 'claude:fable:high' --wait-secs 30
-  rm -f "$TMP_ROOT/idle"
-}
-seed_overseer
-SEED_RECORD="$(jq -cS .overseer "$FLEET_STATE")"
-RECCOMMIT="$(mutant_scripts record-commit)" || exit 1
-record_commit_run "$RECCOMMIT"
-assert_eq "$RC|$(keyed interrupted "$OUT" | sed -n 1p | sed 's/window=@[0-9]*/window=@N/')|$(caller_open)|$(overseers)|$(jq -cS .overseer "$FLEET_STATE")" \
-  "1|oversee-succeed: interrupted window=@N signal=TERM|yes|0|$SEED_RECORD" \
-  "a signal while the record's writer commits: refused, successor closed, the caller's record back"
-# Without signal deferral, abandonment runs before the atomic write's reply
-# establishes ownership, so it cannot restore the predecessor's record.
-RECCTL="$(mutant_scripts record-commit-ctl lib/overseer-launch.sh)" || exit 1
-mutate_file "$RECCTL/lib/overseer-launch.sh" "  trap 'signal=TERM' TERM" '  : # leave the caller TERM handler active'
-record_commit_run "$RECCTL"
-assert_eq "$RC|$(caller_open)|$(overseers)|generation=$(orec generation)" \
-  "1|yes|0|generation=6" \
-  "control: immediate interruption loses the atomic write ownership needed for restore"
-new_caller "$UNDER_MARK"
-run_succeed under 'claude:fable:high'
-assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)|$(recorded claude)" \
-  "0|oversee-succeed: context-below-mark tokens=100000 window=1000000 mark=50 headroom=80|0|none" \
-  "1M window under the context mark: context-below-mark, nothing launched"
-
+# Shared native readiness and failure on either side of retirement are covered
+# by jarvis/tests/succession_test.py using the public Start/succeed boundary.
 
 # A window under 1M is judged at the same share as any other, and a reading
 # whose window its adapter could not name is unmeasured rather than guessed at.
@@ -3498,7 +3272,7 @@ if [ -f "$TMP_ROOT/selects-late" ]; then
   # The real sleep, here and in the gate: a virtual-clock run hands the pane its
   # PATH, whose stub sleep finds no real one in the pane's environment and
   # fails at once, ending the process that carries the handed-over account.
-  exec "$BIN/processes/claude" 100000
+  exec "$BIN/processes/claude" "\$@"
 fi
 if [ -f "$TMP_ROOT/selects-nothing" ]; then
   unset CLAUDE_CONFIG_DIR
@@ -3512,7 +3286,7 @@ fi
 if [ -f "$TMP_ROOT/dialog" ]; then cat "$TMP_ROOT/dialog"
 elif [ -f "$TMP_ROOT/idle" ]; then :
 else echo 'esc to interrupt'; fi
-exec "$BIN/processes/claude" 100000
+exec "$BIN/processes/claude" "\$@"
 STUB
 chmod +x "$BIN/4claude"
 
@@ -3663,122 +3437,6 @@ rm -f -- "${TMP_ROOT:?}/selects-nothing"
 assert_eq "$RC|$(keyed successor-lane-unobserved "$OUT" | sed -n 1p)|$(caller_open)|$(overseers)" \
   "0|oversee-succeed: successor-lane-unobserved reason=$UNOBSERVED_REASON|no|1" \
   "a successor whose account could not be observed: named on stderr, launch stands"
-
-# --wait-secs is ONE deadline over the account read and the running-turn wait,
-# which the help tells a caller to size its shell timeout by. The clock around
-# the call, not the reported figure: that is exactly what the budgeting under
-# test decides, so asserting it would assert the defect as readily as the fix.
-# An unobservable launch that never works spends the read's whole cap and then
-# the rest of the budget, which is the longest this path can take. Where no
-# per-process environment is readable the read answers at once instead and the
-# seconds go to the wait; the ceiling is what this row pins either way, which
-# is what a caller sizes its timeout by.
-#
-# The run waits on the virtual clock, so the figure is how far that clock moved
-# across the whole call: every wait the script made, and none of the work it
-# did besides waiting, which costs whole seconds more on the macOS runner than
-# on Linux. The ceiling is the promise ol_budget_bound's floor states,
-# --wait-secs plus at most one settle; two deadlines push past it by the read's
-# half of the budget. BOUND_CLOCK is the second the clock's real-epoch seed can
-# sit past the reading taken before the call.
-BOUND_WAIT=16
-BOUND_CLOCK=1
-BOUND_CEILING=$(( BOUND_WAIT + LANE_SETTLE_MIN_SECS + BOUND_CLOCK ))
-new_caller "$MARK"
-touch "$TMP_ROOT/selects-nothing" "$TMP_ROOT/idle"
-bound_real="$(date +%s)"
-VIRTUAL_CLOCK=1 succeed_shim bound 'claude:fable:high' --wait-secs "$BOUND_WAIT"
-bound_elapsed=$(( $(cat "$STUB_CLOCK") - bound_real ))
-bound_real=$(( $(date +%s) - bound_real ))
-assert_eq "$RC|$(in_range within "$bound_elapsed" '' "$BOUND_CEILING")" \
-  "1|within" "a run that never works returns inside one --wait-secs bound, not the sum of two"
-assert_eq "$(( bound_elapsed >= BOUND_WAIT )) $(( bound_real < BOUND_WAIT ))" "1 1" \
-  "control: the whole --wait-secs bound is spent on the virtual clock in less than that in wall time"
-# The inverse: the same run with the clock waived spends its bound in real
-# seconds, the wall time the row above holds the virtual run under. The run
-# ends on its own deadline, never on a signal: a ceiling's TERM lands wherever
-# the host's pace has the script by then, and a run that TERM does not end
-# holds the suite with no bound of its own.
-touch "$TMP_ROOT/selects-nothing" "$TMP_ROOT/idle"
-new_caller "$MARK"
-bound_real="$(date +%s)"
-succeed_shim boundwaived 'claude:fable:high' --wait-secs "$BOUND_WAIT"
-bound_real=$(( $(date +%s) - bound_real ))
-assert_eq "$RC|$(( bound_real >= BOUND_WAIT ))" "1|1" \
-  "control: with the clock waived the run spends its whole --wait-secs bound in wall time"
-
-rm -f -- "${TMP_ROOT:?}/selects-nothing" "${TMP_ROOT:?}/idle"
-
-# A handover whose running turn lands with the budget already spent. At
-# --wait-secs 1 the early read's floored share is the whole of it, so the
-# running-turn wait starts with nothing left and the deciding read has only
-# ol_budget_bound's floor to look in. It still looks, because the caller's
-# window closes on that read and a read that could not look is not an answer to
-# close a window on.
-#
-# The virtual clock makes the early read's settle spend the whole budget, and
-# a tmux shim places both reads by event. It holds the early read until the
-# wrapper has published that it stands on the picked account, and the
-# running-turn wait's single probe, a capture of the successor's pane,
-# releases the handover and returns once the exec has landed and the pane
-# shows the running turn. So the early read sees the picked account and the
-# deciding read the other, on any runner's pace.
-#
-# lastsecond_run ROW [SUCCEED_BIN] — that run, the shim on PATH for it alone.
-lastsecond_run() {
-  new_caller "$MARK"
-  printf '%s\n' "$H/.claude" > "$TMP_ROOT/selects-late"
-  : > "$TMP_ROOT/late-gate"
-  cat > "$BIN/tmux" <<SHIM
-#!/bin/sh
-# Every wait stops at 200 looks, which fails the row. The caller's own pane
-# passes straight through.
-gate="\$(cat "$TMP_ROOT/late-gate" 2>/dev/null)"
-n=0
-case " \$* " in
-  *" $CALLER_PANE "*) ;;
-  *" display-message "*" #{pane_pid} "*)
-    # An account read's first call: held until the wrapper has published its
-    # pid and pane, so the early read finds it standing on the picked account.
-    until [ -n "\$gate" ]; do
-      n=\$((n + 1)); [ "\$n" -lt 200 ] || break
-      sleep 0.05
-      gate="\$(cat "$TMP_ROOT/late-gate" 2>/dev/null)"
-    done ;;
-  *" capture-pane "*" \${gate#* } "*)
-    if [ -n "\$gate" ] && [ ! -f "$TMP_ROOT/late-release" ]; then
-      : > "$TMP_ROOT/late-release"
-      until [ "\$(cat "/proc/\${gate%% *}/comm" 2>/dev/null)" = claude ] &&
-        "$REAL_TMUX" "\$@" | grep -q 'esc to interrupt'; do
-        n=\$((n + 1)); [ "\$n" -lt 200 ] || break
-        sleep 0.05
-      done
-    fi ;;
-esac
-exec "$REAL_TMUX" "\$@"
-SHIM
-  chmod +x "$BIN/tmux"
-  VIRTUAL_CLOCK=1 SUCCEED_BIN="${2:-$SUCCEED}" succeed_shim "$1" 'claude:fable:high' --wait-secs 1
-  printf '%s\n' "$OUT" > "$TMP_ROOT/lastsecond.out"
-  [[ ! -f "$TMP_ROOT/work/tmp/oversee-watch.err" ]] || cat "$TMP_ROOT/work/tmp/oversee-watch.err" >> "$TMP_ROOT/lastsecond.out"
-  rm -f -- "${BIN:?}/tmux" "${TMP_ROOT:?}/selects-late" "${TMP_ROOT:?}/late-gate" "${TMP_ROOT:?}/late-release"
-}
-if observed_row "a deciding read with the budget already spent still looks, and catches the handover"; then
-  lastsecond_run lastsecond
-  assert_eq "$RC|$(keyed successor-wrong-lane "$OUT" | sed -n 1p)|$(caller_open)|$(overseers)" \
-    "1|oversee-succeed: successor-wrong-lane picked=$H/.4claude observed=$H/.claude|yes|0" \
-    "a deciding read with the budget already spent still looks, and catches the handover" "$TMP_ROOT/lastsecond.out"
-  # The control: the deciding read handed the raw budget instead of its floor
-  # cannot look, so the row above reaches that read with the budget spent.
-  NOFLOOR="$(mutant_scripts nofloor lib/overseer-launch.sh)" || exit 1
-  mutate_file "$NOFLOOR/lib/overseer-launch.sh" \
-    '"$form" "$(ol_budget_bound)" final' \
-    '"$form" "$(ol_budget_raw)" final'
-  lastsecond_run nofloor "$NOFLOOR/oversee-succeed"
-  assert_eq "$RC|$(keyed successor-lane-unobserved "$OUT" | sed -n 1p)" \
-    "0|oversee-succeed: successor-lane-unobserved reason=no-settle-budget" \
-    "control: a deciding read handed the raw budget cannot look, and the handover stands" "$TMP_ROOT/lastsecond.out"
-fi
 
 echo "=== an overseer whose ACCOUNT is spent, which reaches none of the marks either ==="
 # A walled overseer is not dead: its harness is still its pane's foreground
