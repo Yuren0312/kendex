@@ -3581,40 +3581,83 @@ for identity_case in home session missing; do
     "control: dropping the $identity_case rule fails the unchanged-mail assertion"
 done
 
-# Launch and registration write a new pane before its first native hook.
-# Drive that writer, then call from the previous pane before the successor binds.
+transition_world() { # NAME [HOOK]
+  named_session "$1" "${2:-$HOOK}"
+  real_tmux=$(command -v tmux)
+  transition_dir=$(mktemp -d "$TMP_ROOT/transition.XXXXXX")
+  transition_socket="$transition_dir/tmux"
+  unset TMUX TMUX_PANE
+  OVERSEER_PANE=$("$real_tmux" -S "$transition_socket" new-session -d -P -F '#{pane_id}' -s transition -c "$LANE" 'exec sleep 100000')
+  trap '"$real_tmux" -S "$transition_socket" kill-server 2>/dev/null || :' EXIT
+  read -r OVERSEER_SERVER OVERSEER_SERVER_START < <("$real_tmux" -S "$transition_socket" display-message -p -t "$OVERSEER_PANE" '#{pid} #{start_time}')
+  record_overseer "$OVERSEER_PANE" "$OVERSEER_SERVER"
+  (cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" update oversee \
+    --arg socket "$transition_socket" '.overseer.server_socket = $socket' >/dev/null)
+  # shellcheck disable=SC2207
+  SESSION_ENV=($(overseer_env))
+}
+
+transition_register() { # PANE [NATIVE_SESSION] [public]
+  (cd "$LANE" && "$BASH" -euo pipefail -c '
+    unset ORCH_STATE_DIR
+    SCRIPT_DIR=$1 DEP_ERR=$2 TMUX=$3 TMUX_PANE=$4
+    export TMUX TMUX_PANE
+    . "$SCRIPT_DIR/lib/lane-context.sh"
+    . "$SCRIPT_DIR/lib/overseer-launch.sh"
+    identity=$(jq -nc --arg home "$5" --arg cwd "$PWD" \
+      "{harness:\"claude\",home:\$home,account:\$home,cwd:\$cwd}")
+    if [ -n "$6" ]; then
+      rows=$(session_rows_overseer_file "$PWD" "$7" "$4")
+      mkdir -p "${rows%/*}"
+      source=startup
+      [ "$8" != public ] || source=resume
+      jq -nc --arg home "$5" --arg cwd "$PWD" --arg session "$6" --arg source "$source" \
+        "{at:now,event:\"SessionStart\",harness:\"claude\",account:\$home,cwd:\$cwd,session_id:\$session,source:\$source}" > "$rows"
+    fi
+    if [ "$8" = public ]; then
+      export CLAUDE_CONFIG_DIR=$5
+      exec "$SCRIPT_DIR/oversee" register --account "$5"
+    fi
+    OL_PRIOR=$("$SCRIPT_DIR/workflow-state" get oversee .overseer)
+    window=$(tmux display-message -p -t "$4" "#{window_id}")
+    ol_record_write tmux "$4" "$window" "$7" "$identity"
+    printf "%s %s\n" "$OL_REGISTRATION" "$OL_RECORD_STATE"
+    ' _ "$REPO_ROOT/skills/orch/scripts" "$TMP_ROOT/transition.err" "$transition_socket,0,0" \
+      "$1" "$OVERSEER_HOME_DIR" "${2:-}" "$OVERSEER_SERVER" "${3:-}")
+}
+
+# Pending registration publishes no controller identity. An old pane cannot
+# consume mail or overwrite context before the successor supplies native Start.
 successor_transition() { # NAME CALLER ARM [HOOK]
-  named_session "$1" "${4:-$HOOK}"
+  local result_path="$TMP_ROOT/$1.transition-result" child_pass child_fail
+  (
+  PASS=0 FAIL=0
+  local before state_before judged_before state_path transition_dir transition_socket real_tmux next_pane
+  local OVERSEER_PANE OVERSEER_SERVER OVERSEER_SERVER_START
+  local -a SESSION_ENV
+  transition_world "$1" "${4:-$HOOK}"
   overseer_transcript
   mkdir -p "$LANE/tmp/lane-mail/overseer"
   write_transcript "$TRANSCRIPT" 100000
-  local next_pane before state_before judged_before state_path
-  for next_pane in "$OVERSEER_PANE" %4; do
-    (cd "$LANE" && "$BASH" -euo pipefail -c '
-      unset ORCH_STATE_DIR
-      TMUX=fake TMUX_PANE=$3 TMUX_SERVER_ID=$5 TMUX_SERVER_START=$6
-      PATH="$7:$PATH"
-      export TMUX TMUX_PANE TMUX_SERVER_ID TMUX_SERVER_START PATH
-      SCRIPT_DIR=$1 DEP_ERR=$2
-      . "$SCRIPT_DIR/lib/lane-context.sh"
-      . "$SCRIPT_DIR/lib/overseer-launch.sh"
-      identity=$(jq -nc --arg home "$4" --arg cwd "$PWD" \
-        "{harness:\"claude\",home:\$home,cwd:\$cwd}")
-      OL_PRIOR=$("$SCRIPT_DIR/workflow-state" get oversee .overseer)
-      ol_record_write tmux "$3" @7 "$5" "$identity"
-      ' _ "$REPO_ROOT/skills/orch/scripts" "$TMP_ROOT/transition.err" "$next_pane" "$OVERSEER_HOME_DIR" "$OVERSEER_SERVER" "$OVERSEER_SERVER_START" "$TMUX_BIN")
-    if [ "$next_pane" = "$OVERSEER_PANE" ]; then
-      CALL_ENV=("${SESSION_ENV[@]}")
-      ARM_ARGS=(deliver)
-      run_payload "$(jq -nc --arg p "$TRANSCRIPT" '{session_id:"s1",transcript_path:$p,tool_name:"Bash",tool_input:{command:"git status"}}')"
-      ARM_ARGS=()
-      CALL_ENV=()
-      assert_eq "$(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" get oversee '.overseer.session_id')|$(jq -r '[.session_id,.tokens]|@csv' "$LANE/tmp/lane-mail/overseer/context.json")" \
-        's1|"s1",100000' 'the recorded pane binds first and writes its native reading'
-    fi
-  done
-  assert_eq "$(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" get oversee '[.overseer.generation,.overseer.pane,.overseer.session_id]|@csv')" \
-    '2,"%4",' 'the real successor writer advances the generation and clears the native binding'
+  assert_eq "$(transition_register "$OVERSEER_PANE" s1)" 'complete running' \
+    'native Start permits predecessor registration'
+  CALL_ENV=("${SESSION_ENV[@]}")
+  ARM_ARGS=(deliver)
+  run_payload "$(jq -nc --arg p "$TRANSCRIPT" '{session_id:"s1",transcript_path:$p,tool_name:"Bash",tool_input:{command:"git status"}}')"
+  ARM_ARGS=()
+  CALL_ENV=()
+  assert_eq "$(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" get oversee '.overseer.session_id')|$(jq -r '[.session_id,.tokens]|@csv' "$LANE/tmp/lane-mail/overseer/context.json")" \
+    's1|"s1",100000' 'the recorded pane binds first and writes its native reading'
+  next_pane=$("$real_tmux" -S "$transition_socket" new-window -d -P -F '#{pane_id}' -t transition -c "$LANE" 'exec sleep 100000')
+  "$real_tmux" -S "$transition_socket" kill-window -t "$OVERSEER_PANE"
+  # shellcheck source=../../skills/orch/tests/lib/overseer-checkout.sh
+  . "$REPO_ROOT/skills/orch/tests/lib/overseer-checkout.sh"
+  state_path=$(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" path oversee)
+  controller_fixture_await_ended "$REPO_ROOT/skills/orch/scripts" "$state_path"
+  assert_eq "$(transition_register "$next_pane")" 'pending blocked' \
+    'a successor without native Start stays pending'
+  assert_eq "$(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" get oversee '[.overseer.lifecycle.generation,.overseer.pane,.overseer.session_id]|@csv')" \
+    '2,,' 'pending registration advances the generation without publishing successor authority'
   printf '%s\n' 's1 previous-gap' > "$LANE/tmp/lane-mail/overseer/context-told"
   peer_send 'Successor transition only.'
   state_stub delegate
@@ -3628,8 +3671,9 @@ successor_transition() { # NAME CALLER ARM [HOOK]
   ARM_ARGS=()
   CALL_ENV=()
   TRANSITION_RESULT="RC=$RC stdout=$(cat "$TMP_ROOT/stdout") stderr=$(first_line) unchanged=$([ "$before" = "$(overseer_snapshot)" ] && echo yes || echo no) state=$([ "$state_before" = "$(cksum < "$state_path")" ] && echo same || echo changed) writes=$(grep -cE '^(update|set|init)$' "$STATE_LOG" || :) judged=$(( $(judge_calls) - judged_before )) unread=$(overseer_unread 'Successor transition only.')"
-  # The new pane can bind through the unchanged healer and deliver once.
-  CALL_ENV=("${SESSION_ENV[@]}" 'TMUX_PANE=%4')
+  assert_eq "$(transition_register "$next_pane" successor)" 'complete running' \
+    'successor native Start completes registration'
+  CALL_ENV=("${SESSION_ENV[@]}" "TMUX_PANE=$next_pane")
   ARM_ARGS=(deliver)
   run_payload '{"session_id":"successor","tool_name":"Bash","tool_input":{"command":"git status"}}'
   assert_eq "$(context_line)|$(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" get oversee .overseer.session_id)|$(overseer_unread 'Successor transition only.')" \
@@ -3638,6 +3682,12 @@ successor_transition() { # NAME CALLER ARM [HOOK]
   assert_eq "$(context_line)" - 'the successor receives the note only once'
   ARM_ARGS=()
   CALL_ENV=()
+  printf '%s\n' "$TRANSITION_RESULT" > "$result_path"
+  printf '%s %s\n' "$PASS" "$FAIL" > "$result_path.counts"
+  )
+  TRANSITION_RESULT=$(cat -- "$result_path")
+  read -r child_pass child_fail < "$result_path.counts"
+  PASS=$((PASS + child_pass)) FAIL=$((FAIL + child_fail))
 }
 wake_mutant native-transition-control '      [ -n "$RECORDED_SESSION" ] || return 1' '      :'
 TRANSITION_CONTROL=$MUTANT_PATH
@@ -3706,8 +3756,11 @@ assert_eq "RC=$RC stdout=$(cat "$TMP_ROOT/stdout") unchanged=$([ "$pi_before" = 
   "RC=0 stdout= unchanged=yes first=lane-mail-check: session-unbound=pi-child harness=pi home=$OVERSEER_HOME_DIR remedy=oversee register" \
   'a Pi child with an unmeasured home and another native id changes no overseer mail or context'
 
-named_session native_bound
-bind_overseer claude "$OVERSEER_HOME_DIR" ""
+(
+PASS=0 FAIL=0
+transition_world native_bound
+assert_eq "$(transition_register "$OVERSEER_PANE" s1)" 'complete running' \
+  'native Start registers the session before native resume'
 mkdir -p "$LANE/tmp/lane-mail/overseer"
 overseer_transcript
 write_transcript "$TRANSCRIPT" 100000
@@ -3717,18 +3770,16 @@ run_payload "$(jq -nc --arg p "$TRANSCRIPT" '{session_id:"s1",transcript_path:$p
 ARM_ARGS=()
 CALL_ENV=()
 assert_eq "$(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" get oversee '.overseer.session_id')|$(jq -r '[.session_id,.tokens]|@csv' "$LANE/tmp/lane-mail/overseer/context.json")" \
-  's1|"s1",100000' 'the native session heals its binding and records its own reading'
+  's1|"s1",100000' 'the registered native session records its own reading'
 
-# Register is the existing recovery route for a native resume with another id.
+# Register takes the native resume identity before authorizing resumed mail.
 CALL_ENV=("${SESSION_ENV[@]}")
-ARM_ARGS=(start)
-run_payload '{"session_id":"resumed","source":"resume"}'
-ARM_ARGS=()
-(cd "$LANE" && env -u ORCH_STATE_DIR -u CODEX_HOME -u COPILOT_HOME \
-  "${SESSION_ENV[@]}" "HOME=$OFFLINE_HOME" "LANES_HOME=$OFFLINE_HOME" \
-  "$REPO_ROOT/skills/orch/scripts/oversee" register > "$TMP_ROOT/register.out" 2> "$TMP_ROOT/register.err")
-assert_eq "$(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" get oversee '.overseer.session_id // "none"')" none \
-  'register clears the binding from the previous native session'
+transition_register "$OVERSEER_PANE" resumed public > "$TMP_ROOT/register.out" 2> "$TMP_ROOT/register.err" || {
+  cat -- "$TMP_ROOT/register.err" >&2
+  exit 1
+}
+assert_eq "$(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" get oversee '.overseer.session_id // "none"')" resumed \
+  'register replaces the previous binding with the native resume identity'
 peer_send 'After native resume.'
 ARM_ARGS=(deliver)
 run_payload '{"session_id":"resumed","tool_name":"Bash","tool_input":{"command":"git status"}}'
@@ -3738,6 +3789,10 @@ run_payload '{"session_id":"resumed","tool_name":"Bash","tool_input":{"command":
 assert_eq "$(context_line)" - 'the rebound native session receives its mail once'
 ARM_ARGS=()
 CALL_ENV=()
+printf '%s %s\n' "$PASS" "$FAIL" > "$TMP_ROOT/native-resume.counts"
+)
+read -r transition_pass transition_fail < "$TMP_ROOT/native-resume.counts"
+PASS=$((PASS + transition_pass)) FAIL=$((FAIL + transition_fail))
 
 named_session peer_named
 peer_send 'Your pin bump broke our build.'
