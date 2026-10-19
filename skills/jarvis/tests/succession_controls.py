@@ -59,6 +59,12 @@ def main():
                      'if not shutil.which(choice["harness"]):',
                      'if False and not shutil.which(choice["harness"]):', "test_account_succession")]
         controls.extend([
+            ("selected registration record", "orch/scripts/lib/overseer-launch.sh",
+             'ORCH_STATE_DIR="${path%/*}" "$SCRIPT_DIR/controller-session" register --home "${PROJECT_ROOT:-$PWD}"',
+             '"$SCRIPT_DIR/controller-session" register --home "${cwd:-$PWD}"', "test_registration_selected_record"),
+            ("session-relative handoff", "orch/scripts/lib/controller-session.py",
+             '                    path = Path(identity.get("cwd") or self.home) / path',
+             '                    path = Path(self.home) / path', "test_shared_orch_launch_and_recovery"),
             ("sole controller", "orch/scripts/lib/controller-session.py", '        state["overseer"] = owner',
              '        owner = {"lifecycle": record}\n        state["overseer"] = owner', "test_shared_controller_mail"),
             ("retirement before native work", "orch/scripts/lib/controller-session.py", '                    self.end_owned(record.get("predecessor"), window=True)',
@@ -68,7 +74,7 @@ def main():
             ("legacy worker retirement", "orch/scripts/lib/controller-session.py", '            if legacy.get("worker") and self.worker_live(legacy):',
              '            if False and legacy.get("worker") and self.worker_live(legacy):', "test_legacy_controller_refuses_replacement"),
         ])
-        cases = ("test_shared_first_launch", "test_shared_registration", "test_shared_orch_launch_and_recovery",
+        cases = ("test_shared_first_launch", "test_shared_registration", "test_registration_selected_record", "test_shared_orch_launch_and_recovery",
                  "test_shared_recovery_harnesses", "test_shared_controller_mail", "test_orch_retirement_order",
                  "test_legacy_controller_refuses_replacement", "test_watch_publication_keeps_controller")
         if not set(args.main_case) <= set(cases):
@@ -82,8 +88,20 @@ def main():
                                      "--failfast", "SuccessionContract." + case], env=env, capture_output=True, text=True, timeout=180)
             assert result.returncode != 0, name + " passed its planted defect"
             assert "FAILED (failures=" in result.stderr, result.stdout + result.stderr
-            if name.startswith("main=") and case == "test_shared_recovery_harnesses":
-                assert "shared-controller-record" in result.stderr, result.stdout + result.stderr
+            if name == "selected registration record":
+                assert "registration-selected-record" in result.stderr, result.stdout + result.stderr
+            if name == "session-relative handoff":
+                assert "session-handoff" in result.stderr, result.stdout + result.stderr
+            if name.startswith("main="):
+                expected = {"test_shared_first_launch": "shared-controller-record",
+                            "test_shared_registration": "registration-native-pending",
+                            "test_registration_selected_record": "shared-controller-record",
+                            "test_shared_orch_launch_and_recovery": "shared-controller-record",
+                            "test_shared_recovery_harnesses": "shared-controller-record",
+                            "test_shared_controller_mail": "shared-controller-record",
+                            "test_watch_publication_keeps_controller": "watch-controller-native"}
+                if case in expected:
+                    assert expected[case] in result.stderr, result.stdout + result.stderr
             completed += 1
             print("control: rejected=" + name + " case=" + case, flush=True)
 

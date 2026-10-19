@@ -117,6 +117,8 @@
 #            values. Another pane inherits none of them. The generation is one past the record's,
 #            or the record's own where it already names this pane, so
 #            registering twice launches nothing and counts nothing twice.
+#            During native confirmation, `registration-pending` acknowledges
+#            the session without publishing it as the active controller.
 #            A server start that cannot be read refuses `record-unwritten`
 #            and writes nothing.
 #            Prints `registered` naming the session and generation, with
@@ -242,6 +244,7 @@ message() { # KEY FIELD=VALUE...
     session-id-unrecorded) text='The fleet state at the path field records no native session id for its overseer, so there is no session to resume. Nothing was opened. Launch a fresh overseer through oversee launch.' ;;
     resume-unsupported) text='The recorded harness has no resume form by session id in the overseer launch builder. Nothing was opened. Launch a fresh overseer through oversee launch.' ;;
     resumed) text='The recorded overseer session runs again in a new pane, and the record names that pane.' ;;
+    registration-pending) text='Native confirmation is still in progress. The session is acknowledged; controller publication waits for its Start receipt.' ;;
     identity-fallback) text='No SessionStart row of this session stands, so its harness, account and directory are read off its pane and environment, the named fallback. No model or effort is read; a record proven to name this same pane keeps fields the fallback cannot read.' ;;
     context-reader=missing) text='The Copilot context reader could not be configured. The running session is registered, but its context mark has no new reader. Repair the named home and register again.' ;;
     context-reader=next-start) text='The configured Copilot reader loads at the next session start. This running session does not load a newly installed extension.' ;;
@@ -415,6 +418,10 @@ register() {
   ol_identity "$harness" "$ACCOUNT" "$home" "$model" "" "$cwd" || die record-unwritten field=overseer step=identity
   ol_record_write tmux "$TMUX_PANE" "$window" "$server" "$OL_IDENTITY" "" \
     || die record-unwritten field=overseer
+  if [[ "$OL_RECORD_STATE" != running ]]; then
+    message registration-pending "session=$TMUX_PANE" "state=$OL_RECORD_STATE"
+    return 0
+  fi
   # The writer retains unknown fields only for this same session. Check that
   # resulting identity, not the fallback's empty fields.
   record="$(ol_record_get)" || die state-unreadable field=overseer

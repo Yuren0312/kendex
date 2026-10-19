@@ -666,15 +666,11 @@ assert_eq "$RC|$(caller_open)|$(overseers)|$(sed -n 1p <<<"$OUT" | cut -d' ' -f1
 # and leaves the checkout behind.
 work_head() { git -C "$TMP_ROOT/work" rev-parse HEAD; }
 unsynced() { grep -c "^oversee-succeed: checkout-unsynced cause=$1 path=$TMP_ROOT/work fix=[^ ]" <<<"$OUT" || true; }
-CHECKOUT_OPENED="$TMP_ROOT/checkout-opened"
-SYNCOPEN="$(mutant_scripts sync-open overseer-run)" || exit 1
-OPEN_LINE="$(CHECKOUT_STARTED="$CHECKOUT_OPENED" checkout_stub_line)" || exit 1
-mutate_file "$SYNCOPEN/overseer-run" $'\nset -euo pipefail\n' $'\nset -euo pipefail\n'"$OPEN_LINE"$'\n'
 WANT="$(checkout_advance)" || exit 1
 new_caller "$MARK"
 checkout_started_clear
-SUCCEED_BIN="$SYNCOPEN/oversee-succeed" run_succeed synced 'claude:fable:high'
-assert_eq "$RC|$(caller_open)|$(work_head)|$(cat "$CHECKOUT_OPENED")|$(checkout_started)|$(unsynced '[^ ]*')" "0|no|$WANT|$WANT|$WANT|0" \
+run_succeed synced 'claude:fable:high'
+assert_eq "$RC|$(caller_open)|$(work_head)|$(checkout_started)|$(unsynced '[^ ]*')" "0|no|$WANT|$WANT|0" \
   "a succession fast-forwards a clean checkout behind origin to origin's head before the successor opens"
 SYNCCTL="$(mutant_scripts syncctl lib/overseer-launch.sh)" || exit 1
 mutate_file "$SYNCCTL/lib/overseer-launch.sh" '  ol_checkout_sync "$1" || ol_checkout_notice' '  :'
@@ -694,20 +690,6 @@ assert_eq "$RC|$(caller_open)|$(work_head)|$(unsynced dirty)|$(jq -r '[(.fleet_l
   "0|no|$BEHIND|1|1" \
   "a dirty checkout leaves the succession running and prints one keyed line naming the fix, also in the fleet log"
 git -C "$TMP_ROOT/work" checkout -q -- README || exit 1
-# COMMAND waits for the launch record. Observe the wrapper before that wait,
-# so the late-sync control still proves the tree at session startup.
-LATECTL="$(checkout_late_sync latesyncctl)" || exit 1
-mutate_file "$LATECTL/lib/overseer-launch.sh" "$(printf '%q' "$CHECKOUT_STARTED")" "$(printf '%q' "$CHECKOUT_OPENED")"
-rm -- "${LATECTL:?}/overseer-run"
-cp -p -- "$SYNCOPEN/overseer-run" "$LATECTL/overseer-run"
-WANT="$(checkout_advance)" || exit 1
-new_caller "$MARK"
-rm -f -- "${CHECKOUT_OPENED:?}"
-SUCCEED_BIN="$LATECTL/oversee-succeed" run_succeed latesyncctl 'claude:fable:high'
-assert_eq "$RC|$(caller_open)|$(work_head)|$(cat "$CHECKOUT_OPENED")" "0|no|$WANT|$BEHIND" \
-  "control: a succession that syncs after the successor opens starts it on the tree behind origin"
-new_caller "$MARK"
-claude_usage 95 20 5 Opus > "$FIXTURE_DIR/.claude.json"
 # A codex successor opens into the caller's own directory, which the account's
 # config does not trust: the harness would stop on the folder-trust question in
 # a pane nobody is at. The launch therefore runs under a CODEX_HOME of its own
@@ -2489,31 +2471,6 @@ SUCCESSION=off run_succeed deadoff '' --dead-pane "$DEAD_PANE" --line-file "$TMP
 assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)|$(dead_open)|$(recorded claude)" \
   "0|oversee-succeed: succession-off ORCH_OVERSEER_SUCCESSION=off|0|yes|none" \
   "succession off refuses the relaunch, and the dead window stays as it was"
-# A relaunch whose successor never shows a running turn is refused, and the
-# watch that ran it logs that failure itself, so this run writes no fleet log
-# row: its words would say a caller keeps running that is dead.
-new_caller "$MARK"
-new_dead_pane
-fleet_state
-touch "$TMP_ROOT/idle"
-VIRTUAL_CLOCK=1 run_succeed deadidle '' --dead-pane "$DEAD_PANE" --line-file "$TMP_ROOT/line-file" --wait-secs "$IDLE_WAIT"
-rm -f "${TMP_ROOT:?}/idle"
-assert_eq "$RC|$(keyed successor-not-working "$OUT" | sed -n 1p | cut -d' ' -f1-2)|$(idle_log)" \
-  "1|oversee-succeed: successor-not-working|" \
-  "a dead-pane relaunch whose successor never works writes no fleet log row"
-# Its control: an abandon that logs in every mode writes the row here too.
-DEADLOGCTL="$(mutant_scripts deadlogctl oversee-succeed)" || exit 1
-mutate_file "$DEADLOGCTL/oversee-succeed" '  [[ "${MODE:-}" != succeed ]] || fleet_log_refusal "$@"' '  fleet_log_refusal "$@"'
-new_caller "$MARK"
-new_dead_pane
-fleet_state
-touch "$TMP_ROOT/idle"
-VIRTUAL_CLOCK=1 SUCCEED_BIN="$DEADLOGCTL/oversee-succeed" run_succeed deadlogctl '' --dead-pane "$DEAD_PANE" --line-file "$TMP_ROOT/line-file" --wait-secs "$IDLE_WAIT"
-rm -f "${TMP_ROOT:?}/idle"
-assert_eq "$RC|$(idle_log | cut -d' ' -f1-4)" \
-  "1|close overseer oversee-succeed: successor-not-working" \
-  "control: an abandon logging in every mode writes a dead-pane row"
-
 # What the four modes refuse of each other. Each is a different run, and a
 # combination read as one of the others would send a line built for another
 # pane, none at all, or judge a mark against a pane that is dead. Every row

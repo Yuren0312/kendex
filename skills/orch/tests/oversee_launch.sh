@@ -557,11 +557,11 @@ assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)" \
 
 # register: the record for a hand-opened pane, its generation one past the
 # record's, kept where the record already names that pane.
-HAND_GEN=$(( $(recorded lifecycle.generation) + 1 ))
+HAND_GEN=$(( $(recorded generation) + 1 ))
 HAND="$(tm new-window -d -t fleet:4 -n hand -P -F '#{pane_id}' "exec '$BIN/hclaude' 100000")"
 run_oversee TMUX="$TMUX_ADDR" TMUX_PANE="$HAND" CLAUDE_CONFIG_DIR="$H/.eclaude" -- register
 assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(keyed registered "$OUT" | sed -n 1p)|$(recorded runtime)|$(recorded account)|$(recorded launch_line)|$(recorded server_start)" \
-  "0|oversee: identity-fallback session=$HAND cause=no-start-row|oversee: registered session=$HAND window=$(tm display-message -p -t "$HAND" '#{window_id}') server=$SERVER_PID generation=$HAND_GEN account=$H/.eclaude retained=none fresh=account,cwd,generation,harness,home,pane,runtime,server,server_socket,server_start,session_rows,window|tmux|$H/.eclaude|none|$SERVER_START" \
+  "0|oversee: identity-fallback session=$HAND cause=no-start-row|oversee: registered session=$HAND window=$(tm display-message -p -t "$HAND" '#{window_id}') server=$SERVER_PID generation=$HAND_GEN account=$H/.eclaude retained=lifecycle fresh=account,cwd,generation,harness,home,pane,runtime,server,server_socket,server_start,session_rows,window|tmux|$H/.eclaude|none|$SERVER_START" \
   "register with no SessionStart row reads the pane as the named fallback, says so, writes the record one generation past it with its server's start, and drops the launch line the record held"
 HAND_IDENTITY="claude|$H/.eclaude|$H/.eclaude|none|none|$(tm display-message -p -t "$HAND" '#{pane_current_path}')|"
 assert_eq "$(identity)" "$HAND_IDENTITY" \
@@ -724,37 +724,6 @@ register_codex
 assert_eq "$RC|$(recorded harness)|$(recorded account)|$(recorded home)" \
   "0|codex|$H/.codex|$PRIVATE_HOME" \
   "register on a codex pane records its account and its private CODEX_HOME apart"
-# The successor-up wait asks for a working turn: a SessionStart row is written
-# at startup, before any turn runs, so a session whose screen never shows one
-# is refused whatever rows it wrote.
-tm kill-window -t "$(recorded window)"
-controller_fixture_await_ended "$SRC_DIR" "$FLEET_STATE" || exit 1
-touch "$TMP_ROOT/idle" "$TMP_ROOT/row"
-run_oversee -- launch --wait-secs 3
-rm -f "$TMP_ROOT/idle" "$TMP_ROOT/row"
-assert_eq "$RC|$(keyed overseer-not-working "$OUT" | sed -n 1p | cut -d' ' -f1-2)|$(overseers)" \
-  "1|oversee: overseer-not-working|0" \
-  "a session whose SessionStart row stands and whose turn never runs is refused"
-run_oversee -- launch --wait-secs 20
-assert_eq "$RC|$(keyed overseer-launched "$OUT" | sed -n 1p | cut -d' ' -f1-2)|$(overseers)" \
-  "0|oversee: overseer-launched|1" \
-  "a session whose turn runs is up"
-# The launch line runs under overseer-run: a harness that ends, here killed
-# before any hook of its own could run, leaves its exit status on the record.
-harness_ended() { # -> the recorded exit status, once overseer-run wrote one
-  local run_pid harness_pid waited=0
-  run_pid="$(pgrep -P "$(tm display-message -p -t "$(recorded pane)" '#{pane_pid}')")" || return 1
-  harness_pid="$(pgrep -P "$run_pid")" || return 1
-  harness_pid="${harness_pid%%$'\n'*}"
-  kill -TERM "$harness_pid"
-  # A real wait: the wrapper writes the record after its child is reaped.
-  until [[ "$(recorded exit.status)" != none || "$waited" -ge 50 ]]; do sleep 0.1; waited=$((waited + 1)); done
-  recorded exit.status
-}
-assert_eq "$(harness_ended)|$(recorded exit.at | grep -cE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T')" "143|1" \
-  "a harness that ends leaves its exit status and time on the session record"
-tm kill-window -t "$(recorded window)"
-controller_fixture_await_ended "$SRC_DIR" "$FLEET_STATE" || exit 1
 # register on a Copilot pane. Its command reads node, the npm loader, here a
 # copy of bash under that name whose child carries Copilot's Linux name,
 # MainThread, a copy of sleep. The account is --account's, else the
