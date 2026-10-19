@@ -421,6 +421,8 @@ class Session:
                 # Its predecessor remains the only possible controller.
                 self.end_owned(record, window=True)
                 predecessor = record.get("predecessor")
+                if not self.terminal(predecessor):
+                    self.end_task_session()
                 saved_handoff = record["transfer"]["handoff"]
             else:
                 if record["state"] != "running" or not self.terminal(record):
@@ -528,8 +530,26 @@ class Session:
                 return answer, 0
             record.update(state="off" if record["app_off"] else "stopped",
                           reason="app-off" if record["app_off"] else "stopped", detail="")
+            self.end_task_session()
             self.write(record)
             return self.answer(record), 0
+
+    def end_task_session(self):
+        # Task windows open in the controller's session, so once no controller
+        # remains they alone hold its name against the next Start. One server
+        # command ends the session only while every window in it holds a pane
+        # with a task mark, the window task-close ends: a controller window, or
+        # a foreign session of that name, keeps it. A pane split into a task
+        # window, such as a Pi pane agent's, carries no mark of its own.
+        # A session left standing refuses that Start with name-conflict, so a
+        # failure here is logged and never fails the controller's own end.
+        if not shutil.which("tmux"):
+            return
+        unmarked = "#{W:#{?#{P:#{?#{@jarvis-task},x,}},,x}}"
+        try:
+            self.tmux("if-shell", "-F", "-t", "=jarvis:", "#{==:" + unmarked + ",}", "kill-session -t =jarvis", check=False)
+        except (OSError, subprocess.TimeoutExpired) as failure:
+            self.failure_log("task-session-end-failed", failure)
 
     def end_owned(self, record, *, window=False):
         if self.terminal(record):
@@ -558,6 +578,8 @@ class Session:
             if window and record.get("process"):
                 while self.worker_live({"worker": identity}):
                     time.sleep(0.1)
+        elif not window:
+            self.end_task_session()
 
     def worker(self, verb, generation):
         self.deadline = time.monotonic() + CALL_SECONDS
@@ -732,14 +754,16 @@ class Session:
                 live = record if self.terminal(record) else predecessor if self.terminal(predecessor) else None
                 if live:
                     record = self.retain_live(record, live)
-                elif verb == "stop":
-                    record.update(state="off" if record["app_off"] else "stopped",
-                                  reason="app-off" if record["app_off"] else "stopped", detail="", terminal=None)
                 else:
-                    record.update(state=failure.state if isinstance(failure, Refusal) else "failed",
-                                  reason=failure.reason if isinstance(failure, Refusal) else "launch-failed",
-                                  detail=failure.detail if isinstance(failure, Refusal) else "Jarvis could not start. Check the session log.",
-                                  terminal=None)
+                    self.end_task_session()
+                    if verb == "stop":
+                        record.update(state="off" if record["app_off"] else "stopped",
+                                      reason="app-off" if record["app_off"] else "stopped", detail="", terminal=None)
+                    else:
+                        record.update(state=failure.state if isinstance(failure, Refusal) else "failed",
+                                      reason=failure.reason if isinstance(failure, Refusal) else "launch-failed",
+                                      detail=failure.detail if isinstance(failure, Refusal) else "Jarvis could not start. Check the session log.",
+                                      terminal=None)
                     if verb == "succeed":
                         record.update(state="failed", reason="handover-failed", history=None,
                                       detail="Retry jarvis-session succeed for this home. Check the session log if it fails again.")

@@ -27,6 +27,20 @@ source "$SCRIPT_DIR/lib/pane-write.sh"
 source "$SCRIPT_DIR/lib/copilot-session.sh"
 source "$SCRIPT_DIR/lib/lane-relaunch.sh"
 source "$SCRIPT_DIR/lib/tmux-server.sh"
+# task_window_live SOCKET SERVER START PANE: tmux_pane_live's answer for a
+# task window on the home's socket. The recorded server serves that socket
+# until it exits, so another server answering it proves the window gone (1),
+# whatever process now holds the recorded pid.
+task_window_live() {
+  local rc=0 serving
+  export TMUX="$1,0,0"
+  tmux_pane_live "$2" "$3" "$4" "$1" || rc=$?
+  if [[ "$rc" == 2 ]] && serving="$(tmux display-message -p '#{pid}' 2>/dev/null)" \
+    && [[ -n "$serving" && "$serving" != "$2" ]]; then
+    rc=1
+  fi
+  return "$rc"
+}
 case "$verb" in
   select)
     source "$ROOT/jarvis/scripts/lib/jarvis-env.sh"
@@ -69,6 +83,39 @@ case "$verb" in
     esac
     jq -cn --arg harness "$harness" --arg account "$account" --arg model "$model" --arg effort "$effort" \
       '{harness:$harness,account:$account,model:$model,effort:$effort}' ;;
+  task-prepare)
+    source "$ROOT/jarvis/scripts/lib/jarvis-env.sh"
+    jarvis_load "$5"
+    source "$SCRIPT_DIR/lib/overseer-launch.sh"
+    DEP_ERR=/dev/stderr
+    ol_entry_model "$1:$2:$3" || { printf 'jarvis-task: selection=model-unread\n%s\n' "$OL_CLASS_ERR" >&2; exit 1; }
+    harness="$OL_ENTRY_HARNESS" model="$OL_ENTRY_MODEL" effort="$OL_ENTRY_EFFORT"
+    pick_args=(pick --harness "$harness" --json)
+    [[ -z "$model" ]] || pick_args+=(--native-model "$model")
+    [[ -z "$4" ]] || pick_args+=(--lane "$4")
+    picked="$("$SCRIPT_DIR/lanes" "${pick_args[@]}")" || exit "$?"
+    account="$(jq -er '.config_dir | strings | select(length > 0)' <<<"$picked")" || exit 1
+    ol_model_line "$OL_ENTRY_WARNING"
+    ol_launch_flags --question-off "$harness" "$model" "$effort" "$model" "" || exit 1
+    ol_command_line --brief "$6" "$harness" "" "$account" "$5" "${OL_FLAGS[@]}" || exit 1
+    jq -cn --arg line "$OL_CMD" --arg harness "$harness" --arg model "${model:-native-default}" \
+      --arg account "$account" --arg effort "$effort" \
+      '{line:$line,harness:$harness,model:$model,account:$account,effort:$effort}' ;;
+  task-live)
+    rc=0
+    task_window_live "$1" "$2" "$3" "$4" || rc=$?
+    [[ "$rc" != 2 ]] || printf 'jarvis-task: terminal=unread\n%s\n' "$TMUX_PANE_DETAIL" >&2
+    exit "$rc" ;;
+  task-close)
+    rc=0
+    task_window_live "$1" "$2" "$3" "$4" || rc=$?
+    [[ "$rc" != 1 ]] || exit 0
+    [[ "$rc" == 0 ]] || { printf 'jarvis-task: terminal=unread\n%s\n' "$TMUX_PANE_DETAIL" >&2; exit 1; }
+    actual="$(tmux display-message -p -t "$4" '#{@jarvis-task}')" || exit 1
+    [[ "$actual" == "$6" || ( "$7" == true && -z "$actual" ) ]] || { printf 'jarvis-task: terminal=identity-changed\n' >&2; exit 1; }
+    binding="#{==:#{@jarvis-task},$6}"
+    [[ "$7" != true ]] || binding="#{||:$binding,#{==:#{@jarvis-task},}}"
+    tmux if-shell -F -t "$4" "#{&&:$binding,#{==:#{pid},$2}}" "kill-window -t $5" ;;
   live)
     export TMUX="$1,0,0"
     tmux_pane_live "$2" "$3" "$4" || exit "$?"
