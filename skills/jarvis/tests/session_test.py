@@ -137,9 +137,10 @@ class SessionContract(unittest.TestCase):
         self.label = "jarvis-" + key[:32]
 
     def tearDown(self):
-        # Kill only the server this fixture started, then remove its scratch.
-        (self.root / "refuse-teardown").unlink(missing_ok=True)
+        # Registered worker joins run after teardown, before scratch removal,
+        # even when a persisted-state assertion fails.
         try:
+            (self.root / "refuse-teardown").unlink(missing_ok=True)
             if self.record.exists():
                 # A record-location control can leave only workflow metadata.
                 # The owned server cleanup below still releases its resources.
@@ -148,17 +149,18 @@ class SessionContract(unittest.TestCase):
                     self.call("stop")
                     self.wait("off" if lifecycle.get("app_off") else "stopped", persisted_stop=True)
                     self.await_worker_ended(json.loads(self.record.read_text()).get("worker"))
-            for identity in self.observed_workers.values():
-                self.await_worker_ended(identity)
         finally:
-            for worker in self.owned_workers:
-                worker.terminate()
-                try:
-                    worker.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    worker.kill()
-                    worker.wait(timeout=5)
-            self.stop_server(label=self.label)
+            try:
+                for worker in self.owned_workers:
+                    with self.subTest(cleanup_worker=worker.pid):
+                        worker.terminate()
+                        try:
+                            worker.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            worker.kill()
+                            worker.wait(timeout=5)
+            finally:
+                self.stop_server(label=self.label)
 
     def stop_server(self, *, label=None, socket=None):
         target = ["-S", socket] if socket else ["-L", label]
@@ -210,7 +212,10 @@ class SessionContract(unittest.TestCase):
         lifecycle = json.loads(self.record.read_text())
         identity = (lifecycle or {}).get("worker")
         if identity:
-            self.observed_workers[(identity["pid"], identity["started_at"])] = identity
+            key = (identity["pid"], identity["started_at"])
+            if key not in self.observed_workers:
+                self.observed_workers[key] = identity
+                self.addCleanup(self.await_worker_ended, identity)
 
     def wait(self, state="running", reason=None, seconds=20, persisted_stop=False):
         deadline = time.monotonic() + seconds
