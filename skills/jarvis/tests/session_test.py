@@ -827,7 +827,7 @@ class SessionContract(unittest.TestCase):
                     "JARVIS_TEST_HARNESS": "claude", "CLAUDE_CONFIG_DIR": str(self.account)}, clear=True), \
                     patch.object(sys, "argv", ["claude", "--resume", confirmed]), \
                     patch.object(sys, "stdin", io.StringIO("")), \
-                    patch("fixtures.harness.native_hook"), \
+                    patch("fixtures.harness.native_hook", return_value=subprocess.CompletedProcess([], 0, b"", b"")), \
                     patch("fixtures.harness.select.select", return_value=([], [], [])), \
                     redirect_stdout(io.StringIO()):
                 harness_main()
