@@ -12,7 +12,7 @@ Read when setting up an assistant home, choosing a home path or starting a conti
 | `state/handoff.md` | Committed | The session model writes the current handoff under [Handoff](long-session.md#handoff). |
 | `state/archive/` | Committed | The session model writes archived handoffs and progress logs under [Handoff](long-session.md#handoff). |
 | Other files under `state/` | Committed | A consumer's file and shell tools write its work here. An app-managed home limits model file and shell writes to this folder. |
-| `${XDG_STATE_HOME:-$HOME/.local/state}/kendex/jarvis/<canonical-home-key>/jarvis-session.json` | Outside the home | The session runtime and the native SessionStart hook write the local controller record. The runtime writes no start-critical record under `state/`. |
+| The path orch’s `workflow-state path oversee` resolves | Local | Orch keeps the sole controller record under `.overseer`. Jarvis calls orch’s lifecycle operations. No controller record is written under `state/`. |
 | `.agents/skills/` and each harness's skill and agent directories, such as `.claude/skills/`, `.claude/agents/` and `.codex/agents/` | Committed | kendex renders or links installed skills and agents here so a clone has them. In a home where kendex did not install Jarvis, an assistant app such as VGS can copy a kendex-rendered package to these same paths. |
 | `tmp/` | Local | Scratch files stay on this machine under [Scratch files](computer-use.md#scratch-files). |
 | `.env.local`, or the private env file selected by `KENDEX_ENV_FILE` | Local | Secrets stay on this machine; kendex creates the file with mode 600. |
@@ -25,4 +25,8 @@ Before the first Jarvis Start with Copilot CLI, open this home in native Copilot
 
 ## Session record
 
-The [session command](../workflows/session.md#session-command) keeps one tmux controller per canonical home. Its record stays across logins and restarts. Each home uses a separate tmux socket. Status names that socket and the owned session, window and pane.
+The [session command](../workflows/session.md#session-command) calls orch’s controller lifecycle for one canonical home. Orch resolves the local record through `workflow-state path oversee`. The record retains Off and unfinished transfers across logins and restarts. Jarvis’s explicit first launch uses the home’s tmux socket. An orch launch or registration can use an existing fleet server. Status returns the owned socket, session, window and pane.
+
+Moving a running home requires retiring its controller before the move. A new clone starts without a live controller. Committed handoff text grants no runtime identity. A record for a different canonical home refuses reuse.
+
+A package refresh can leave the former XDG `kendex/jarvis/<canonical-home-key>/jarvis-session.json` record and its controller alive. Its presence refuses new launches and registrations with `record-unreadable`. Use orch’s `controller-session retire-legacy --home HOME` to stop the exact recorded controller identities, preserve Off and the boot marker in orch, and remove the retired record. If the old Start, Stop or succession worker is still running, retirement refuses; wait for that bounded command to settle, then run retirement again. A failed identity or stop check leaves that record in place. Removing the old file by hand does not prove the controller ended and is not a retirement route.

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Private bridge to the existing lock, launch, history and pane owners.
 set -euo pipefail
-ROOT="$(cd -- "${BASH_SOURCE[0]%/*}/../../.." && pwd -P)"
-SCRIPT_DIR="$ROOT/orch/scripts"
-for package in mailbox orch; do
+SCRIPT_DIR="$(cd -- "${BASH_SOURCE[0]%/*}/.." && pwd -P)"
+ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
+for package in mailbox; do
   if [[ ! -d "$ROOT/$package/scripts" ]]; then
     printf 'jarvis-session: dependency=%s\n' "$package" >&2
     exit 1
@@ -12,6 +12,25 @@ done
 verb="$1"
 shift
 case "$verb" in
+  assert-record)
+    source "$SCRIPT_DIR/lib/overseer-launch.sh"
+    jq -e --argjson expected "$2" --argjson request "$3" "$OL_JQ_DEFS"'
+      (.overseer | ol_succession_owned($expected))
+      and ($request == null or (.overseer | ol_recovery_bound($request)))' -- "$1" >/dev/null
+    exit ;;
+  pane-process)
+    source "$SCRIPT_DIR/lib/lane-state.sh"
+    pid="$(tmux -S "$1" display-message -p -t "$2" '#{pane_pid}')" || exit 1
+    at="$(lane_process_start "$pid")" || exit 1
+    [[ -n "$at" ]] || exit 1
+    jq -cn --argjson pid "$pid" --arg at "$at" '{pid:$pid,started_at:$at}'
+    exit ;;
+  state-path) exec "$SCRIPT_DIR/workflow-state" path oversee ;;
+  state-init)
+    if ! "$SCRIPT_DIR/workflow-state" exists oversee >/dev/null; then
+      "$SCRIPT_DIR/workflow-state" init oversee >/dev/null
+    fi
+    exit ;;
   lock)
     source "$ROOT/mailbox/scripts/lib/file-lock.sh"
     exec 200>>"$1.lock"
@@ -41,10 +60,20 @@ task_window_live() {
   fi
   return "$rc"
 }
+controller_flags() { # JSON_ARGV
+  controller_flags_file="$(mktemp)" || return 1
+  trap 'rm -f -- "${controller_flags_file:?}"' EXIT
+  jq -j 'if type == "array" and all(.[]; type == "string" and (contains("\u0000") | not))
+    then .[] | . + "\u0000" else error("controller-flags-invalid") end' <<<"$1" >"$controller_flags_file" || return 1
+  flags=()
+  while IFS= read -r -d '' flag; do flags+=("$flag"); done <"$controller_flags_file"
+  rm -f -- "${controller_flags_file:?}" || return 1
+  trap - EXIT
+}
 case "$verb" in
   select)
-    source "$ROOT/jarvis/scripts/lib/jarvis-env.sh"
-    jarvis_load "$3"
+    source "$ROOT/mailbox/scripts/lib/kendex-env.sh"
+    kendex_load_project_env "$3"
     DEP_ERR="$(mktemp)" || exit 1
     trap 'rm -f -- "$DEP_ERR"' EXIT
     source "$SCRIPT_DIR/lib/lane-context.sh"
@@ -116,15 +145,64 @@ case "$verb" in
     binding="#{==:#{@jarvis-task},$6}"
     [[ "$7" != true ]] || binding="#{||:$binding,#{==:#{@jarvis-task},}}"
     tmux if-shell -F -t "$4" "#{&&:$binding,#{==:#{pid},$2}}" "kill-window -t $5" ;;
+  rows)
+    source "$SCRIPT_DIR/lib/lane-context.sh"
+    source "$SCRIPT_DIR/lib/session-rows.sh"
+    session_rows_overseer_file "$1" "$2" "$3" ;;
+  command-plan)
+    harness="$1"
+    launch_choice_shell_words "$2" || exit 1
+    end=$((${#LAUNCH_CHOICE_ARGV[@]} - 1))
+    [[ "$end" -ge 0 ]] || exit 1
+    brief="${LAUNCH_CHOICE_ARGV[end]}"
+    start=-1
+    for ((i=0; i<end; i++)); do
+      word="${LAUNCH_CHOICE_ARGV[i]}"
+      if [[ "${word##*/}" == "$harness" ]]; then start=$((i + 1)); break; fi
+    done
+    [[ "$start" -ge 0 ]] || exit 1
+    if [[ "$harness" == claude && "${LAUNCH_CHOICE_ARGV[start]:-}" == -n ]]; then start=$((start + 2)); fi
+    case "${LAUNCH_CHOICE_ARGV[end-1]:-}" in -i|--interactive|--) end=$((end - 1)) ;; esac
+    flags=()
+    for ((i=start; i<end; i++)); do flags+=("${LAUNCH_CHOICE_ARGV[i]}"); done
+    flags_json="$(jq -cn --args '$ARGS.positional' -- ${flags[@]+"${flags[@]}"})" || exit 1
+    handoff=""
+    if [[ "$harness" == claude ]]; then
+      source "$SCRIPT_DIR/lib/overseer-launch.sh"
+      if ol_command_read "$harness" "$2"; then handoff="$OL_COMMAND_HANDOFF"; fi
+    fi
+    jq -cn --arg brief "$brief" --arg handoff "$handoff" --argjson flags "$flags_json" '{brief:$brief,flags:$flags,handoff:$handoff}' ;;
+  open)
+    placement=(--session "$3")
+    [[ -z "$2" ]] || placement=(--after "$2")
+    result="$("$SCRIPT_DIR/overseer-host" create --cwd "$PWD" --name overseer "${placement[@]}" --line "exec $1")" || exit 1
+    pane="" window=""
+    for word in $result; do case "$word" in session=*) pane="${word#session=}" ;; window=*) window="${word#window=}" ;; esac; done
+    [[ -n "$pane" && -n "$window" ]] || exit 1
+    tmux display-message -p -t "$pane" '#{socket_path}	#{pid}	#{start_time}	#{session_name}	#{window_id}	#{pane_id}' ;;
+  watch)
+    source "$SCRIPT_DIR/lib/overseer-launch.sh"
+    source "$SCRIPT_DIR/lib/watch-pid.sh"
+    source "$SCRIPT_DIR/lib/job-unit.sh"
+    source "$SCRIPT_DIR/lib/watch-handover.sh"
+    HANDOFF="$6"
+    export TMUX="$8,0,0"
+    controller_flags "$7" || exit 1
+    DEP_ERR="$(mktemp)" || exit 1
+    trap 'rm -f -- "${DEP_ERR:?}"' EXIT
+    closed=()
+    [[ "${9:-}" != closed ]] || closed=(--closed)
+    watch_handover ${closed[@]+"${closed[@]}"} "$1" "$2" "$3" "$4" "$5" ${flags[@]+"${flags[@]}"} || { cat -- "$DEP_ERR" >&2; exit 1; }
+    printf '%s\n' "$WATCH_HANDOVER_KEY" "${WATCH_HANDOVER_FIELDS[@]}" ;;
   live)
     export TMUX="$1,0,0"
     tmux_pane_live "$2" "$3" "$4" || exit "$?"
     actual="$(tmux display-message -p -t "$4" '#{@jarvis-generation}')" || exit 2
     # Staging ownership precedes the native generation mark.
-    [[ "$actual" == "$5" || ( "$7" == staging && -z "$actual" ) ]] || exit 1
+    [[ "$7" == registered || "$actual" == "$5" || ( "$7" == staging && -z "$actual" ) ]] || exit 1
     session="$(tmux display-message -p -t "$4" '#{session_name}')" || exit 2
     window="$(tmux display-message -p -t "$4" '#{window_id}')" || exit 2
-    [[ "$session" == jarvis && "$window" == "$6" ]] || exit 1
+    [[ ( "$7" == registered || "$session" == jarvis ) && "$window" == "$6" ]] || exit 1
     jq -cn --arg socket "$1" --arg session "$session" --arg window "$window" --arg pane "$4" \
       '{server:$socket,session:$session,window:$window,pane:$pane}' ;;
   process)
@@ -142,16 +220,31 @@ case "$verb" in
   prepare)
     harness="$1" account="$2" home="$3" id="$4" file="$5"
     lane_trust_prepare "$harness" "$account" "$home" || exit 1
-    lane_session_command "$harness" "$id" "$file" || exit 1
+    controller_flags "${8:-[]}" || exit 1
+    lane_session_command "$harness" "$id" "$file" "${12:-jarvis}" ${flags[@]+"${flags[@]}"} || exit 1
     cmd="$LANE_SESSION_CMD" var="$LANE_SESSION_ACCOUNT_VAR"
-    if [[ -n "${8:-}${9:-}" ]]; then
-      flags="$(launch_choice_write "$harness" "${8:-}" "${9:-}")" || exit 1
+    if [[ -n "${13:-}${14:-}" ]]; then
+      flags="$(launch_choice_write "$harness" "${13:-}" "${14:-}")" || exit 1
       launch_choice_shell_words "$flags" || exit 1
       flags="$(printf ' %q' ${LAUNCH_CHOICE_ARGV[@]+"${LAUNCH_CHOICE_ARGV[@]}"})" || exit 1
       cmd="$harness$flags${cmd#"$harness"}"
     fi
+    if [[ -n "${15:-}" ]]; then
+      # Use the resume builder's exact native argv and already-submitted brief.
+      cmd="${15}"
+      LANE_SESSION_PROMPTED=false
+    fi
     form="$(lane_launch_form "$cmd" "$harness" "$LANE_TRUST_HOME" "")"
+    if [[ "${9:-jarvis}" == external ]]; then
+      model="$(launch_choice_launch_model "$harness" "$cmd")"
+      var="$(lane_env_prefix "$harness" - "$model")"
+      var="${var%%=*}"
+    fi
+    [[ -z "${10:-}" ]] || var="${10}"
     child_env="JARVIS_RECORD=$(lane_single_quote "$6") JARVIS_GENERATION=$(lane_single_quote "$7")"
+    if [[ "$harness" == pi && "$var" != PI_CODING_AGENT_DIR && -n "${11:-}" ]]; then
+      child_env+=" PI_CODING_AGENT_DIR=$(lane_single_quote "${11}")"
+    fi
     # Jarvis acts on the owner's desktop, so its session keeps the live display.
     lane_launch_keep_live_session
     line="$(lane_launch_line "$cmd" "$harness" "$var" "$LANE_TRUST_HOME" "$form" "" "$child_env")" || exit 1

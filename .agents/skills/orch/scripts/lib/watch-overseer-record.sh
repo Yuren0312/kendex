@@ -143,17 +143,39 @@ overseer_command_record() {
   # The account is a claude session's home (ol_identity), so a record naming
   # claude takes it too; a codex home is its own directory and is never read
   # off the account.
-  detail="$("$WORKFLOW_STATE" ${WORKFLOW_STATE_ARGS[@]+"${WORKFLOW_STATE_ARGS[@]}"} \
-    update oversee --arg server "$server" --arg pane "$pane" --arg window "$window" --arg line "$line" \
+  (
+  local state record path DEP_ERR
+  DEP_ERR="$(mktemp)" || {
+    overseer_record_notice "" "$held" overseer-unrecorded "pane=$pane" "step=mktemp"
+    exit 0
+  }
+  trap 'rm -f -- "${DEP_ERR:?}"' EXIT
+  if ! state="$("$WORKFLOW_STATE" ${WORKFLOW_STATE_ARGS[@]+"${WORKFLOW_STATE_ARGS[@]}"} get oversee '.' 2>"$DEP_ERR")"; then
+    overseer_record_notice "$(cat -- "$DEP_ERR")" "$held" overseer-unrecorded "pane=$pane" "step=read"
+    return 0
+  fi
+  record="$(jq -c --arg server "$server" --arg pane "$pane" --arg window "$window" --arg line "$line" \
       --arg rows "$rows" --arg start "$start" --arg socket "$socket" "$OL_JQ_DEFS"'
-      .overseer = ((((.overseer // {})
+      if .overseer.lifecycle != null and (.overseer | ol_owns($server; $start; $pane) | not)
+        then error("controller-unbound")
+      elif .overseer.lifecycle != null and .overseer.lifecycle.state != "running" then .
+      else .overseer = ((((.overseer // {})
         | if ol_owns($server; $start; $pane) then . else {} end)
         + {server: $server, pane: $pane, window: $window, launch_line: $line, session_rows: $rows,
            server_start: ($start | tonumber)}) + {server_socket: $socket}
         | del(.pending, .exit)
         | if (.harness // "claude") == "claude" and (.account // "") != "" and (.home // "") == ""
-          then .home = .account else . end)' 2>&1)" \
+          then .home = .account else . end) end | .overseer' <<<"$state" 2>"$DEP_ERR")" || {
+      overseer_record_notice "$(cat -- "$DEP_ERR")" "$held" overseer-unrecorded "pane=$pane" "step=identity"
+      return 0
+    }
+  path="$("$WORKFLOW_STATE" ${WORKFLOW_STATE_ARGS[@]+"${WORKFLOW_STATE_ARGS[@]}"} path oversee 2>"$DEP_ERR")" || {
+    overseer_record_notice "$(cat -- "$DEP_ERR")" "$held" overseer-unrecorded "pane=$pane" "step=state-path"
+    return 0
+  }
+  detail="$(ORCH_STATE_DIR="${path%/*}" "$SCRIPT_DIR/controller-session" register --home "$PWD" --record "$record" 2>&1)" \
     || overseer_record_notice "$detail" "$held" overseer-unrecorded "pane=$pane" "step=write"
+  )
   return 0
 }
 

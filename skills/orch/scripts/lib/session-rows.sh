@@ -384,9 +384,7 @@ SESSION_ROWS_JARVIS_BOUND='def bound($generation; $server; $pane; $harness):
 # neither or RECORD could not be read, 2 where it could not be written, 3 where
 # its lock was not taken. The cause is on stderr.
 session_rows_jarvis_write() { # RECORD GENERATION KEY HARNESS
-  local identity account
-  account="$(lane_context_caller_cfg "$4")" || return 1
-  [ -n "$account" ] || return 1
+  local identity account var
   identity="$(jq -c '{native_session_id: (.session_id // .sessionId),
       session_file: (.transcript_path // .transcriptPath)}
     | with_entries(select(.value | type == "string" and . != ""))')" || return 1
@@ -395,7 +393,7 @@ session_rows_jarvis_write() { # RECORD GENERATION KEY HARNESS
     orch_take_lock 200 "$1.lock" "$SESSION_ROWS_WAIT" || exit 3
     verdict="$(jq -r --arg generation "$2" --arg server "${3%% *}" --arg pane "${3#* }" \
       --argjson identity "$identity" --arg harness "$4" "$SESSION_ROWS_JARVIS_BOUND"'
-      .pending as $p
+      .overseer.lifecycle | .pending as $p
       | if (bound($generation; $server; $pane; $harness) | not) or $p.started_at != null then "other"
         elif ($p.native_session_id // $identity.native_session_id) != $identity.native_session_id then "mismatch"
         elif ($identity | length) == 0 then "unnamed"
@@ -409,8 +407,16 @@ session_rows_jarvis_write() { # RECORD GENERATION KEY HARNESS
         [ "$verdict" = mismatch ] && exit 4
         exit 1 ;;
     esac
+    var="$(jq -r '.overseer.lifecycle.account_var // empty' -- "$1")" || exit 1
+    if [ -n "$var" ]; then
+      [[ "$var" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || exit 1
+      account="${!var:-}"
+    else
+      account="$(lane_context_caller_cfg "$4")" || exit 1
+    fi
+    [ -n "$account" ] || exit 1
     jq -c --argjson identity "$identity" --arg account "$account" --argjson at "$(date +%s)" \
-      '.pending += $identity + {started_at: $at, observed_account: $account}' -- "$1" >"$1.$$" || { rm -f -- "$1.$$"; exit 2; }
+      '.overseer.lifecycle.pending += $identity + {started_at: $at, observed_account: $account}' -- "$1" >"$1.$$" || { rm -f -- "$1.$$"; exit 2; }
     mv -f -- "$1.$$" "$1" || { rm -f -- "$1.$$"; exit 2; }
   )
 }
@@ -483,7 +489,7 @@ session_rows_jarvis_taken() { # RECORD GENERATION KEY HARNESS EVENT
       turn:undelivered) stamp=kickoff_ended ;;
       *) exit 0 ;;
     esac
-    jq -c --arg stamp "$stamp" '.pending[$stamp] = true' -- "$1" >"$1.$$" || { rm -f -- "$1.$$"; exit 2; }
+    jq -c --arg stamp "$stamp" '.overseer.lifecycle.pending[$stamp] = true' -- "$1" >"$1.$$" || { rm -f -- "$1.$$"; exit 2; }
     mv -f -- "$1.$$" "$1" || { rm -f -- "$1.$$"; exit 2; }
   )
 }
@@ -496,7 +502,7 @@ session_rows_jarvis_taken() { # RECORD GENERATION KEY HARNESS EVENT
 session_rows_jarvis_due() { # RECORD GENERATION KEY HARNESS SESSION
   jq -r --arg generation "$2" --arg server "${3%% *}" --arg pane "${3#* }" \
     --arg harness "$4" --arg session "$5" "$SESSION_ROWS_JARVIS_BOUND"'
-    if (bound($generation; $server; $pane; $harness) and .pending.started_at != null
+    .overseer.lifecycle | if (bound($generation; $server; $pane; $harness) and .pending.started_at != null
       and .pending.native_session_id == $session and .state == "starting"
       and .pending.brief_taken == null) | not then "other"
     elif .brief_delivered == true then "own"

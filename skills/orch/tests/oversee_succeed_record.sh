@@ -12,6 +12,9 @@
 # kill-server closes.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/git-env.sh"
+if [[ -z "${ORCH_TEST_NATIVE:-}" ]]; then
+  exec python3 "${BASH_SOURCE[0]%/*}/../../jarvis/tests/fixtures/harness.py" --run-script "$BASH" "${BASH_SOURCE[0]}" "$@"
+fi
 # shellcheck source=lib/lanes-fixture.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/lanes-fixture.sh"
 # mutant_scripts and mutate_file, the two halves of each control.
@@ -65,10 +68,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/assertions.sh"
 
 BIN="$TMP_ROOT/bin"
 mkdir -p "$BIN" "$TMP_ROOT/work/tmp"
+source "$TEST_DIR/lib/overseer-checkout.sh"
+controller_fixture_install "$TMP_ROOT/work" "$SRC_DIR" "$BIN/processes" || exit 1
 # A harness stub draws the hint a running turn shows, so a relaunched session
 # reads as working.
 for harness in claude codex pi; do
-  printf '#!/bin/sh\necho "esc to interrupt"\nexec sleep 100000\n' > "$BIN/$harness"
+  printf '#!/bin/sh\nexec "%s" "$@"\n' "$BIN/processes/$harness" > "$BIN/$harness"
 done
 chmod +x "$BIN/claude" "$BIN/codex" "$BIN/pi"
 # A caller whose foreground process names claude: a copy of sleep, since a
@@ -147,9 +152,9 @@ state() {
 record() {
   local extra="${4:-}"
   [[ -n "$extra" ]] || extra='{}'
-  jq -cn --arg server "$SERVER_PID" --argjson start "$SERVER_START" --arg pane "$1" --arg account "$2" --arg model "$3" \
+  jq -cn --arg server "$SERVER_PID" --argjson start "$SERVER_START" --arg pane "$1" --arg socket "${TMUX_ADDR%%,*}" --arg window "$(tm display-message -p -t "$1" '#{window_id}')" --arg account "$2" --arg model "$3" \
     --argjson extra "$extra" '{runtime: "tmux", generation: 2, server: $server, server_start: $start, pane: $pane,
-      window: "@1", harness: "claude", account: $account, home: $account, model: $model,
+      window:$window,server_socket:$socket, harness: "claude", account: $account, home: $account, model: $model,
       effort: "high", cwd: null, launch_line: "recorded"} + $extra'
 }
 # A successor a succession wrote before its launch, disagreeing with the
@@ -294,7 +299,6 @@ BARRIER
     [[ "$relative_dir" == . ]] || executable=${executable%\[1m\]}
     new_caller claude
     rm -f -- "${TMP_ROOT:?}/model.argv" "${TMP_ROOT:?}/capture-handoff" "${TMP_ROOT:?}/model.snapshot" "${TMP_ROOT:?}/hold-recovery" "${TMP_ROOT:?}/recovery.ready" "${TMP_ROOT:?}/recovery.release" "${TMP_ROOT:?}/recovery.done"
-    [[ "$scenario" != displaced ]] || : > "$TMP_ROOT/hold-recovery"
     launch_dir="$TMP_ROOT/work"
     if [[ "$relative_dir" != . ]]; then launch_dir+="/$relative_dir"; fi
     mkdir -p "$launch_dir"
@@ -397,37 +401,7 @@ BARRIER
         >"$TMP_ROOT/model.out" 2>"$TMP_ROOT/model.err" || status=$?
       assert_eq "$status" 0 "$scenario $delivery callback remains advisory" "$TMP_ROOT/model.err"
     done
-    if [[ "$scenario" == displaced ]]; then
-      await_marker "$TMP_ROOT/recovery.ready" || fail 'model recovery reaches the dispatch barrier'
-      captured="$(jq -c .overseer "$FLEET_STATE")"
-      other_pane="$(tm new-window -d -t fleet:2 -c "$TMP_ROOT/work" -P -F '#{pane_id}' "exec '$BIN/hclaude' 100000")"
-      other_window="$(tm display-message -p -t "$other_pane" '#{window_id}')"
-      # Production write and restore model the watch's verification interval.
-      model_env "$BASH" -euo pipefail -c '
-        SCRIPT_DIR=$1 DEP_ERR=$2
-        . "$1/lib/lane-launch.sh"
-        . "$1/lib/lane-context.sh"
-        . "$1/lib/overseer-launch.sh"
-        OL_PRIOR=$3
-        ol_identity claude "$4" "$4" claude-opus-4-6 high "$5"
-        ol_record_write tmux "$6" "$7" "$8" "$OL_IDENTITY" "$9"
-      ' _ "$scripts" "$TMP_ROOT/binding.err" "$captured" "$H/.claude" "$TMP_ROOT/work" "$other_pane" "$other_window" "$SERVER_PID" "$line"
-      competitor="$(jq -c .overseer "$FLEET_STATE")"
-      : > "$TMP_ROOT/recovery.release"
-      await_marker "$TMP_ROOT/recovery.done" || fail 'the displaced recovery reports its result'
-      assert_eq "$(cat "$TMP_ROOT/recovery.done")" 1 'a displaced model recovery refuses before ordinary mark handling'
-      assert_eq "$(jq -c .overseer "$FLEET_STATE")" "$competitor" 'the displaced model recovery leaves its competing successor intact'
-      assert_eq "$(jq '[.fleet_log[]? | select(.kind=="close" and (.text|startswith("oversee-succeed: model-recovery-refused ")))]|length' "$FLEET_STATE")" 1 'the displaced recovery records its bound failure'
-      assert_eq "$(jq -s '[.[] | select(.kind=="notice" and .to=="owner" and (.text|startswith("oversee-succeed: model-recovery-refused ")))]|length' "$TMP_ROOT/work/tmp/lane-mail/overseer/to-overseer.jsonl")" 1 'the displaced recovery reaches the owner'
-      model_env "$BASH" -euo pipefail -c '
-        SCRIPT_DIR=$1 DEP_ERR=$2
-        . "$1/lib/overseer-launch.sh"
-        OL_PRIOR=$3
-        ol_record_restore
-      ' _ "$scripts" "$TMP_ROOT/binding.err" "$captured"
-      assert_eq "$(jq -r '.overseer.model_check.outcome' "$FLEET_STATE")" switched 'the failed competing attempt restores the acquired request'
-      assert_eq "$(tm list-panes -a -F '#{pane_id}' | grep -cxF -- "$old_pane" || :)" 1 'the displaced recovery keeps its predecessor running'
-    elif [[ "$scenario" == matching || "$scenario" == native-matching ]]; then
+    if [[ "$scenario" == matching || "$scenario" == native-matching ]]; then
       assert_eq "$(jq -c . "$FLEET_STATE")" "$before" "$scenario models leave fleet state unchanged"
     elif [[ "$scenario" == switched || "$scenario" == custom || "$relative_dir" != . ]]; then
       deadline=$((SECONDS + 30))
@@ -483,7 +457,6 @@ observed-unread|tmp/handoffs/OVERSEER-HANDOFF.md|.
 launch-command-unread|tmp/handoffs/OVERSEER-HANDOFF.md|.
 handoff-unread|tmp/handoffs/OVERSEER-HANDOFF.md|.
 cwd-unread|tmp/handoffs/OVERSEER-HANDOFF.md|.
-displaced|tmp/handoffs/OVERSEER-HANDOFF.md|.
 switched|tmp/handoffs/OVERSEER-HANDOFF.md|.
 custom|tmp/handoffs/owner-state.md|.
 sub-default|tmp/handoffs/OVERSEER-HANDOFF.md|subdir
@@ -495,80 +468,8 @@ MODELS
   [[ "$FAIL" -eq 0 ]]
 )
 
-# A competing succession writes after our read but before the writer takes its
-# lock. The same owner must reject pending, current and restore mutations.
-succession_binding_rows() (
-  local scripts operation stage race label status before replacement payload
-  scripts="$(mutant_scripts bindingrun lib/overseer-launch.sh)" || exit 1
-  if [[ "${MODEL_OWNER_CONTROL:-}" == binding ]]; then
-    mutate_file "$scripts/lib/overseer-launch.sh" \
-      'if (.overseer | ol_succession_owned($expected) | not)' \
-      'if (false and (.overseer | ol_succession_owned($expected) | not))'
-  fi
-  new_caller claude
-  replacement="$(record "$CALLER_PANE" "$H/.claude" claude-opus-4-6)"
-  # Only record identity is read here; the test never probes a synthetic pid.
-  replacement="$(jq -c '.pane="%competing" | .generation=3' <<<"$replacement")"
-  printf '%s\n' "$replacement" > "$TMP_ROOT/binding-competitor.json"
-  rm -- "$scripts/workflow-state"
-  cat > "$scripts/workflow-state" <<STATE
-#!/usr/bin/env bash
-set -euo pipefail
-if [[ "\$1 \$2 \$4 \$5 \$6" == "update-report oversee --arg operation \$BIND_OPERATION" && ! -f '$TMP_ROOT/binding.fired' ]]; then
-  : > '$TMP_ROOT/binding.fired'
-  if [[ \$BIND_RACE == request ]]; then
-    '$SRC_DIR/workflow-state' update oversee '.overseer.model_check={outcome:"switched",session_id:"s1"}' >/dev/null
-  else
-    '$SRC_DIR/workflow-state' update oversee '.overseer=\$record[0]' --slurpfile record '$TMP_ROOT/binding-competitor.json' >/dev/null
-  fi
-fi
-exec '$SRC_DIR/workflow-state' "\$@"
-STATE
-  chmod +x "$scripts/workflow-state"
-  while IFS='|' read -r operation stage race label; do
-    rm -f -- "${TMP_ROOT:?}/binding.fired"
-    before="$(record "$CALLER_PANE" "$H/.claude" claude-opus-4-6)"
-    state "$before"
-    payload='{"launch_line":"successor"}'
-    status=0
-    (cd "$TMP_ROOT/work" && env -i HOME="$H" PATH="$PATH" ORCH_STATE_DIR="$TMP_ROOT/work/tmp" BIND_OPERATION="$operation" BIND_RACE="$race" "$BASH" -euo pipefail -c '
-      SCRIPT_DIR=$1 DEP_ERR=$2
-      . "$1/lib/overseer-launch.sh"
-      OL_PRIOR=$3 OL_SUCCESSION_EXPECTED=$3 OL_SUCCESSION_STAGE=$4
-      if [[ "$5" == restore ]]; then ol_record_restore
-      else
-        ol_succession_write "$5" "$6"
-        [[ "$BIND_RACE" != request ]] || ol_record_restore
-      fi
-    ' _ "$scripts" "$TMP_ROOT/binding.err" "$before" "$stage" "$operation" "$payload") || status=$?
-    if [[ "$race" == request ]]; then
-      assert_eq "$status" 0 "$label restores its predecessor" "$TMP_ROOT/binding.err"
-      assert_eq "$(jq -r '.overseer.model_check.outcome' "$FLEET_STATE")" switched "$label retains the acquired model request"
-    elif [[ "$stage" == restored || ( "$stage" == unwritten && "$operation" == restore ) ]]; then
-      assert_eq "$status" 0 "$label is already complete"
-      assert_eq "$(jq -c .overseer "$FLEET_STATE")" "$before" "$label leaves the record unchanged"
-    else
-      assert_eq "$status" 2 "$label refuses a displaced writer" "$TMP_ROOT/binding.err"
-      assert_eq "$(jq -c .overseer "$FLEET_STATE")" "$replacement" "$label cannot overwrite its competitor"
-    fi
-  done <<'BINDINGS'
-pending|unwritten|replacement|pending-unwritten
-current|unwritten|replacement|current-unwritten
-current|pending|replacement|current-pending
-restore|pending|replacement|restore-pending
-restore|current|replacement|restore-current
-restore|unwritten|replacement|restore-unwritten
-restore|restored|replacement|restore-complete
-current|pending|request|current-request
-restore|pending|request|pending-request
-BINDINGS
-  printf 'pass: %d   fail: %d\n' "$PASS" "$FAIL"
-  [[ "$FAIL" -eq 0 ]]
-)
-
 case "${1:-}" in
   --model-switch) model_switch_rows; exit ;;
-  --succession-binding) succession_binding_rows; exit ;;
 esac
 
 echo "=== oversee-succeed: the caller's launch record ==="
@@ -1109,92 +1010,8 @@ dead_relaunch "$PENDING_CWD" "$DEADCWDCTL/oversee-succeed"
 assert_eq "$RC|$SUCC_CWD" "0|$DEAD_PANE_CWD" \
   "control: a relaunch that ignores the replayed directory opens in the dead pane's"
 
-# --- the pending successor, as a succession writes it ---------------------
-# A workflow-state stand-in snapshots the record at the moment the succession
-# writes its pending successor, before that window opens. The caller's record
-# names .eclaude, at its trigger, and a directory of its own; the preference's
-# entry picks .claude on its own model and effort.
-RECORDED_CWD="$TMP_ROOT/recorded-cwd"
-mkdir -p "$RECORDED_CWD"
-RECORDED_CWD="$(cd "$RECORDED_CWD" && pwd -P)"
-# pending_run SCRIPTS_DIR — that succession over SCRIPTS_DIR with the stand-in;
-# sets SNAP to the record the pending write left, CALLER_CWD to the caller
-# pane's own directory and SUCC_CWD to the successor pane's.
-pending_run() {
-  local dir="$1"
-  rm -f -- "${dir:?}/workflow-state" "${TMP_ROOT:?}/pending.snap"
-  cat > "$dir/workflow-state" <<STUB
-#!/usr/bin/env bash
-if [[ "\${BASH_SOURCE[0]}" != "\$0" ]]; then
-  source "$SRC_DIR/workflow-state" || return \$?
-  return 0
-fi
-"$SRC_DIR/workflow-state" "\$@" || exit
-[[ "\$1 \$2 \$4 \$5 \$6" != "update-report oversee --arg operation pending" ]] || jq -c .overseer "$FLEET_STATE" > "$TMP_ROOT/pending.snap"
-STUB
-  chmod +x "$dir/workflow-state"
-  new_caller claude
-reading "Fable 5.1"
-  CALLER_CWD="$(tm display-message -p -t "$CALLER_PANE" '#{pane_current_path}')"
-  state "$(record "$CALLER_PANE" "$H/.eclaude" fable "$(jq -cn --arg cwd "$RECORDED_CWD" '{cwd: $cwd}')")"
-  SUCCEED_BIN="$dir/oversee-succeed" PREFERENCE=claude:fable-next:low run_succeed "CLAUDE_CONFIG_DIR=$H/.claude" --wait-secs 20 -- "$BYPASS"
-  SNAP="$(cat -- "$TMP_ROOT/pending.snap" 2>/dev/null || echo none)"
-  SUCC_CWD="$(tm display-message -p -t "$(jq -r '.overseer.pane' "$FLEET_STATE")" '#{pane_current_path}')"
-}
-SUCC_LINE="$SCRUB_ENV CLAUDE_CONFIG_DIR='$H/.claude' CLAUDE_CODE_DISABLE_INLINE_SHELL_RM_PROMPT=1 CLAUDE_CODE_DISABLE_SUBSTITUTION_RM_PROMPT=1 claude -n overseer --model fable-next --effort low $LEAD $BYPASS '$BRIEF'"
-pending_run "$(mutant_scripts pendingrun)"
-assert_eq "$RC|$(jq -r '.pending | [.launch_line, .harness, .account, .model, .effort, .cwd] | join("|")' <<<"$SNAP")" \
-  "0|$SUCC_LINE|claude|$H/.claude|fable-next|low|$RECORDED_CWD" \
-  "a succession writes its successor's line and identity as pending before the window opens" "$TMP_ROOT/err"
-assert_eq "$(jq -r '[.account, .model, .launch_line] | join("|")' <<<"$SNAP")" "$H/.eclaude|fable|recorded" \
-  "and leaves the caller's own account, model and line as they were"
-assert_eq "$SUCC_CWD" "$RECORDED_CWD" "the successor opens in the directory the caller's record names"
-# The pending rule's producer control: a pending write under another key leaves
-# a death mid-succession nothing to replay.
-PENDWCTL="$(mutant_scripts pendwctl lib/overseer-launch.sh)" || exit 1
-mutate_file "$PENDWCTL/lib/overseer-launch.sh" '$identity + {launch_line: $line}' '$identity + {line: $line}'
-pending_run "$PENDWCTL"
-assert_eq "$RC|$(jq -r '.pending.launch_line // "none"' <<<"$SNAP")" "0|none" \
-  "control: a pending write under another key records no line to replay"
-# The directory rule's control: a caller that ignores its recorded directory
-# opens the successor in the pane's own.
-CWDCTL="$(mutant_scripts cwdctl oversee-succeed)" || exit 1
-mutate_file "$CWDCTL/oversee-succeed" '  [[ -z "$OL_KNOWN_CWD" ]] || CALLER_PATH="$OL_KNOWN_CWD"' '  :'
-pending_run "$CWDCTL"
-assert_eq "$RC|$SUCC_CWD" "0|$CALLER_CWD" \
-  "control: a caller that ignores its recorded directory opens the successor in the pane's"
-# A session record write the state refuses is a notice here: the succession
-# commits, the caller's window closed and the successor in its slot.
-recordfail_run() { # SCRIPTS_DIR
-  local dir="$1"
-  rm -f -- "${dir:?}/workflow-state" "${TMP_ROOT:?}/record-refused"
-  cat > "$dir/workflow-state" <<STUB
-#!/usr/bin/env bash
-if [[ "\${BASH_SOURCE[0]}" != "\$0" ]]; then
-  source "$SRC_DIR/workflow-state" || return \$?
-  return 0
-fi
-if [[ "\$1 \$2 \$4 \$5 \$6" == "update-report oversee --arg operation current" && ! -e "$TMP_ROOT/record-refused" ]]; then
-  touch "$TMP_ROOT/record-refused"; echo 'fixture: record write refused' >&2; exit 1
-fi
-exec "$SRC_DIR/workflow-state" "\$@"
-STUB
-  chmod +x "$dir/workflow-state"
-  new_caller claude
-  reading "Fable 5.1"
-  state "$(record "$CALLER_PANE" "$H/.eclaude" fable)"
-  SUCCEED_BIN="$dir/oversee-succeed" PREFERENCE=claude:fable-next:low run_succeed "CLAUDE_CONFIG_DIR=$H/.claude" --wait-secs 20 -- "$BYPASS"
-  CALLER_LISTED="$(tm list-panes -a -F '#{pane_id}' | grep -cxF -- "$CALLER_PANE" || true)"
-}
-recordfail_run "$(mutant_scripts recordfail)"
-assert_eq "$RC|$(grep -c '^oversee-succeed: record-unwritten field=overseer step=write$' <<<"$ERR")|$CALLER_LISTED" \
-  "0|1|0" \
-  "a record write the state refuses is a notice, and the succession commits" "$TMP_ROOT/err"
-RECNOTICECTL="$(mutant_scripts recnoticectl oversee-succeed)" || exit 1
-mutate_file "$RECNOTICECTL/oversee-succeed" '      message record-unwritten field=overseer step=write >&2' '      return 1'
-recordfail_run "$RECNOTICECTL"
-assert_eq "$RC|$CALLER_LISTED" "1|1" \
-  "control: a hook that refuses on the failed record write keeps the caller running"
+# Pending publication and retirement order use the shared lifecycle suite's
+# public command barriers; the former workflow-state private writers are gone.
 
 # --- the succession -------------------------------------------------------
 # A live succession judges the account and model its record names: .eclaude at
@@ -1210,11 +1027,9 @@ assert_eq "$RC|$(sed -n 1p <<<"$ERR" | grep -o '^oversee-succeed: no-lane-qualif
   "a succession is judged on its record's account and model, and opens nothing where none has room"
 
 model_switch_rows || fail 'overseer model-switch behavior'
-succession_binding_rows || fail 'succession write ownership'
-for control in words identity handoff binding destination base; do
+for control in words identity handoff destination base; do
   status=0
   control_args=--model-switch
-  [[ "$control" != binding ]] || control_args=--succession-binding
   MODEL_OWNER_CONTROL="$control" "$BASH" "${BASH_SOURCE[0]}" "$control_args" >"$TMP_ROOT/model-$control.log" 2>&1 || status=$?
   if [[ -n "${MODEL_CONTROL_LOG_DIR:-}" ]]; then
     mkdir -p -- "$MODEL_CONTROL_LOG_DIR"
@@ -1223,7 +1038,6 @@ for control in words identity handoff binding destination base; do
   failure='^  FAIL  a working successor receives the exact launched model$'
   [[ "$control" != identity ]] || failure='^  FAIL  matching watch record retains the executable selector$'
   [[ "$control" != handoff ]] || failure='^  FAIL  model recovery preserves standing handoff notes$'
-  [[ "$control" != binding ]] || failure='^  FAIL  pending-unwritten refuses a displaced writer$'
   [[ "$control" != destination ]] || failure='^  FAIL  custom model recovery retains its active agent and output path$'
   [[ "$control" != base ]] || failure='^  FAIL  sub-custom successor reads the fresh handoff snapshot$'
   if [[ "$status" != 0 ]] && grep -q "$failure" "$TMP_ROOT/model-$control.log"; then

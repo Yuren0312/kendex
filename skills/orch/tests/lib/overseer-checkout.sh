@@ -99,3 +99,89 @@ checkout_late_sync() { # NAME
 "
   printf '%s\n' "$dir"
 }
+
+# shellcheck shell=bash
+# Native event carrier shared with the Jarvis controller suite. Legacy policy
+# fixtures keep their own argv/screen inputs; this supplies actual startup hooks.
+controller_fixture_install() { # HOME SCRIPTS NATIVE_BIN
+  local home="$1" scripts="$2" bin="$3" skills fixture
+  skills="$(cd -- "$scripts/../.." && pwd -P)" || return 1
+  fixture="${BASH_SOURCE[0]%/*}/../../../jarvis/tests/fixtures/harness.py"
+  mkdir -p -- "$home" "$bin" || return 1
+  cp -- "$fixture" "$home/.fixture-harness.py" || return 1
+  jq -n --arg skills "$skills" --arg bash "$BASH" --arg rows "$TMP_ROOT/native-events.jsonl" \
+    --arg gate "$TMP_ROOT/native-gate" --arg idle "$TMP_ROOT/idle" --arg process "${HARNESS_PIDS:-}" \
+    '{skills:$skills,bash:$bash,rows:$rows,gate:$gate,idle_marker:$idle,process_markers:$process}' > "$home/.fixture.json" || return 1
+  local harness
+  for harness in claude codex copilot pi; do
+    if ! cmp -s -- "$ORCH_TEST_NATIVE" "$bin/$harness"; then
+      cp -- "$ORCH_TEST_NATIVE" "$bin/$harness" || return 1
+      chmod +x "$bin/$harness" || return 1
+    fi
+  done
+}
+
+# Register the fixture's hand-opened predecessor through the surviving owner.
+controller_fixture_register() { # SCRIPTS HOME PANE HARNESS ACCOUNT TMUX
+  local scripts="$1" home="$2" pane="$3" harness="$4" account="$5" socket fields record
+  socket="${6%%,*}"
+  fields="$(tmux -S "$socket" display-message -p -t "$pane" '#{pid} #{start_time} #{window_id} #{session_name}')" || return 1
+  local server start window session
+  read -r server start window session <<<"$fields"
+  record="$(jq -cn --arg server "$server" --argjson start "$start" --arg socket "$socket" --arg pane "$pane" \
+    --arg window "$window" --arg session "$session" --arg harness "$harness" --arg account "$account" --arg cwd "$home" \
+    '{runtime:"tmux",server:$server,server_start:$start,server_socket:$socket,pane:$pane,window:$window,tmux_session:$session,
+      harness:$harness,account:$account,home:$account,cwd:$cwd,session_id:"s1",generation:1}')" || return 1
+  (cd -- "$home" && "$scripts/controller-session" register --home "$home" --record "$record" >/dev/null)
+}
+
+# tmux can acknowledge window removal before its native supervisor exits.
+controller_fixture_await_ended() { # SCRIPTS STATE
+  local fields pid start rc deadline=$((SECONDS + 12))
+  fields="$(jq -er '.overseer.lifecycle.process | [.pid,.started_at] | @tsv' "$2")" || return 1
+  IFS=$'\t' read -r pid start <<<"$fields"
+  while (( SECONDS < deadline )); do
+    rc=0
+    "$BASH" "$1/lib/session-backend.sh" worker-live "$pid" "$start" || rc=$?
+    case "$rc" in 1) return 0 ;; 0) sleep 0.05 ;; *) return 1 ;; esac
+  done
+  return 1
+}
+
+# Policy assertions observe the real argv and the real pasted brief. Native
+# identity/kickoff fields have separate coverage in the shared lifecycle suite.
+controller_fixture_argv() { # FILE HARNESS
+  python3 - "$1" "$TMP_ROOT/native-events.jsonl" "$2" <<'PY'
+import json
+from pathlib import Path
+import sys
+path, events, harness = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+if not path.exists():
+    print("none", end="")
+    sys.exit(0)
+words = [word for word in path.read_text().splitlines() if not word.startswith("argv0=")]
+prefix = words[:1] if words and words[0].startswith(("lane=", "home=")) else []
+args = words[len(prefix):]
+rows = [json.loads(line) for line in events.read_text().splitlines()] if events.exists() else []
+started = next((row for row in reversed(rows) if row.get("harness") == harness and row.get("argv") == args), None)
+if started:
+    own = [row for row in rows if row.get("id") == started["id"]]
+    kickoff = next((row["kickoff"] for row in own if "kickoff" in row), None)
+    selected, skip = [], False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg in ("--session-id", "--resume", "resume"):
+            skip = True
+        elif arg.startswith(("--session-id=", "--resume=")):
+            continue
+        elif kickoff is not None and arg == kickoff:
+            if selected and selected[-1] == "-i":
+                selected.pop()
+        else:
+            selected.append(arg)
+    prompt = next((row["prompt"] for row in reversed(own) if "prompt" in row), None)
+    args = selected + ([prompt] if prompt is not None else [])
+print("".join(word + ";" for word in prefix + args), end="")
+PY
+}

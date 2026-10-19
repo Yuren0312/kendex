@@ -11,6 +11,9 @@
 # oversee_succeed_watch.sh's.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/git-env.sh"
+if [[ -z "${ORCH_TEST_NATIVE:-}" ]]; then
+  exec python3 "${BASH_SOURCE[0]%/*}/../../jarvis/tests/fixtures/harness.py" --run-script "$BASH" "${BASH_SOURCE[0]}" "$@"
+fi
 # shellcheck source=lib/lanes-fixture.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/lanes-fixture.sh"
 # Private script layouts hold the stand-in watch beside the real launcher.
@@ -54,6 +57,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/assertions.sh"
 
 BIN="$TMP_ROOT/bin"
 mkdir -p "$BIN" "$TMP_ROOT/work/tmp" "$TMP_ROOT/fixture"
+source "$TEST_DIR/lib/overseer-checkout.sh"
+controller_fixture_install "$TMP_ROOT/work" "$SRC_DIR" "$BIN/processes" || exit 1
 # A checkout, which the real watch's mailbox reads resolve their root in.
 git init -q "$TMP_ROOT/work"
 git -C "$TMP_ROOT/work" config gc.auto 0
@@ -63,18 +68,10 @@ git -C "$TMP_ROOT/work" config maintenance.auto false
 # pane to the shell the launch line was typed into.
 HARNESS_PIDS="$TMP_ROOT/harness"
 mkdir -p "$HARNESS_PIDS"
+controller_fixture_install "$TMP_ROOT/work" "$SRC_DIR" "$BIN/processes" || exit 1
 cat > "$BIN/claude" <<STUB
 #!/bin/sh
-echo 'esc to interrupt'
-(
-  while [ ! -f "$HARNESS_PIDS/wall-\${TMUX_PANE#%}" ]; do sleep 0.1; done
-  echo "You've hit your limit"
-) &
-wall_writer=\$!
-trap 'kill "\$wall_writer" 2>/dev/null || true' 0
-sleep 100000 &
-echo \$! > "$HARNESS_PIDS/\${TMUX_PANE#%}"
-wait \$!
+exec "$BIN/processes/claude" "\$@"
 STUB
 chmod +x "$BIN/claude"
 
@@ -111,6 +108,7 @@ SETSID_LINE='runner=setsid reason=probe-failed detail=Failed to connect to bus: 
 ROW_ENV=()
 ROW_LAUNCH=""
 run_oversee() {
+  fixture_succession_handoff "$FLEET_STATE" "$TMP_ROOT/work/tmp/handoffs/OVERSEER-HANDOFF.md" || exit 1
   local bin="$OVERSEE"
   [[ "$1" == -- ]] || { bin="$1"; shift; }
   shift
@@ -588,9 +586,11 @@ resume_watch_control() { # NAME CASE FILE FROM TO
 }
 echo "=== oversee resume: the fleet watch ==="
 for RESUME_CASE in live released; do resume_watch_row "$RESUME_CASE"; done
-resume_watch_control unguarded live oversee '      hand_over_watch ;;' '      [[ "$COMMAND" == resume ]] || hand_over_watch ;;'
+resume_watch_control unguarded live lib/controller-session.py \
+  $'                if record.get("external"):\n                    watch_receipt = self.backend("watch",' \
+  $'                if record.get("external") and not launch.get("resume"):\n                    watch_receipt = self.backend("watch",'
 resume_watch_control deferred live lib/watch-handover.sh '  if (( closed )); then' '  if false; then'
-resume_watch_control unclosed released oversee '  [[ "$COMMAND" != resume ]] || closed=(--closed)' '  :'
+resume_watch_control unclosed released lib/session-backend.sh '    [[ "${9:-}" != closed ]] || closed=(--closed)' '    :'
 
 # The new server can hand the lost pane's id to the resumed pane itself. The
 # watch claiming it was started by an earlier succession, so its record names

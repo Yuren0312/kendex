@@ -1,87 +1,8 @@
 # shellcheck shell=bash
 #
-# The steps every overseer launch takes, whoever asks for one: `oversee
-# launch` opening a fleet's first overseer, and `oversee-succeed` opening a
-# successor in a predecessor's place. One launcher, so a first launch and a
-# succession cannot come to open, verify or record a session differently.
-# What differs between them is policy and stays with the caller: which marks
-# fire and which entries the account walk tries; the walk and the flag
-# assembly apply that policy the same way for both. `oversee-watch` sources
-# it too, through lib/watch-overseer-record.sh, for OL_JQ_DEFS, ol_preference,
-# ol_session_inspect and ol_fleet_log. What is shared is here:
-#
-#   ol_preference          the ORCH_OVERSEER_PREFERENCE value, its default
-#                          where the setting is unset
-#   ol_preference_entries  the shared overseer and lane preference parse
-#   ol_model_class         a model word classified by kendex, a class
-#                          resolved to the model a launch runs
-#   ol_model_line          kendex's model-resolution line of the model a
-#                          launch runs, once per launch
-#   ol_account             the account a session spends, as `lanes` judges it
-#   ol_pi_model            a pi session's model, out of the sources naming it
-#   ol_entry_model         one entry's harness, model, class and effort, a
-#                          class resolved to its model
-#   ol_lanes               `lanes` through the overseer's account reader
-#   ol_pick_record         one `lanes pick --json` record, for a caller's
-#                          own counts
-#   ol_pick_lane           one `lanes pick` for one entry, with the counts a
-#                          refusal reports
-#   ol_account_id          an account directory as its comparable identity
-#   ol_walk                the account walk: the entries in order, the first
-#                          whose lane qualifies, a predecessor's own entry and
-#                          the rules a succession skips an entry on included
-#   ol_entry_permitted     whether an entry's harness takes the posture its
-#                          source allows
-#   ol_launch_flags        the flag words of the entry the walk chose, a
-#                          predecessor's words carried over as its harness
-#                          and the entry's allow
-#   ol_command_line        the harness command for a picked lane, brief
-#                          included, fresh or resuming a native session, made
-#                          trusted and put under the lane form
-#   ol_identity            the launch identity the next record write stores
-#   ol_runtime_supported   the runtime resolved and held to the one these
-#                          launchers can verify a session on
-#   ol_checkout_sync       the checkout a session opens in fast-forwarded
-#                          to its base branch's origin head, through
-#                          sync-base, before the session opens there
-#   ol_checkout_notice     a sync's refusal as the caller's keyed line, on
-#                          stderr and in the fleet log
-#   ol_session_open        the runtime's `create`, through overseer-host
-#   ol_record_*            the session record in the oversee state's
-#                          `overseer` object: read, written before the first
-#                          turn, restored when the launch is abandoned, the
-#                          pending successor written apart from it, the
-#                          current session's launch identity read back, and
-#                          a record lacking a fact its session knows healed
-#   ol_session_verify      the account read, the first working turn and the
-#                          confirming read, inside one deadline
-#   ol_session_inspect     the runtime's `inspect` of a recorded session: its
-#                          liveness, window, server and state
-#   ol_succession          one succession from the pending record to the
-#                          committing stop, the caller's words at each step
-#   ol_session_stop        the runtime's `stop`
-#   ol_session_abandon     the close-out every refusal after `create` takes:
-#                          the session stopped, the prior record put back
-#   ol_fleet_log           one `close` row about the overseer in the fleet log
-#   ol_fleet_log_notice    one keyed line of the caller's as that row
-#
-# Every function returns 0 for the answer its name promises and 1 for a
-# refusal the caller prints, with the reason in OL_REASON and its fields in
-# the OL_* variables each function documents; none of them prints a keyed
-# line of its own, save the preference deprecation warning and conversion and
-# kendex's model-resolution warning (ol_model_line), because
-# the caller owns its own refusal prefix and words: ol_checkout_notice and
-# ol_fleet_log_notice print theirs through the caller's `message`. Every
-# failed dependency leaves its stderr in DEP_ERR for the caller's keyed
-# refusal. Account reads relay notices before record parsing replaces DEP_ERR.
-#
-# Requires, of a caller that runs its functions: SCRIPT_DIR (the orch scripts
-# directory), DEP_ERR (a file), lib/lane-launch.sh sourced by the caller,
-# the github skill installed beside orch, whose
-# lib/bounded.sh ol_checkout_sync sources, and, of a caller that opens a
-# session or writes a notice to the fleet log, `message KEY FIELD=VALUE...`
-# defined, with a `checkout-unsynced` text of its own where it opens a
-# session. Sourcing it defines names and runs nothing. Sourced, never run.
+# Account preference, command construction and the controller record's shared
+# predicates. Controller launch, transfer and retirement belong to
+# controller-session. Callers keep account selection, marks and notices here.
 
 # The inspection reader carries the state owner's live-session classification.
 # shellcheck source=lane-state.sh
@@ -492,7 +413,7 @@ ol_pick_record() { # HARNESS MODEL TRIGGER [EXCLUDE_DIR] [LANE]
 # model on a provider neither pi-claude nor the Copilot pool, returns 0 with
 # OL_PICKED_DIR empty: no account can be picked or
 # refused for it, so it launches with no lane variable, and its first working
-# turn, which ol_session_verify waits for, is the one reading of its room. A pi
+# turn is the one reading of its room. A pi
 # model naming no provider names no account to pick either, and returns 4.
 OL_PICKED_DIR=""
 OL_WALKED_WALLED=0
@@ -912,6 +833,13 @@ ol_command_line() { # [--brief TEXT] [--resume ID] HARNESS HANDOFF LANE_DIR LAUN
   [[ -z "$OL_IDENTITY" || -z "$OL_MODEL_CLASS" ]] \
     || OL_IDENTITY="$(jq -c --arg class "$OL_MODEL_CLASS" '. + {class: $class}' <<<"$OL_IDENTITY" 2>"$DEP_ERR")" \
     || OL_IDENTITY=""
+  local flags_json agent_home=""
+  [[ "$harness" != pi ]] || agent_home="$(lane_adapter_pi_agent_dir)"
+  flags_json="$(jq -cn --args '$ARGS.positional' -- "$@")" || return 1
+  OL_IDENTITY="$(jq -c --arg brief "$brief" --arg handoff "$handoff" --arg line "$OL_CMD" --arg agent_home "$agent_home" --argjson flags "$flags_json" \
+    --arg resume "$resume" --arg command "$cmd" \
+    '. + {launch_spec:{brief:$brief,flags:$flags,handoff:$handoff,line:$line,agent_home:$agent_home}}
+     | if $resume != "" then .launch_spec.resume = {id:$resume,command:$command} else . end' <<<"$OL_IDENTITY" 2>"$DEP_ERR")" || return 1
 }
 
 # Read the command ol_command_line writes. Its Claude argv ends with one
@@ -982,8 +910,7 @@ ol_command_recovery() { # RECORD
 # liveness refusal.
 # `ol_unstarted($server; $session)` is a record naming that session on that
 # server with no start at all, which no current writer leaves but a record
-# written before starts were recorded, or put back whole by
-# ol_record_restore, still is. The session in that pane is the one the
+# written before starts were recorded still is. The session in that pane is the one the
 # record was written for. The lane-mail-check hook's identification and
 # lane-mail's peer reader ask it rather than read an empty start.
 # `ol_owns($server; $start; $session)` is either answer: the record is that
@@ -1047,7 +974,8 @@ ol_identity() { # HARNESS ACCOUNT HOME MODEL EFFORT CWD
 # line was built with.
 ol_record_line_identity() { # LINE
   OL_IDENTITY="$(jq -c --arg line "$1" "$OL_JQ_DEFS"'
-      def line_identity: ol_identity + (if has("class") then {class} else {} end);
+      def line_identity: ol_identity + (if has("class") then {class} else {} end)
+        + (if has("launch_spec") then {launch_spec} else {} end);
       if type == "object" and (.pending.launch_line // null) == $line then .pending | line_identity
       elif type == "object" and (.launch_line // null) == $line then line_identity
       else null | ol_identity end' <<<"${OL_PRIOR:-null}" 2>"$DEP_ERR")"
@@ -1155,43 +1083,7 @@ ol_checkout_notice() {
   ol_fleet_log_notice checkout-unsynced "cause=$OL_SYNC_CAUSE" "fix=$OL_SYNC_FIX"
 }
 
-# ol_session_open CWD NAME LINE PLACEMENT — the runtime's `create`: a session
-# named NAME with its shell in CWD running LINE under `overseer-run`, which
-# writes the harness's exit status into the session record once LINE returns
-# (ol_record_exit), placed by PLACEMENT, which is
-# `--after SESSION` for a successor in its predecessor's session or `--session
-# NAME` for a first launch into a tmux session. The checkout is synced first
-# (ol_checkout_sync), whichever launcher opens it; a sync that refuses is
-# ol_checkout_notice, and the session opens on the tree as it stands. Into
-# OL_SESSION, OL_WINDOW and OL_SERVER. Returns 1 with OL_REASON=create-failed;
-# the provider's own line is in DEP_ERR.
-#
-# OL_OPEN_OUT holds the provider's raw answer from the moment the call
-# returns, before it is parsed: a signal that lands during `create` runs its
-# trap once the call returns, and a trap that closes a session opened by a
-# call the signal interrupted reads it from there through
-# ol_session_from_out.
-OL_SESSION="" OL_WINDOW="" OL_SERVER="" OL_OPEN_OUT=""
-ol_session_open() { # CWD NAME LINE PLACEMENT_FLAG PLACEMENT_VALUE
-  OL_SESSION="" OL_WINDOW="" OL_SERVER="" OL_OPEN_OUT=""
-  ol_checkout_sync "$1" || ol_checkout_notice
-  OL_OPEN_OUT="$("$SCRIPT_DIR/overseer-host" create --cwd "$1" --name "$2" "$4" "$5" \
-    --line "$(lane_single_quote "$SCRIPT_DIR/overseer-run") $3" 2>"$DEP_ERR")" \
-    || { OL_REASON=create-failed; return 1; }
-  ol_session_from_out
-  [[ -n "$OL_SESSION" && -n "$OL_WINDOW" ]] || { OL_REASON=create-failed; return 1; }
-}
-# The three fields of a `create` answer, out of OL_OPEN_OUT.
-ol_session_from_out() {
-  local word
-  for word in $OL_OPEN_OUT; do
-    case "$word" in
-      session=*) OL_SESSION="${word#session=}" ;;
-      window=*) OL_WINDOW="${word#window=}" ;;
-      server=*) OL_SERVER="${word#server=}" ;;
-    esac
-  done
-}
+OL_SESSION="" OL_WINDOW="" OL_SERVER="" OL_DETAIL="" OL_STEP=""
 
 # ol_session_inspect SESSION [--launch] — the runtime's `inspect`, which the
 # launch's live-overseer check, the succession's read of its caller and its
@@ -1262,200 +1154,45 @@ ol_session_inspect() { # SESSION [--launch]
   [[ "$out" != *$'\n'* ]] || OL_DETAIL="${out#*$'\n'}"
 }
 
-# ol_session_stop SESSION [SUCCESSOR] — the runtime's `stop`. Returns the
-# provider's status; its words are in DEP_ERR.
-ol_session_stop() { # SESSION [SUCCESSOR]
-  local args=(--session "$1")
-  [[ -z "${2:-}" ]] || args+=(--successor "$2")
-  "$SCRIPT_DIR/overseer-host" stop "${args[@]}" >/dev/null 2>"$DEP_ERR"
-}
-
-# ol_session_abandon — the close-out every refusal after `create` takes,
-# whichever launcher refuses: the session this launch opened is stopped, read
-# off the provider's answer where a signal landed before the caller parsed
-# it, and the prior record is put back wherever ol_record_read read one,
-# whether or not ol_record_write ran: a signal that lands while its writer
-# runs is taken only once the writer returns, and the writer may have
-# committed. The put-back leaves the record as the launch found it, and an
-# empty OL_PRIOR, a state that could not be read, is never written to. Two
-# overseers never run, so this is one function and not a copy per caller.
-# DEP_ERR is left as the caller had it, holding the detail its refusal
-# relays. The provider restores the window placement when it stops the
-# abandoned insertion. Returns 0, or 1
-# where the stop or record restore failed, with OL_REASON=restore-failed and its
-# words in OL_DETAIL, for the caller to report under its own key before its
-# refusal.
-ol_session_abandon() {
-  local detail rc=0 stop_detail=""
-  detail="$(cat -- "$DEP_ERR" 2>/dev/null)" || detail=""
-  [[ -n "$OL_SESSION" ]] || ol_session_from_out
-  if [[ -n "$OL_SESSION" ]] && ! ol_session_stop "$OL_SESSION"; then
-    OL_REASON=restore-failed
-    stop_detail="$(cat -- "$DEP_ERR" 2>/dev/null)" || stop_detail=""
-    OL_DETAIL="$stop_detail"
-    rc=1
-  fi
-  if [[ -n "$OL_PRIOR" ]] && ! ol_record_restore; then
-    OL_REASON=restore-failed
-    OL_DETAIL="$(cat -- "$DEP_ERR" 2>/dev/null)" || OL_DETAIL=""
-    OL_DETAIL="${stop_detail:+$stop_detail$'\n'}$OL_DETAIL"
-    rc=1
-  fi
-  if [[ -n "$detail" ]]; then printf '%s\n' "$detail" > "$DEP_ERR"; else : > "$DEP_ERR"; fi
-  return "$rc"
-}
-
-# ol_succession PREDECESSOR CWD LINE IDENTITY PENDING LANE_VAR LANE_DIR FORM
-# WAIT_SECS — one succession, from the successor's first record write to the
-# commit point, whichever launcher runs it: `oversee launch --predecessor` and
-# `oversee-succeed` in every mode that launches (succeed, walled and dead). In
-# order:
-#   1. With PENDING `pending`, LINE and IDENTITY become the record's pending
-#      successor (ol_record_pending); `replay`, a relaunch of the line the
-#      record already holds, writes none.
-#   2. The checkout CWD lies in is fast-forwarded (ol_checkout_sync); one it
-#      refuses is the caller's `checkout-unsynced` line on stderr and in the
-#      fleet log (ol_checkout_notice), and the launch goes on. The runtime's
-#      `create` then opens LINE in CWD at the session's base index.
-#   3. The record names the successor (ol_record_write over OL_PRIOR), where
-#      the caller's ol_record_read could read one.
-#   4. The session is verified (ol_session_verify, LANE_VAR to WAIT_SECS).
-#   5. The predecessor is stopped with the successor keeping the base index: the
-#      commit point, so HUP, INT and TERM are ignored from here on, and a
-#      caller running in the predecessor's own window ends with it.
-# The step order is this function's; what a failed record write at step 1 or
-# 3 means is the caller's policy. The caller defines ol_succession_hook STEP,
-# called at each point it speaks: `pending-unrecorded` and `record-unwritten`
-# with the writer's words in DEP_ERR, where a nonzero return refuses the
-# succession before its commit point and 0 lets it go on; `opened` once
-# OL_SESSION and OL_WINDOW name the successor; and `verified` just before the
-# commit point, for its notices and whatever it arranges before its window may
-# end. Returns 0 once committed, and 1 with OL_REASON record-unwritten and
-# OL_STEP pending or write where the hook refused, create-failed at step 2,
-# ol_session_verify's reasons at step 4 and stop-failed at step 5, the
-# provider's words in DEP_ERR, any successor left for the caller's
-# ol_session_abandon.
-# A competing record returns succession-unbound without overwriting it.
-# The hook passes its acquired record as private assertion data. Its absence
-# means ordinary succession. A missing command never removes a recovery request.
+# Launch callers pass their selected command to controller-session. The model
+# recovery assertion uses the same recorded-launch predicates as every writer.
 OL_RECOVERY_RECORD=""
-OL_SUCCESSION_STAGE=""
-OL_SUCCESSION_EXPECTED=null
-OL_SUCCESSION_ORIGINAL_PENDING=null
 ol_model_recovery_check() { # REQUEST CURRENT
   OL_REASON=model-recovery-unbound
   jq -e --argjson request "$1" "$OL_JQ_DEFS"'ol_recovery_bound($request)' <<<"$2" > /dev/null 2>"$DEP_ERR" || return 1
   ol_command_recovery "$1"
 }
 
-# Every succession write compares and changes the record under the state
-# writer's lock. The watch can publish a competing successor while the hook's
-# detached request is queued. An abandoned attempt restores only its own write.
-ol_succession_write() { # pending|current|restore PAYLOAD
-  local old_hup old_int old_term signal="" status=0
-  # A signal can arrive after the atomic write commits but before its reply
-  # reaches this shell. Finish recording ownership before the caller abandons.
-  local bounded="$SCRIPT_DIR/../../github/scripts/lib/bounded.sh"
-  [[ -r "$bounded" ]] && source "$bounded" || return 1
-  old_hup="$(trap -p HUP)" || return 1
-  old_int="$(trap -p INT)" || return 1
-  old_term="$(trap -p TERM)" || return 1
-  trap 'signal=HUP' HUP
-  trap 'signal=INT' INT
-  trap 'signal=TERM' TERM
-  ol_succession_update "$@" || status=$?
-  _kendex_github_restore_trap HUP "$old_hup"
-  _kendex_github_restore_trap INT "$old_int"
-  _kendex_github_restore_trap TERM "$old_term"
-  [[ -z "$signal" ]] || kill -s "$signal" "$$"
-  return "$status"
-}
-
-ol_succession_update() { # pending|current|restore PAYLOAD
-  local reply result prior
-  OL_REASON=succession-write-failed
-  reply="$("$SCRIPT_DIR/workflow-state" update-report oversee "$OL_JQ_DEFS"'
-      if (.overseer | ol_succession_owned($expected) | not)
-        or ($operation != "restore" and $request != null and (.overseer | ol_recovery_bound($request) | not))
-      then {state:., report:{result:"unbound"}}
-      else .overseer as $prior
-        | .overseer = (if $operation == "pending" then .overseer + {pending:$payload}
-          elif $operation == "current" then $payload
-          elif $operation == "restore" and $stage == "pending" then
-            .overseer | if $original_pending == null then del(.pending) else .pending=$original_pending end
-          elif $operation == "restore" then $payload
-          else error("succession-operation-invalid") end)
-        | {state:., report:{result:"written",prior:$prior,current:.overseer}}
-      end' --arg operation "$1" --arg stage "$OL_SUCCESSION_STAGE" \
-    --argjson expected "$OL_SUCCESSION_EXPECTED" --argjson request "${OL_RECOVERY_RECORD:-null}" \
-    --argjson payload "$2" --argjson original_pending "$OL_SUCCESSION_ORIGINAL_PENDING" \
-    2>"$DEP_ERR")" || return 1
-  result="$(jq -r .result <<<"$reply" 2>"$DEP_ERR")" || return 1
-  if [[ "$result" == unbound ]]; then OL_REASON=succession-unbound; return 2; fi
-  [[ "$result" == written ]] || return 1
-  if [[ "$1" == pending ]]; then
-    OL_PRIOR="$(jq -c .prior <<<"$reply" 2>"$DEP_ERR")" || return 1
-    OL_SUCCESSION_ORIGINAL_PENDING="$(jq -c '.pending // null' <<<"$OL_PRIOR" 2>"$DEP_ERR")" || return 1
-  elif [[ "$1" == current ]]; then
-    # Preserve a check acquired after pending was written. Remove only this
-    # attempt's pending command from the snapshot a refusal can restore.
-    prior="$(jq -c --argjson pending "$OL_SUCCESSION_ORIGINAL_PENDING" '
-      .prior | if $pending == null then del(.pending) else .pending=$pending end' <<<"$reply" 2>"$DEP_ERR")" || return 1
-    OL_PRIOR="$prior"
-  fi
-  OL_SUCCESSION_EXPECTED="$(jq -c .current <<<"$reply" 2>"$DEP_ERR")" || return 1
-  OL_SUCCESSION_STAGE="$1"
-  [[ "$1" != restore ]] || OL_SUCCESSION_STAGE=restored
-}
-
+# Policy stays with the callers. The controller owner acquires a waiting runner,
+# retires the exact predecessor and waits for native identity and brief receipt.
 ol_succession() { # PREDECESSOR CWD LINE IDENTITY PENDING LANE_VAR LANE_DIR FORM WAIT_SECS
-  local predecessor="$1" cwd="$2" line="$3" identity="$4" pending="$5"
-  local write_rc=0
-  shift 5
-  OL_SUCCESSION_STAGE=unwritten
-  OL_SUCCESSION_EXPECTED="${OL_PRIOR:-null}"
-  OL_SUCCESSION_ORIGINAL_PENDING="$(jq -c '.pending // null' <<<"$OL_SUCCESSION_EXPECTED" 2>"$DEP_ERR")" || return 1
-  if [[ "$pending" == pending ]]; then
-    ol_record_pending "$line" "$identity" || write_rc=$?
-    if (( write_rc != 0 )); then
-      OL_STEP=pending
-      (( write_rc != 2 )) && [[ -z "$OL_RECOVERY_RECORD" ]] || return 1
-      ol_succession_hook pending-unrecorded || { OL_REASON=record-unwritten; return 1; }
-    fi
-  fi
-  ol_session_open "$cwd" overseer "$line" --after "$predecessor" || return 1
-  ol_succession_hook opened
-  write_rc=0
-  if [[ -n "$OL_PRIOR" ]]; then
-    ol_record_write "$OL_RUNTIME" "$OL_SESSION" "$OL_WINDOW" "$OL_SERVER" "$identity" "$line" || write_rc=$?
-    if (( write_rc != 0 )); then
-      OL_STEP=write
-      (( write_rc != 2 )) && [[ -z "$OL_RECOVERY_RECORD" ]] || return 1
-      ol_succession_hook record-unwritten || { OL_REASON=record-unwritten; return 1; }
-    fi
-  fi
-  ol_session_verify "$OL_SESSION" "$@" || return 1
-  ol_succession_hook verified
-  trap '' HUP TERM INT
-  ol_session_stop "$predecessor" "$OL_SESSION" || { OL_REASON=stop-failed; return 1; }
+  local predecessor="$1" cwd="$2" line="$3" identity="$4" wait="$9"
+  ol_controller_launch "$cwd" "$line" "$identity" "$predecessor" "" "$wait"
 }
 
-# ---------------------------------------------------------------------------
-# The session record: the `overseer` object of the oversee state
-# (../schemas/workflow-state.md), which names the runtime, the server, the
-# session and a generation, written before the session's first turn. The
-# turn-end hook, the watch and `oversee launch` read it to know which session
-# is the overseer, so during a succession it is what tells the predecessor and
-# the successor apart, and a launch that is abandoned puts the predecessor's
-# record back.
-#
-# The same object carries the current session's launch identity: its harness,
-# account, home, model, effort and working directory. Its `pending` member is
-# the successor a succession is about to open, written before that launch and
-# never read as the current session's identity: a pending command names the
-# account and model the NEXT session will run, and judging this one against
-# them would hand the running overseer another session's marks.
-# ---------------------------------------------------------------------------
+ol_controller_launch() { # CWD LINE IDENTITY PREDECESSOR SESSION WAIT_SECS
+  local out record fields receipt_lines field receipt=()
+  ol_checkout_sync "$1" || ol_checkout_notice
+  out="$("$SCRIPT_DIR/controller-session" launch --home "$1" --line "$2" --identity "$3" \
+    --predecessor "$4" --session-name "$5" --handoff "${HANDOFF:-}" --wait-secs "$6" \
+    --expected "${OL_PRIOR:-null}" --recovery "${OL_RECOVERY_RECORD:-null}" 2>"$DEP_ERR")" || {
+      OL_REASON=controller-launch-failed
+      printf '%s\n' "$out" >>"$DEP_ERR"
+      return 1
+    }
+  ol_record_get record || { OL_REASON=record-unwritten; return 1; }
+  fields="$(jq -er '[.pane,.window,.server,.generation] | @tsv' <<<"$record" 2>"$DEP_ERR")" || return 1
+  IFS=$'\t' read -r OL_SESSION OL_WINDOW OL_SERVER OL_GENERATION <<<"$fields"
+  ol_succession_hook opened || return 1
+  receipt_lines="$(jq -r '.lifecycle.watch_receipt // [] | .[]' <<<"$record" 2>"$DEP_ERR")" || return 1
+  if [[ -n "$receipt_lines" ]]; then
+    while IFS= read -r field; do receipt+=("$field"); done <<<"$receipt_lines"
+    message "${receipt[0]}" "${receipt[@]:1}"
+  fi
+}
+
+# The active controller and request phases share the overseer object.
+# controller-session owns publication; native hooks bind that published identity.
 
 # ol_fleet_log NOTICE_FILE RECORD_FILE ERR_FILE [STATE_CMD...] — one `close`
 # row about the overseer in the fleet log: the text in NOTICE_FILE, the record
@@ -1530,9 +1267,9 @@ ol_record_get() { # [OUT_VAR]
 # `generation`: one more than
 # the prior record's, or 1 where none was recorded, and the prior's own where
 # the prior names this very session on this server, which is a registration
-# repeated and never a second session. Every write clears the native
-# `session_id` binding, so a register after a resume lets its next hook bind
-# the new id. On tmux the session is the pane, and
+# repeated and never a second session. Repeated registration keeps the native
+# `session_id` bound to this same controller. A different controller inherits
+# no native binding. On tmux the session is the pane, and
 # the object keeps `pane` as the spelling the turn-end hook and the watch
 # already read it under, and `session_rows` names the file that pane's own
 # event rows land in (lib/session-rows.sh), under the overseer mailbox of the
@@ -1582,38 +1319,15 @@ ol_record_write() { # RUNTIME SESSION WINDOW SERVER IDENTITY [LINE]
             then {pane: $session, session_rows: $rows, server_start: ($start | tonumber)} + {server_socket: $socket}
             else {session: $session} end)
          + (if $line == "" then {} else {launch_line: $line} end)) as $fresh
-      | (if $same then $p | del(.pending, .exit, .session_id) else $identity | map_values(null) end) as $base
+      | (if $same then $p | del(.pending, .exit) else ($identity | map_values(null))
+          + (if $p.lifecycle != null then {lifecycle:($p.lifecycle | {v,home,generation,app_off,boot,state:"stopped",reason:"stopped",detail:"",terminal:null})} else {} end) end) as $base
       | {record: ($base + $fresh),
          retained: ($base | nonempty | with_entries(select(.key as $key | $fresh | has($key) | not)) | field_names),
          fresh: ($fresh | field_names)}' 2>"$DEP_ERR")" || return 1
   record="$(jq -c '.record' <<<"$result" 2>"$DEP_ERR")" || return 1
   fields="$(jq -r '[.record.generation, .retained, .fresh] | @tsv' <<<"$result" 2>"$DEP_ERR")" || return 1
-  if [[ -n "$OL_SUCCESSION_STAGE" ]]; then
-    ol_succession_write current "$record" || return $?
-  else
-    "$SCRIPT_DIR/workflow-state" set oversee overseer "$record" >/dev/null 2>"$DEP_ERR" || return 1
-  fi
+  "$SCRIPT_DIR/controller-session" register --home "${cwd:-$PWD}" --record "$record" >/dev/null 2>"$DEP_ERR" || return 1
   IFS=$'\t' read -r OL_GENERATION OL_RECORD_RETAINED OL_RECORD_FRESH <<<"$fields"
-}
-
-# ol_record_pending LINE IDENTITY — the successor a succession is about to
-# open, written as the record's `pending` member before its window opens: LINE
-# and its launch identity object. The current session's own fields
-# are left as they are, so the account and model the running overseer is
-# judged on stay its own until ol_record_write names the successor. A
-# dead-overseer relaunch replays this LINE ahead of the current one, since a
-# death between this write and that one leaves the command the succession
-# chose as the last one the fleet decided on. Returns 1 with the writer's
-# words in DEP_ERR.
-ol_record_pending() { # LINE IDENTITY
-  local record
-  record="$(jq -cn --argjson identity "$2" --arg line "$1" '$identity + {launch_line: $line}' 2>"$DEP_ERR")" \
-    || return 1
-  if [[ -n "$OL_SUCCESSION_STAGE" ]]; then
-    ol_succession_write pending "$record"
-  else
-    "$SCRIPT_DIR/workflow-state" set oversee overseer.pending "$record" >/dev/null 2>"$DEP_ERR"
-  fi
 }
 
 # ol_record_current SERVER PANE — the launch identity the record holds for the
@@ -1738,167 +1452,10 @@ ol_caller_known() { # SERVER PANE DIR
   return "$rc"
 }
 
-# ol_record_restore — OL_PRIOR written back whole, for an abandoned launch:
-# the predecessor keeps running, so the record has to name it again, its own
-# launch line included. A prior of null removes the object. Returns 1 with
-# the writer's words in DEP_ERR.
-ol_record_restore() {
-  if [[ "$OL_SUCCESSION_STAGE" == unwritten || "$OL_SUCCESSION_STAGE" == restored ]]; then
-    return 0
-  elif [[ -n "$OL_SUCCESSION_STAGE" ]]; then
-    ol_succession_write restore "${OL_PRIOR:-null}"
-  elif [[ "${OL_PRIOR:-null}" == null ]]; then
-    "$SCRIPT_DIR/workflow-state" update oversee 'del(.overseer)' >/dev/null 2>"$DEP_ERR"
-  else
-    "$SCRIPT_DIR/workflow-state" set oversee overseer "$OL_PRIOR" >/dev/null 2>"$DEP_ERR"
-  fi
-}
-
-# ---------------------------------------------------------------------------
-# Verification: the account the session is REALLY on, asked TWICE, and only
-# the second answers.
-#
-# /proc/<pid>/environ is a snapshot taken at execve, so it shows what a process
-# was handed, never what a process has since decided. A wrapper that sets the
-# account and only then execs the harness carries the value it was given for as
-# long as it runs, and a reading taken while it runs is a reading about the
-# wrapper. Waiting for that value to settle does not fix this: it settles
-# perfectly well on the pre-exec value.
-#
-# So the FIRST read is an early abort and nothing else. It can prove a
-# disagreement that is already true, and proving one there is worth doing,
-# because it comes before the session has had a turn in which to open a
-# work-item window or write to the tracker on an account nobody picked. It
-# cannot prove agreement, so it reports none.
-#
-# The SECOND read, taken once the session has shown a running turn, is the one
-# that speaks and the one a predecessor is stopped on. A running turn is the
-# harness itself; whatever exec was going to happen has happened.
-#
-# What is still not caught: a wrapper that execs onto another account AFTER the
-# session reported a running turn and after this read settled. Nothing local
-# can rule that out, since no reading proves a future exec.
-#
-# One deadline covers all three waits, and ol_budget_raw is that deadline:
-# every wait asks it rather than subtracting for itself, so the rule is the
-# function and not a sentence three call sites have to keep agreeing with.
-# ---------------------------------------------------------------------------
-
-OL_STARTED=0
-OL_WAIT_SECS=0
-# The budget, computed in ONE place off the clock: seconds left of the wait,
-# zero or negative once it is spent.
-ol_budget_raw() {
-  printf '%s\n' "$(( OL_STARTED + OL_WAIT_SECS - $(date +%s) ))"
-}
-# The same budget as a BOUND for one account read: a share of it when a
-# divisor is given, and never below the least a read can settle in.
-#
-# That floor is the one overrun this deadline allows, and it is deliberate. A
-# predecessor is stopped on the deciding read, and a read handed nothing
-# cannot catch the handover it exists for, it can only report that the pane
-# was changing hands, which is not what happened. So the promise is `the wait
-# plus at most one settle`, never `the wait and a read that could not look`.
-ol_budget_bound() { # [DIVISOR]
-  local left
-  left="$(ol_budget_raw)"
-  left=$(( left / ${1:-1} ))
-  (( left >= LANE_SETTLE_MIN_SECS )) || left="$LANE_SETTLE_MIN_SECS"
-  printf '%s\n' "$left"
-}
-# Seconds since the launch, for the refusals that report how long this run
-# waited. Off the same clock ol_budget_raw decides on, so the figure an
-# operator reads cannot drift from the deadline that produced it.
-ol_waited() { printf '%s\n' "$(( $(date +%s) - OL_STARTED ))"; }
-
 # ol_account_measured ACCOUNT_HARNESS — whether an OL_ACCOUNT_HARNESS answer
 # names an account `lanes` measures: a harness lane_pick_harness answered,
 # never `none`, `unknown` or the empty answer for a launch nothing judges. The
 # one reading of that answer, so no caller keeps a harness list of its own.
 ol_account_measured() { # ACCOUNT_HARNESS
   case "${1:-}" in '' | none | unknown) return 1 ;; esac
-}
-# ol_account_verdict SESSION LANE_VAR LANE_DIR FORM BOUND final|early — one
-# account read and its verdict: 0 where the session may keep running, 1 with
-# OL_REASON=wrong-lane and the account seen in OL_OBSERVED, or
-# OL_REASON=result-unknown with the verdict in OL_RESULT. Only the final read
-# reports an unobserved account, in OL_UNOBSERVED: an early one has nothing
-# settled to say.
-OL_OBSERVED="" OL_RESULT="" OL_UNOBSERVED=""
-ol_account_verdict() { # SESSION LANE_VAR LANE_DIR FORM BOUND final|early
-  lane_account_check "$1" "$2" "$3" "$4" "$5" || true
-  OL_RESULT="$LANE_ACCOUNT_RESULT"
-  case "$LANE_ACCOUNT_RESULT" in
-    mismatch) OL_REASON=wrong-lane; OL_OBSERVED="$LANE_ACCOUNT_OBSERVED"; return 1 ;;
-    skipped|verified) ;;
-    unobserved:*) [[ "$6" != final ]] || OL_UNOBSERVED="${LANE_ACCOUNT_RESULT#unobserved:}" ;;
-    # Defensive, as open-terminal's twin is: no shipped lane_account_check
-    # emits a fourth verdict, so nothing can drive this arm. It exists so a
-    # new one closes the session rather than falling through as a pass.
-    *) OL_REASON=result-unknown; return 1 ;;
-  esac
-}
-
-# ol_session_verify SESSION LANE_VAR LANE_DIR FORM WAIT_SECS — the early
-# account read, the wait for the session's first working turn through the
-# runtime's `inspect --launch`, and the deciding read, all inside WAIT_SECS.
-# A SessionStart row is no evidence here: the harness writes it at startup,
-# before its first turn runs, so it proves the process started and nothing
-# about a turn.
-# 0 once the session is working on the picked account. 1 with OL_REASON:
-#   wrong-lane      the session runs another account (OL_OBSERVED)
-#   result-unknown  an account verdict this library does not know (OL_RESULT)
-#   dialog          a dialog nobody is there to answer holds the harness; the
-#                   line under the keyed one is in DEP_ERR for the caller's
-#                   refusal to relay, and in OL_DETAIL, OL_WAITED the seconds
-#                   waited
-#   not-working     no working turn inside the wait; the last screen is in
-#                   DEP_ERR and OL_DETAIL the same way, OL_WAITED the seconds
-#                   waited
-#   inspect-failed  the runtime could not read the session; its words are in
-#                   DEP_ERR, the step in OL_STEP
-# OL_UNOBSERVED carries the deciding read's unobserved reason, empty where it
-# observed or skipped, for the notice a caller prints.
-OL_DETAIL="" OL_WAITED="" OL_STEP=""
-ol_session_verify() { # SESSION LANE_VAR LANE_DIR FORM WAIT_SECS
-  local session="$1" lane_var="$2" lane_dir="$3" form="$4"
-  OL_WAIT_SECS="$5"
-  OL_DETAIL="" OL_WAITED="" OL_STEP="" OL_UNOBSERVED=""
-  OL_STARTED="$(date +%s)"
-  # Half the budget to the early read, so the running-turn wait keeps a share.
-  # An unobservable launch sleeps to its whole cap before it answers, and with
-  # the whole budget that would leave the loop one probe to see a running turn.
-  ol_account_verdict "$session" "$lane_var" "$lane_dir" "$form" "$(ol_budget_bound 2)" early || return 1
-  # The session is up once the runtime reads a turn in flight. `inspect
-  # --launch` is the first-turn reading, over the whole screen: the settled
-  # judge's higher rungs answer this question wrong, since a first-run dialog
-  # or an option list the brief itself prints reads as asking, and the wait
-  # would burn the budget on a session that had in fact launched.
-  while :; do
-    ol_session_inspect "$session" --launch || { OL_STEP=inspect; return 1; }
-    case "$OL_INSPECT_STATE" in
-      working) break ;;
-      asking)
-        OL_REASON=dialog; OL_WAITED="$(ol_waited)"
-        printf '%s\n' "$OL_DETAIL" > "$DEP_ERR"
-        return 1 ;;
-      idle) ;;
-      *)
-        printf '%s\n' "$OL_INSPECT_LINE" > "$DEP_ERR"
-        OL_REASON=inspect-failed; OL_STEP="state"
-        return 1 ;;
-    esac
-    # The clock decides, and there is no counter to decide otherwise: a loop
-    # counting its own seconds from zero would start a second deadline here,
-    # and the deciding read below would reach it with nothing left.
-    if (( $(ol_budget_raw) <= 0 )); then
-      OL_REASON=not-working; OL_WAITED="$(ol_waited)"
-      printf '%s\n' "$OL_DETAIL" > "$DEP_ERR"
-      return 1
-    fi
-    sleep 1
-  done
-  # The session is running a turn, so the harness is up and this reading is
-  # about it rather than about whatever came up first.
-  ol_account_verdict "$session" "$lane_var" "$lane_dir" "$form" "$(ol_budget_bound)" final
 }

@@ -109,6 +109,7 @@ Route `<command> [args]` to its workflow and follow [Workflow Execution](#workfl
 | Script | Intent |
 |--------|--------|
 | `workflow-state` | Persistent state read/write/append. See below |
+| `controller-session` | Controller lifecycle and registration; Jarvis delegates here. Record/retirement: [overseer-host.md](schemas/overseer-host.md#the-session-record) |
 | `git-context` | Git-derived values (branch, head, issue id, roots, timestamps) |
 | `pr-view-json` | PR view JSON; `status=no_pr` exits 0 and routes to PR creation, not an error |
 | `resolve-base-branch` | Print a worktree's base branch; exits 1 rather than guess |
@@ -159,7 +160,7 @@ Every script takes `--help` bar `pr-view-json` and `resolve-base-branch`, whose 
 
 Requires kendex 1.20.0 or newer for managed Claude model overrides.
 
-Non-secret settings go in committed `kendex.settings.toml` under `[env]`; `.env.local` holds secrets and personal overrides. Keys: [README.md](README.md) § Setup; review-gate keys in [references/gates.md](references/gates.md); lane keys in `lanes --help` and `open-terminal --help`. Dependencies: `jq`; `bash` 3.2; `python3` 3.8+: Claude GUI, SSH, configured archives; `flock` and `setsid` (util-linux); `timeout` or `gtimeout` (coreutils) for `dev-validate-run`, and `perl` for its `--attached`. Optional: `systemd-run` with a user manager, which the orch job runner's jobs are contained in; a launch with no `--cap` (the fleet watch, the waiters and the succession's helper) also needs it to linger (`loginctl enable-linger`) ([references/job-units.md](references/job-units.md)); `setsid` stays the fallback elsewhere.
+Non-secret settings go in committed `kendex.settings.toml` under `[env]`; `.env.local` holds secrets and personal overrides. Keys: [README.md](README.md) § Setup; review-gate keys in [references/gates.md](references/gates.md); lane keys in `lanes --help` and `open-terminal --help`. Dependencies: `jq`; `bash` 3.2; `python3` 3.8+: controller lifecycle, Claude GUI, SSH, configured archives; `flock` and `setsid` (util-linux); `timeout` or `gtimeout` (coreutils) for `dev-validate-run`, and `perl` for its `--attached`. Optional: `systemd-run` with a user manager, which the orch job runner's jobs are contained in; a launch with no `--cap` (the fleet watch, the waiters and the succession's helper) also needs it to linger (`loginctl enable-linger`) ([references/job-units.md](references/job-units.md)); `setsid` stays the fallback elsewhere.
 
 ---
 

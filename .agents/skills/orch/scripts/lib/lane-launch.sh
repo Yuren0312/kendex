@@ -74,8 +74,10 @@ lane_env_prefix() { # HARNESS DIR [MODEL]
 # the caller that a kickoff turn runs before the brief. The explicit Pi account
 # is its agent directory, rather than a Claude seat selected for pi-claude.
 LANE_SESSION_KICKOFF='Jarvis Start: your Start brief is the next message. Reply only Waiting, and take no action until it arrives.'
-lane_session_command() { # HARNESS NATIVE_ID RESUME_FILE
-  local harness="$1" id="$2" file="$3" kickoff="" compaction
+lane_session_command() { # HARNESS NATIVE_ID RESUME_FILE [NAME [FLAG...]]
+  local harness="$1" id="$2" file="$3" name="${4-jarvis}" kickoff="" flags="" flag compaction
+  if [[ $# -ge 4 ]]; then shift 4; else shift 3; fi
+  for flag in "$@"; do flags+=" $(printf %q "$flag")"; done
   case "$harness" in codex | copilot) kickoff="$(lane_single_quote "$LANE_SESSION_KICKOFF")" ;; esac
   LANE_SESSION_PROMPTED=false
   [[ -z "$kickoff" ]] || LANE_SESSION_PROMPTED=true
@@ -86,22 +88,24 @@ lane_session_command() { # HARNESS NATIVE_ID RESUME_FILE
   case "$harness" in
     (claude)
       compaction="$(launch_choice_compaction claude "")" || return 1
-      printf 'claude %q -n jarvis' "$compaction"
+      printf 'claude %q -n %q' "$compaction" "$name"
       if [[ -n "$file" ]]; then printf ' --resume %q' "$id"
-      else printf ' --session-id %q' "$id"; fi ;;
+      else printf ' --session-id %q' "$id"; fi
+      printf '%s' "$flags" ;;
     (codex)
       launch_choice_lead_settings codex || return 1
-      printf 'codex'
+      printf 'codex%s' "$flags"
       printf ' %q' "${LAUNCH_CHOICE_KEPT[@]}"
       [[ -z "$file" ]] || printf ' resume %q' "$id"
       printf ' %s' "$kickoff" ;;
     (copilot)
       if [[ -n "$file" ]]; then printf 'copilot --resume=%q' "$id"
       else printf 'copilot --session-id=%q' "$id"; fi
-      printf ' -i %s' "$kickoff" ;;
+      printf '%s -i %s' "$flags" "$kickoff" ;;
     (pi)
       if [[ -n "$file" ]]; then printf 'pi --session %q' "$file"
-      else printf 'pi --session-id %q' "$id"; fi ;;
+      else printf 'pi --session-id %q' "$id"; fi
+      printf '%s' "$flags" ;;
     (*) return 2 ;;
   esac
   printf '\n'

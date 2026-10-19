@@ -71,13 +71,32 @@ def validate(output, code, verb, duplicate_boot=False):
     return answer
 
 
+class LifecycleRecord(type(Path())):
+    """Existing session assertions read the lifecycle held by workflow-state."""
+    def read_text(self, *args, **kwargs):
+        text = super().read_text(*args, **kwargs)
+        if self.name not in ("workflow-state-oversee.json", "jarvis-session.json"):
+            return text
+        value = json.loads(text)
+        return json.dumps(value["overseer"]["lifecycle"]) if "overseer" in value else text
+
+    def write_text(self, text, *args, **kwargs):
+        if self.name not in ("workflow-state-oversee.json", "jarvis-session.json"):
+            return super().write_text(text, *args, **kwargs)
+        state = json.loads(super().read_text()) if self.exists() else {}
+        if "v" in state:
+            return super().write_text(text, *args, **kwargs)
+        state.setdefault("overseer", {})["lifecycle"] = json.loads(text)
+        return super().write_text(json.dumps(state), *args, **kwargs)
+
+
 class BootReceiptScenario:
     # The specified receipt producer owns applicability for its contract rows
     # and every mutation of that scenario.
     applicable = Path("/proc/sys/kernel/random/boot_id").is_file()
     controls = (
-        ("boot receipt", "jarvis/scripts/lib/session.py", 'if boot and record and record.get("boot") == boot:', 'if False:', "test_off_and_boot_receipt"),
-        ("boot refusal receipt", "jarvis/scripts/lib/session.py", 'if boot:\n                    record["boot"] = boot\n                if args.origin == "app-on":', 'if False:\n                    record["boot"] = boot\n                if args.origin == "app-on":', "test_off_and_boot_receipt"),
+        ("boot receipt", "orch/scripts/lib/controller-session.py", 'if boot and record and record.get("boot") == boot:', 'if False:', "test_off_and_boot_receipt"),
+        ("boot refusal receipt", "orch/scripts/lib/controller-session.py", 'if boot:\n                    record["boot"] = boot\n                if args.origin == "app-on":', 'if False:\n                    record["boot"] = boot\n                if args.origin == "app-on":', "test_off_and_boot_receipt"),
     )
 
 
@@ -105,8 +124,12 @@ class SessionContract(unittest.TestCase):
                                  "XDG_STATE_HOME": str(self.root / "state"), "XDG_SESSION_ID": "fixture-login",
                                  "WAYLAND_DISPLAY": "fixture-wayland", "DISPLAY": ":fixture",
                                  "JARVIS_TEST_BASH": os.environ["JARVIS_TEST_BASH"]}
+        for key in ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "ORCH_STATE_DIR"):
+            self.env.pop(key, None)
         key = hashlib.sha256(os.fsencode(str(self.home))).hexdigest()
-        self.record = self.root / "state/kendex/jarvis" / key / "jarvis-session.json"
+        shared = (SKILLS / "orch/scripts/lib/controller-session.py").exists()
+        self.record = LifecycleRecord(self.home / "tmp/workflow-state-oversee.json" if shared else
+            self.root / "state/kendex/jarvis" / key / "jarvis-session.json")
         self.label = "jarvis-" + key[:32]
 
     def tearDown(self):
@@ -149,7 +172,7 @@ class SessionContract(unittest.TestCase):
             with patch.dict(os.environ, self.env | {"JARVIS_BASH": self.env["JARVIS_TEST_BASH"]}, clear=True), \
                     patch.object(sys, "argv", argv), patch.object(subprocess, "Popen", observe_child), \
                     redirect_stdout(output), redirect_stderr(errors):
-                runtime = runpy.run_path(str(SKILLS / "jarvis/scripts/lib/session.py"))
+                runtime = runpy.run_path(str(SKILLS / "orch/scripts/lib/controller-session.py"))
                 code = runtime["main"]()
             result = subprocess.CompletedProcess(argv, code, output.getvalue(), errors.getvalue())
         else:
@@ -187,6 +210,9 @@ class SessionContract(unittest.TestCase):
             log = (self.record.parent / "session.log").read_text()
         except FileNotFoundError:
             log = "session-log=absent"
+        detail = self.home / ".fixture-error"
+        if detail.exists():
+            log += detail.read_text()
         if self.rows.exists():
             stamps = [line for line in self.rows.read_text().splitlines() if "stamp" in json.loads(line)]
             log += "\n" + "\n".join(stamps)
@@ -198,7 +224,11 @@ class SessionContract(unittest.TestCase):
             if self.rows.exists() and len(self.started()) >= count:
                 return
             time.sleep(0.05)
-        self.fail("the native fixture did not acknowledge its launch")
+        saved = json.loads(self.record.read_text())
+        terminal = saved.get("terminal") or {}
+        screen = subprocess.run(["tmux", "-S", terminal.get("server", ""), "capture-pane", "-p", "-t", terminal.get("pane", "")],
+                                env=self.env, capture_output=True, text=True, timeout=10).stdout
+        self.fail("the native fixture did not acknowledge its launch\n" + self.record.read_text() + "\n" + screen + "\n" + self.session_log())
 
     def started(self):
         return [json.loads(line) for line in self.rows.read_text().splitlines() if "argv" in json.loads(line)]
@@ -232,7 +262,7 @@ class SessionContract(unittest.TestCase):
         wrapper = self.root / "bin/tmux"
         wrapper.write_text("#!" + os.environ["JARVIS_TEST_BASH"] + "\nset -euo pipefail\n"
             + "for arg in \"$@\"; do if [[ $arg == capture-pane ]]; then until jq -e "
-            + shlex.quote('.state != "starting" or .brief_delivered != true or .pending.brief_taken == true')
+            + shlex.quote('.overseer.lifecycle | .state != "starting" or .brief_delivered != true or .pending.brief_taken == true')
             + " " + shlex.quote(str(self.record)) + " >/dev/null 2>&1; do sleep 0.05; done; fi; done\nexec "
             + shlex.quote(real) + ' "$@"\n')
         wrapper.chmod(0o755)
@@ -245,7 +275,7 @@ class SessionContract(unittest.TestCase):
         wrapper = self.root / "bin/tmux"
         wrapper.write_text("#!" + os.environ["JARVIS_TEST_BASH"] + "\nset -euo pipefail\n"
             + "for arg in \"$@\"; do if [[ $arg == capture-pane ]]; then printf 'inspect\\n' >> "
-            + shlex.quote(str(events)) + "; until jq -e " + shlex.quote(".pending.started_at != null") + " "
+            + shlex.quote(str(events)) + "; until jq -e " + shlex.quote(".overseer.lifecycle.pending.started_at != null") + " "
             + shlex.quote(str(self.record)) + " >/dev/null 2>&1 && screen=\"$(" + shlex.quote(real)
             + ' "$@")" && [[ $screen == *' + shlex.quote(drawn) + "* ]]; do sleep 0.05; done; "
             + "printf '%s\\n' \"$screen\"; exit; fi; done\nexec " + shlex.quote(real) + ' "$@"\n')
@@ -280,9 +310,8 @@ class SessionContract(unittest.TestCase):
         # Jarvis acts on the owner's desktop: its session keeps the live display.
         self.assertEqual(before["display"], ["fixture-wayland", ":fixture"])
         actual_record = Path(before["record"])
-        self.assertTrue(actual_record.is_relative_to(Path(self.env["XDG_STATE_HOME"])))
-        self.assertFalse(actual_record.is_relative_to(self.home))
-        self.assertEqual(json.loads(actual_record.read_text())["home"], str(self.home))
+        self.assertEqual(actual_record, self.home / "tmp/workflow-state-oversee.json")
+        self.assertEqual(json.loads(actual_record.read_text())["overseer"]["lifecycle"]["home"], str(self.home))
         state = self.home / "state"
         state.mkdir()
         (state / "jarvis-session.json").write_text("not a runtime record")
@@ -295,7 +324,7 @@ class SessionContract(unittest.TestCase):
                 competitor = Path(target).parent / (name + ".jsonl")
                 competitor.write_text(json.dumps(native_header(harness, name, cwd)) + "\n")
                 reader = subprocess.run([self.env["JARVIS_TEST_BASH"],
-                    str(SKILLS / "jarvis/scripts/lib/session-backend.sh"), "history", harness,
+                    str(SKILLS / "orch/scripts/lib/session-backend.sh"), "history", harness,
                     before["account"], name, str(competitor)], env=self.env, capture_output=True, text=True)
                 self.assertEqual(reader.returncode, 0, reader.stderr)
                 self.assertEqual(reader.stdout.strip(), str(competitor))
@@ -373,7 +402,7 @@ class SessionContract(unittest.TestCase):
         # A desktop with no selected app still has the lock/runtime tools.
         tool_bin = self.root / "tools"
         tool_bin.mkdir()
-        for tool in ("bash", "python3", "cat", "flock", "perl", "sleep", "ps", "tmux", "mkdir", "rmdir", "rm", "date", "stat", "sed", "awk"):
+        for tool in ("bash", "python3", "jq", "dirname", "cat", "flock", "perl", "sleep", "ps", "tmux", "mkdir", "rmdir", "rm", "date", "stat", "sed", "awk"):
             found = self.env["JARVIS_TEST_BASH"] if tool == "bash" else shutil.which(tool)
             if found:
                 (tool_bin / tool).symlink_to(found)
@@ -483,7 +512,7 @@ class SessionContract(unittest.TestCase):
                     # the process gate independently of that earlier reader.
                     env = {key: value for key, value in self.env.items()
                            if key not in ("TMUX", "TMUX_PANE", "VGSHELL_RUNNER_PID")}
-                    delivered = subprocess.run([self.env["JARVIS_TEST_BASH"], str(SKILLS / "jarvis/scripts/lib/session-backend.sh"),
+                    delivered = subprocess.run([self.env["JARVIS_TEST_BASH"], str(SKILLS / "orch/scripts/lib/session-backend.sh"),
                                                 "deliver", terminal["server"], terminal["pane"], "codex", str(brief)],
                                                env=env, cwd=self.home, capture_output=True, text=True, timeout=10)
                     self.assertEqual(delivered.returncode, 1)
@@ -804,7 +833,7 @@ class SessionContract(unittest.TestCase):
                     # the selected account, even with an unavailable reader.
                     terminal = saved["terminal"]
                     for acknowledgement in ("", str(wrong)):
-                        result = subprocess.run([self.env["JARVIS_TEST_BASH"], str(skills / "jarvis/scripts/lib/session-backend.sh"),
+                        result = subprocess.run([self.env["JARVIS_TEST_BASH"], str(skills / "orch/scripts/lib/session-backend.sh"),
                             "inspect", terminal["server"], terminal["pane"], "claude", "CLAUDE_CONFIG_DIR",
                             str(self.account), "confirmed", acknowledgement, "delivered"], capture_output=True, text=True, env=self.env, timeout=10)
                         self.assertEqual((result.returncode, result.stdout.strip()), (0, "wrong-account"))
@@ -840,6 +869,7 @@ class SessionContract(unittest.TestCase):
                     injected = []
                     def refuse_worker_ownership(source, destination):
                         data = json.loads(Path(source).read_text())
+                        data = data.get("overseer", {}).get("lifecycle", data)
                         if data.get("worker") and not injected:
                             injected.append(True)
                             raise OSError("fixture worker write refused")
@@ -864,6 +894,7 @@ class SessionContract(unittest.TestCase):
                     injected = []
                     def refuse_first_ownership(source, destination):
                         data = json.loads(Path(source).read_text())
+                        data = data.get("overseer", {}).get("lifecycle", data)
                         if data.get("terminal") and not injected:
                             injected.append(True)
                             raise OSError(errno.EIO, "fixture ownership write refused")
@@ -888,7 +919,7 @@ class SessionContract(unittest.TestCase):
                     # CI reads these structured fields. Capture intentional
                     # failures so its log exposes only unexpected failures.
                     with patch.dict(os.environ, self.env | {"JARVIS_BASH": self.env["JARVIS_TEST_BASH"]}, clear=True), redirect_stderr(errors):
-                        runtime = runpy.run_path(str(SKILLS / "jarvis/scripts/lib/session.py"))
+                        runtime = runpy.run_path(str(SKILLS / "orch/scripts/lib/controller-session.py"))
                         if failure == "brief-write":
                             with patch.object(Path, "open", refuse_brief), self.assertRaises(OSError):
                                 runtime["Session"](self.home).worker("start", request["generation"])
@@ -1058,8 +1089,8 @@ class SessionContract(unittest.TestCase):
                 jq = shutil.which("jq")
                 wrapper = self.root / "bin/jq"
                 wrapper.write_text("#!/usr/bin/env python3\nimport sys, subprocess\nfrom pathlib import Path\n"
-                    + "data=sys.stdin.read()\nack=Path(" + repr(str(acknowledgement)) + ")\n"
-                    + "if 'hold-preparation' in data and not ack.exists():\n ack.write_text('ready\\n')\n"
+                    + "data=None if sys.stdin.isatty() else sys.stdin.read()\nack=Path(" + repr(str(acknowledgement)) + ")\n"
+                    + "if 'hold-preparation' in (data or '') and not ack.exists():\n ack.write_text('ready\\n')\n"
                     + " with Path(" + repr(str(gate)) + ").open() as stream: stream.read(1)\n"
                     + "result=subprocess.run([" + repr(jq) + ", *sys.argv[1:]], input=data, text=True, capture_output=True)\n"
                     + "sys.stdout.write(result.stdout)\nsys.stderr.write(result.stderr)\nsys.exit(result.returncode)\n")

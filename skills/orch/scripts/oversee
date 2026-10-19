@@ -86,53 +86,15 @@
 #        preference that names two harnesses is never handed one harness's
 #        spelling for the other. The launch is made trusted for --cwd
 #        first, refusing `launch-trust-missing` where the entry cannot be made.
-#     6. Open the session through the adapter's `create`, at its base index,
-#        also with --predecessor, once the command and its identity are written as the
-#        record's `pending` successor (a write that fails refuses
-#        `record-unwritten step=pending` with nothing opened) and the --cwd
-#        checkout is fast-forwarded to its base branch's origin head through
-#        `sync-base` (lib/overseer-launch.sh § ol_checkout_sync), inside
-#        ORCH_OVERSEER_SYNC_TIMEOUT_S seconds. A checkout that is dirty,
-#        diverged, off its base branch, not synced inside that bound or
-#        otherwise refused is the notice `checkout-unsynced cause=<key>
-#        path=<checkout> fix=<what clears it>` on stderr and, its path left
-#        out, in the fleet log, and the session opens on the tree as it
-#        stands. With --predecessor the predecessor still runs in that
-#        checkout: a succession abandoned after the sync leaves it on the
-#        fast-forwarded tree, and this launcher calls the moved helpers for
-#        the rest of its run. Then print
-#        `overseer-launch` naming the form, lane, session and window, and
-#        write the session record before the first turn: runtime tmux, the
-#        server, the pane, its window, the launch identity (harness, account,
-#        home, model, effort and directory, as the command built in step 5
-#        carries them), the launch line and generation 1, or one past the
-#        record a stopped fleet left. A record
-#        that cannot be written closes the session and refuses
-#        `record-unwritten`, with --predecessor before the predecessor is
-#        stopped: an overseer nothing records is one the hooks and the watch
-#        cannot tell from any other session, and a live-overseer check that
-#        read the stopped predecessor's record would open a second overseer
-#        beside it.
-#     7. Verify the session inside --wait-secs, as a succession does: read its
-#        account, wait for a running turn through `inspect --launch`, read the
-#        account again. `overseer-wrong-lane`, `overseer-dialog` and
-#        `overseer-not-working` each close the session, put the record back
-#        and refuse. `overseer-lane-unobserved` is a notice: the launch stands.
-#     8. With --predecessor, stop the predecessor through the adapter with
-#        the successor named: on tmux the successor stays at the base index
-#        and the predecessor's window closes. That is the commit
-#        point, so HUP, INT and TERM are ignored across it; a stop that fails
-#        closes the successor, puts the record back and refuses
-#        `close-failed`, the predecessor still running. Run from inside the
-#        predecessor's own window, the stop ends this command with it.
-#     9. Ensure the fleet repeat watch runs through the orch job runner,
-#        serving the new pane. With no watch claim, start one and wait for
-#        its claim. With a live watch, arrange its handover before step 8,
-#        because the stop can end this command. A start or helper launch
-#        the runner refuses closes the new pane and restores the prior
-#        record. Its job-unit line states the cause. The shared owner is
-#        lib/watch-handover.sh; references/watch-delivery.md gives the
-#        session's log reader and stop route.
+#     6. Sync the checkout through sync-base, retaining its notice policy.
+#        The controller owner saves the handoff and acquires a waiting runner.
+#        It confirms predecessor retirement before releasing native startup.
+#        Native identity, selected account, kickoff completion where required,
+#        and the brief receipt precede publication of the active controller.
+#        Before-retirement failure retains the predecessor. A later failure
+#        remains recoverable without restoring a retired controller.
+#     7. The owner hands the watch to the successor through
+#        lib/watch-handover.sh. It survives closure of the predecessor's pane.
 #     On success `overseer-launched` names the session, window, generation
 #     and lane, and the predecessor where one was stopped, at exit 0.
 #   register writes the session record for the session this command runs in,
@@ -373,14 +335,6 @@ source "$SCRIPT_DIR/lib/overseer-launch.sh"
 # shellcheck source=lib/tmux-server.sh
 source "$SCRIPT_DIR/lib/tmux-server.sh"
 
-# The watch handover a succession arranges, `oversee-succeed`'s own.
-# shellcheck source=lib/watch-pid.sh
-source "$SCRIPT_DIR/lib/watch-pid.sh"
-# shellcheck source=lib/job-unit.sh
-source "$SCRIPT_DIR/lib/job-unit.sh"
-# shellcheck source=lib/watch-handover.sh
-source "$SCRIPT_DIR/lib/watch-handover.sh"
-
 # The runtime, held to tmux by the library both launchers share: this
 # launcher reads the new session's account off its pane.
 if ! ol_runtime_supported; then
@@ -611,7 +565,7 @@ if [[ "$COMMAND" == register ]]; then register; fi
 # and CWD the directory the session started in.
 RESUME_LINE="" RESUME_ID=""
 resume_line() {
-  local fields generation account model effort recorded_cwd line words
+  local fields generation account model effort recorded_cwd line words resume_spec
   fields="$(jq -r '[.generation, .session_id, .harness, .account, .model, .effort, .cwd, .class]
     | map(. // "" | tostring) | join("\u001f")' <<<"$OL_PRIOR" 2>"$DEP_ERR")" || die state-unwritable field=overseer
   IFS=$'\x1f' read -r generation RESUME_ID OL_HARNESS account model effort recorded_cwd OL_MODEL_CLASS <<<"$fields"
@@ -643,11 +597,16 @@ resume_line() {
     die launch-trust-missing "lane=$lane_dir" "dir=$CWD" "reason=$OL_TRUST_REASON"
   fi
   RESUME_LINE="$OL_CMD"
+  resume_spec="$(jq -c '.launch_spec.resume' <<<"$OL_IDENTITY" 2>"$DEP_ERR")" \
+    || die state-unwritable field=overseer
   # The record's launch line is the fresh command for the same identity: a
   # successor or a dead-pane relaunch replaying it never resumes a session
   # that has since ended or handed over.
   ol_command_line "$OL_HARNESS" "$HANDOFF" "$lane_dir" "$CWD" ${OL_FLAGS[@]+"${OL_FLAGS[@]}"} \
     || die launch-trust-missing "lane=$lane_dir" "dir=$CWD" "reason=$OL_TRUST_REASON"
+  OL_IDENTITY="$(jq -c --argjson resume "$resume_spec" \
+    '.launch_spec.resume = $resume' <<<"$OL_IDENTITY" 2>"$DEP_ERR")" \
+    || die state-unwritable field=overseer
 }
 
 QUESTION_OFF=()
@@ -689,99 +648,27 @@ else
     || die launch-trust-missing "lane=$lane_dir" "dir=$CWD" "reason=$OL_TRUST_REASON"
 fi
 
-# Every failure from here closes the session and puts the record back: the
-# close-out is the library's ol_session_abandon, the words are this script's.
-abandon() {
-  ol_session_abandon || { message record-unwritten field=overseer step=restore >&2; [[ -z "$OL_DETAIL" ]] || printf '%s\n' "$OL_DETAIL" >&2; }
-  die "$@"
-}
-# A signal that lands during the runtime's create runs its trap once the call
-# returns; ol_session_abandon inside abandon reads the session off the
-# provider's answer and closes it, so it is named here only where create had
-# already returned it.
-interrupted() { # SIGNAL
-  abandon interrupted "session=${OL_SESSION:-none}" "signal=$1"
-}
+# The shared worker owns cleanup and records whether retirement completed.
+# A caller interruption leaves its persisted request available for status/recovery.
+interrupted() { die interrupted "session=${OL_SESSION:-none}" "signal=$1"; }
 trap 'interrupted TERM' TERM
 trap 'interrupted INT' INT
 trap 'interrupted HUP' HUP
-
-# This script's words at each step of a launch: the ones
-# lib/overseer-launch.sh's ol_succession asks for, which the first launch
-# below says at the same points of its own steps. A record write that fails
-# refuses the succession before its commit point, as it refuses a first
-# launch.
-ol_succession_hook() { # STEP
-  case "$1" in
-    pending-unrecorded | record-unwritten) return 1 ;;
-    opened)
-      SESSION="$OL_SESSION"
-      message overseer-launch "form=$OL_FORM" "lane=$lane_dir" "trust=$OL_TRUST_ROUTE" \
-        "session=$SESSION" "window=$OL_WINDOW" "server=$SERVER_SOCKET" ;;
-    verified)
-      [[ -z "$OL_UNOBSERVED" ]] || message overseer-lane-unobserved "reason=$OL_UNOBSERVED" >&2
-      hand_over_watch ;;
-  esac
-}
-# Step 9 of the header: lib/watch-handover.sh's watch_handover, the one
-# `oversee-succeed` runs, in this script's words. The restarted watch reads
-# the successor's pane only under a $TMUX (`oversee-watch` § check_overseer),
-# which a launch from outside tmux has none of: the helper is then handed the
-# one tmux sets in the successor's own pane. A resumed session succeeds one
-# its server closed: a watch still claiming the lost pane is stopped and
-# replayed from the new pane before this returns, keeping its log cursor.
-hand_over_watch() {
-  local tmux_env="${TMUX:-}" closed=()
-  [[ "$COMMAND" != resume ]] || closed=(--closed)
-  if [[ -z "$tmux_env" ]] \
-     && ! tmux_env="$(tmux display-message -p -t "$SESSION" '#{socket_path},#{pid},#{session_id}' 2>"$DEP_ERR")"; then
-    abandon watch-restart-failed step=tmux "session=$SESSION"
-  fi
-  if TMUX="${tmux_env/,\$/,}" watch_handover ${closed[@]+"${closed[@]}"} "$PREDECESSOR" "$SESSION" "$OL_LANE_VAR" "$OL_LAUNCH_HOME" \
-      "$OL_HARNESS" ${OL_FLAGS[@]+"${OL_FLAGS[@]}"}; then
-    message "$WATCH_HANDOVER_KEY" "${WATCH_HANDOVER_FIELDS[@]}"
-  else
-    abandon "$WATCH_HANDOVER_KEY" "${WATCH_HANDOVER_FIELDS[@]}"
-  fi
-}
-# ol_session_verify's refusals, each closing the session and putting the
-# record back.
-refuse_unverified() {
-  case "$OL_REASON" in
-    wrong-lane) abandon overseer-wrong-lane "picked=$lane_dir" "observed=$OL_OBSERVED" ;;
-    result-unknown) abandon overseer-lane-unknown "result=$OL_RESULT" ;;
-    dialog) abandon overseer-dialog "session=$SESSION" "waited=$OL_WAITED" ;;
-    not-working) abandon overseer-not-working "session=$SESSION" "waited=$OL_WAITED" ;;
-    inspect-failed) abandon launch-failed "step=$OL_STEP" ;;
-    *) abandon launch-failed step=verify "reason=$OL_REASON" ;;
-  esac
+ol_succession_hook() {
+  SESSION="$OL_SESSION"
+  message overseer-launch "form=$OL_FORM" "lane=$lane_dir" "trust=$OL_TRUST_ROUTE" \
+    "session=$SESSION" "window=$OL_WINDOW" "server=$SERVER_SOCKET"
 }
 
 SESSION=""
 if [[ -n "$PREDECESSOR" ]]; then
-  # A succession is lib/overseer-launch.sh's ol_succession, the one
-  # `oversee-succeed` runs: the pending record, the session opened at the base
-  # index, the record, the verification and the predecessor's stop,
-  # the commit point.
-  if ! ol_succession "$PREDECESSOR" "$CWD" "$OL_CMD" "$OL_IDENTITY" pending \
-      "$OL_LANE_VAR" "$lane_dir" "$OL_FORM" "$WAIT_SECS"; then
-    case "$OL_REASON" in
-      record-unwritten) abandon record-unwritten field=overseer "step=$OL_STEP" ;;
-      create-failed) abandon launch-failed "step=$OL_REASON" ;;
-      stop-failed) abandon close-failed "predecessor=$PREDECESSOR" ;;
-      *) refuse_unverified ;;
-    esac
-  fi
+  ol_succession "$PREDECESSOR" "$CWD" "$OL_CMD" "$OL_IDENTITY" pending \
+    "$OL_LANE_VAR" "$lane_dir" "$OL_FORM" "$WAIT_SECS" \
+    || die launch-failed "step=$OL_REASON"
 else
-  # A first launch or a resume opens at the base index, and a record it
-  # cannot write closes it again: nothing else would tell it from any other
-  # session.
-  ol_session_open "$CWD" overseer "${RESUME_LINE:-$OL_CMD}" --session "$SESSION_NAME" || abandon launch-failed "step=$OL_REASON"
-  ol_succession_hook opened
-  ol_record_write "$OL_RUNTIME" "$SESSION" "$OL_WINDOW" "$OL_SERVER" "$OL_IDENTITY" "$OL_CMD" \
-    || abandon record-unwritten field=overseer step=write
-  ol_session_verify "$SESSION" "$OL_LANE_VAR" "$lane_dir" "$OL_FORM" "$WAIT_SECS" || refuse_unverified
-  ol_succession_hook verified
+  ol_controller_launch "$CWD" "$OL_CMD" "$OL_IDENTITY" "" "$SESSION_NAME" "$WAIT_SECS" \
+    || die launch-failed "step=$OL_REASON"
+
 fi
 trap - HUP TERM INT
 if [[ "$COMMAND" == resume ]]; then

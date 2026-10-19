@@ -40,7 +40,7 @@ ACCOUNT="$TMP_ROOT/account"
 TRANSCRIPT="$ACCOUNT/projects/jarvis/s1.jsonl"
 mkdir -p "${TRANSCRIPT%/*}"
 STATE="$TMP_ROOT/state"
-RECORD=$(env JARVIS_BASH="$BASH" XDG_STATE_HOME="$STATE" python3 - "$REPO_ROOT/skills/jarvis/scripts/lib/session.py" "$LANE" <<'PY'
+RECORD=$(env JARVIS_BASH="$BASH" XDG_STATE_HOME="$STATE" python3 - "$REPO_ROOT/skills/orch/scripts/lib/controller-session.py" "$LANE" <<'PY'
 import runpy
 import sys
 print(runpy.run_path(sys.argv[1])["Session"](sys.argv[2]).path)
@@ -52,7 +52,7 @@ jq -nc --arg home "$LANE" --arg account "$ACCOUNT" --arg socket "$JARVIS_SOCKET"
   '{v:1,home:$home,harness:"claude",account:$account,effective_home:$account,
     state:"running",reason:"new-requested",generation:3,server_pid:$server,server_started_at:$start,
     terminal:{server:$socket,session:"jarvis",window:$window,pane:$pane},
-    pending:{generation:3,native_session_id:"s1",started_at:1}}' > "$RECORD"
+    pending:{generation:3,native_session_id:"s1",started_at:1}}' > "$RECORD.seed"
 
 # Read the environment Claude supplies to hooks from the actual managed
 # launch, with neither compaction setting inherited from the test runner.
@@ -88,13 +88,25 @@ jarvis_mark() { # TOKENS ACTIVE [SESSION] [AGENT]
       + (if $agent == "" then {} else {agent_id:$agent} end)')"
 }
 
-cp "$RECORD" "$RECORD.seed"
-
 # The gate's cases share the same live controller identity. SDK usage comes
 # from session.usage_info. Jarvis Control-host events registers the same
 # native session as overseer, so that overlap must retain the overseer path.
 while IFS='|' read -r shape label tokens active session agent expected key; do
-  cp "$RECORD.seed" "$RECORD"
+  env JARVIS_BASH="$BASH" XDG_STATE_HOME="$STATE" python3 - \
+    "$REPO_ROOT/skills/orch/scripts/lib/controller-session.py" "$LANE" "$RECORD.seed" "$shape" <<'PYTHON'
+import json
+import runpy
+import sys
+session = runpy.run_path(sys.argv[1])["Session"](sys.argv[2])
+with open(sys.argv[3]) as stream:
+    record = json.load(stream)
+record["registered"] = sys.argv[4] == "registered"
+if sys.argv[4].startswith("copilot"):
+    record["harness"] = "copilot"
+with session.locked():
+    session.write(record)
+PYTHON
+  cp "$RECORD" "$TMP_ROOT/controller-before.json"
   CONTEXT_PCT_ENV=ORCH_HANDOFF_CONTEXT_PCT=90
   TRANSCRIPT="$ACCOUNT/projects/jarvis/s1.jsonl"
   install_hook "$HOOK" "$LANE/.claude/hooks/lane-mail-check.sh"
@@ -110,7 +122,6 @@ while IFS='|' read -r shape label tokens active session agent expected key; do
       ;;
     transcript) TRANSCRIPT="$ACCOUNT/projects/missing/s1.jsonl" ;;
     copilot*)
-      jq '.harness="copilot"' "$RECORD.seed" > "$RECORD"
       install_hook "$HOOK" "$LANE/.github/hooks/lane-mail-check.sh"
       TRANSCRIPT="$ACCOUNT/session-state/s1/events.jsonl"
       mkdir -p "${TRANSCRIPT%/*}"
@@ -134,8 +145,8 @@ while IFS='|' read -r shape label tokens active session agent expected key; do
       run_payload "$(jq -nc --arg p "$TRANSCRIPT" '{sessionId:"s1",timestamp:1,transcriptPath:$p}')" "COPILOT_HOME=$ACCOUNT"
       ;;
     registered)
-      assert_eq "$([ -e "$LANE/tmp" ] && echo written || echo absent)" absent \
-        'the plain Jarvis role creates no mailbox, fleet or context state in its home'
+      assert_eq "$(jq -r '.overseer.lifecycle.registered' "$RECORD")" true \
+        'the registered row uses the existing shared lifecycle fact'
       git -C "$LANE" init -q
       git -C "$LANE" config gc.auto 0
       git -C "$LANE" config maintenance.auto false
@@ -144,9 +155,6 @@ while IFS='|' read -r shape label tokens active session agent expected key; do
       hole_install oversee-succeed
       plant_judge "$LANE/.agents/skills/orch/scripts"
       judge_says "$BELOW_MARK_LINE"
-      (cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" init oversee >/dev/null)
-      record_overseer "$JARVIS_PANE" "$JARVIS_SERVER" "$ACCOUNT" "$JARVIS_START"
-      bind_overseer claude "$ACCOUNT" s1
       CALL_ENV+=("ORCH_WAKE_PROCESS=^jarvis-fixture-wake$" "ORCH_WAKE_START=fixture-wake")
       ;;
   esac
@@ -182,6 +190,10 @@ while IFS='|' read -r shape label tokens active session agent expected key; do
       fi
       ;;
   esac
+  if [ "$shape" = plain ]; then
+    assert_eq "$(cmp -s "$RECORD" "$TMP_ROOT/controller-before.json" && echo unchanged || echo changed)" unchanged \
+      "$label: the mark does not mutate shared controller state"
+  fi
   case "$shape" in
     absent | copilot-absent) mv "$RECORD.saved" "$RECORD" ;;
     script | setting)
@@ -221,6 +233,13 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
   assert_eq "$control_rc" 1 'control rejects the missing Jarvis identification'
   assert_eq "$(grep -Fxc '  FAIL  past the percentage mark' "$TMP_ROOT/control.log" || :)" 1 \
     'control reaches the succession assertion'
+
+  mutant jarvis-registration-ignored -e 's/\[ "$JARVIS_REGISTERED" != true \]/[ true ]/'
+  control_rc=0
+  HOOK_UNDER_TEST="$MUTANT_PATH" "$BASH" "${BASH_SOURCE[0]}" > "$TMP_ROOT/registered-control.log" 2>&1 || control_rc=$?
+  assert_eq "$control_rc" 1 'control rejects the ignored registered lifecycle fact'
+  assert_eq "$(grep -Fxc '  FAIL  a managed registered overseer retains its wake refusal' "$TMP_ROOT/registered-control.log" || :)" 1 \
+    'control reaches the registered overseer wake assertion'
 fi
 
 printf 'pass: %d   fail: %d\n' "$PASS" "$FAIL"

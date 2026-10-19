@@ -9,7 +9,9 @@ import select
 import sys
 import shutil
 import tempfile
+import threading
 import time
+import traceback
 
 # Native errors and turn markers exercised by orch/tests/lane-state-auth.sh.
 AUTH_MESSAGES = {
@@ -69,7 +71,7 @@ def await_inspections(events, count):
 
 def brief_taken(fixture, harness, identity, event, **fields):
     # The native hook's stamp, written by its real library at the default wait.
-    shell = 'source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/orch/scripts/lib/lane-context.sh"; source "$1/orch/scripts/lib/session-rows.sh"; key="$(tmux display-message -p "#{pid} #{pane_id}")"; session_rows_jarvis_taken "$JARVIS_RECORD" "$JARVIS_GENERATION" "$key" "$2" "$3"'
+    shell = 'source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/orch/scripts/lib/lane-context.sh"; source "$1/orch/scripts/lib/session-rows.sh"; key="$(tmux display-message -p -t "$TMUX_PANE" "#{pid} #{pane_id}")"; session_rows_jarvis_taken "$JARVIS_RECORD" "$JARVIS_GENERATION" "$key" "$2" "$3"'
     result = subprocess.run([fixture["bash"], "-c", shell, "fixture", fixture["skills"], harness, event],
                             input=json.dumps({"session_id": identity, **fields}), text=True, capture_output=True)
     with Path(fixture["rows"]).open("a") as stream:
@@ -111,16 +113,39 @@ def native_header(harness, identity, cwd):
     return {"type": "session", "id": identity, "cwd": cwd}
 
 
+def observe_retirement(fixture, identity):
+    if fixture.get("retiring"):
+        predecessor = fixture["retiring"]
+        backend = Path(fixture["skills"]) / "orch/scripts/lib/session-backend.sh"
+        if not backend.exists():
+            backend = Path(fixture["skills"]) / "jarvis/scripts/lib/session-backend.sh"
+        probe = subprocess.run([fixture["bash"], str(backend), "worker-live", str(predecessor["pid"]), predecessor["started_at"]], capture_output=True)
+        ended = probe.returncode == 1
+        with Path(fixture["rows"]).open("a") as stream:
+            stream.write(json.dumps({"predecessor_ended": ended, "id": identity}) + "\n")
+        assert ended, "predecessor-ended=false"
+
+
 def main():
     fixture = json.loads(Path(".fixture.json").read_text())
+    if fixture.get("idle_marker"):
+        fixture["idle"] = Path(fixture["idle_marker"]).exists()
     harness = fixture.get("harness", os.environ["JARVIS_TEST_HARNESS"])
     args = sys.argv[1:]
     # Jarvis's Codex command carries this boolean once. The real CLI refuses
     # duplicate boolean flags before it can publish its native identity.
     if harness == "codex":
         assert args.count("--dangerously-bypass-hook-trust") <= 1
+    if "JARVIS_RECORD" not in os.environ:
+        # The pre-change orch command starts its brief directly, without the
+        # later native binding handshake. Main controls exercise that command.
+        observe_retirement(fixture, "unbound-native")
+        print("Working to interrupt", flush=True)
+        sys.stdin.read()
+        return
     record_path = Path(os.environ["JARVIS_RECORD"])
-    record = json.loads(record_path.read_text())
+    owner = json.loads(record_path.read_text())
+    record = owner.get("overseer", {}).get("lifecycle", owner)
     identity = record["pending"].get("native_session_id")
     if harness == "codex":
         identity = args[args.index("resume") + 1] if "resume" in args else "codex-native-" + os.environ["JARVIS_GENERATION"]
@@ -136,6 +161,7 @@ def main():
             assert args[args.index("--resume") + 1] == identity
         else:
             raise AssertionError("the native identity flag is absent")
+    observe_retirement(fixture, identity)
     account_var = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME", "copilot": "COPILOT_HOME", "pi": "PI_CODING_AGENT_DIR"}[harness]
     account = Path(os.environ[account_var])
     rows = Path(fixture["rows"])
@@ -143,6 +169,17 @@ def main():
         stream.write(json.dumps({"harness": harness, "id": identity, "argv": args, "cwd": os.getcwd(),
                                  "account": str(account), "record": str(record_path), "pid": os.getpid(),
                                  "display": [os.environ.get("WAYLAND_DISPLAY"), os.environ.get("DISPLAY")]}) + "\n")
+    if fixture.get("process_markers"):
+        folder = Path(fixture["process_markers"])
+        pane = os.environ["TMUX_PANE"].removeprefix("%")
+        (folder / pane).write_text(str(os.getpid()))
+
+        def draw_wall():
+            while not (folder / ("wall-" + pane)).exists():
+                time.sleep(0.05)
+            print("You've hit your limit", flush=True)
+
+        threading.Thread(target=draw_wall, daemon=True).start()
     history = fixture.get("history")
     if history == "pending":
         print(TRUST_HISTORY[history], flush=True)
@@ -182,11 +219,15 @@ def main():
             print("Working to interrupt", flush=True)
             await_inspections(Path(barrier), 2)
     assert not select.select([sys.stdin], [], [], 0)[0], "a prompt preceded SessionStart"
-    payload = {"session_id": identity}
+    payload = {"session_id": identity, "cwd": os.getcwd(), "source": "startup",
+               "model": "pi-claude/claude-fable-5-1" if harness == "pi" else "fixture-native"}
     if harness != "copilot":
         payload["transcript_path"] = str(file)
-    shell = 'source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/orch/scripts/lib/lane-context.sh"; source "$1/orch/scripts/lib/session-rows.sh"; SESSION_ROWS_WAIT=10; key="$(tmux display-message -p "#{pid} #{pane_id}")"; session_rows_jarvis_write "$JARVIS_RECORD" "$JARVIS_GENERATION" "$key" "$2"'
+    shell = 'source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/orch/scripts/lib/lane-context.sh"; source "$1/orch/scripts/lib/session-rows.sh"; SESSION_ROWS_WAIT=10; key="$(tmux display-message -p -t "$TMUX_PANE" "#{pid} #{pane_id}")"; session_rows_jarvis_write "$JARVIS_RECORD" "$JARVIS_GENERATION" "$key" "$2"'
     subprocess.run([fixture["bash"], "-c", shell, "fixture", fixture["skills"], harness],
+                   input=json.dumps(payload), text=True, check=True)
+    rows_shell = 'source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/mailbox/scripts/lib/mailbox-append.sh"; source "$1/orch/scripts/lib/lane-state.sh"; source "$1/orch/scripts/lib/lane-context.sh"; source "$1/orch/scripts/lib/session-rows.sh"; session_rows_write "$PWD" "$2" SessionStart'
+    subprocess.run([fixture["bash"], "-c", rows_shell, "fixture", fixture["skills"], harness],
                    input=json.dumps(payload), text=True, check=True)
     if barrier:
         # The kickoff turn still runs after its stamp and draws only its
@@ -232,6 +273,7 @@ def main():
             brief_taken(fixture, harness, identity, fixture["auth_event"])
     elif auth_mode == "stale":
         print(AUTH_MESSAGES[harness] + "\nesc to interrupt", flush=True)
+        brief_taken(fixture, harness, identity, "PreToolUse")
     elif harness == "pi" and fixture.get("turn") == "text-only":
         print("Ready.\n" + PI_IDLE, flush=True)
         brief_taken(fixture, harness, identity, "Stop", pi_run_outcome=fixture["outcome"])
@@ -254,6 +296,7 @@ def main():
         brief_taken(fixture, harness, identity, "Stop")
     else:
         print("Working to interrupt", flush=True)
+        brief_taken(fixture, harness, identity, "PreToolUse")
     if deferred and auth_mode != "current" and fixture.get("turn") != "text-only":
         if barrier:
             # A working pane after a kickoff turn is no proof of the brief:
@@ -265,4 +308,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["--run-script"]:
+        with native_launcher() as launcher:
+            result = subprocess.run(sys.argv[2:], env=os.environ | {"ORCH_TEST_NATIVE": str(launcher)})
+        sys.exit(result.returncode)
+    try:
+        main()
+    except BaseException:
+        Path(".fixture-error").write_text(traceback.format_exc())
+        raise
