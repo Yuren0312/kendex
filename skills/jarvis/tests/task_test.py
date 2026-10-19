@@ -215,6 +215,79 @@ class TaskContract(unittest.TestCase):
             self.assertEqual(self.call("cleanup", "--id", record["id"]), cleaned)
         windows = self.tmux("list-windows", "-t", "=jarvis", "-F", "#{window_id}").stdout.splitlines()
         self.assertEqual(windows, [self.terminal["window"]])
+        original = self.record_path.read_bytes()
+        controller = json.loads(self.record_path.read_text())
+        for mode in ("native-ended", "unconfirmed", "retained", "fleet-only", "fleet-with-jarvis"):
+            with self.subTest(controller=mode):
+                world = json.loads(original)
+                parent = world["overseer"]["lifecycle"]
+                waiting = None
+                renamed = False
+                foreign = None
+                try:
+                    if mode == "native-ended":
+                        parent["native_exit"] = {"status": 0}
+                    elif mode == "unconfirmed":
+                        parent["pending"].pop("native_session_id")
+                        world["overseer"].pop("session_id", None)
+                    elif mode == "retained":
+                        waiting = ["tmux", "-L", self.label + "-waiting", "-f", os.devnull]
+                        created = subprocess.run([*waiting, "new-session", "-d", "-s", "waiting", "-P", "-F",
+                            "#{socket_path}\t#{pid}\t#{start_time}\t#{window_id}\t#{pane_id}",
+                            self.env["JARVIS_TEST_BASH"], "--noprofile", "--norc"],
+                            env=self.env, capture_output=True, text=True, timeout=10, check=True)
+                        socket, server, started, window, pane = created.stdout.strip().split("\t")
+                        subprocess.run([*waiting, "set-option", "-p", "-t", pane, "@jarvis-generation", "2"],
+                            env=self.env, capture_output=True, timeout=10, check=True)
+                        world["overseer"]["lifecycle"] = dict(parent, generation=2, intent="launch",
+                            state="starting", reason="launching", predecessor=parent,
+                            transfer={"phase": "waiting"}, pending={"generation": 2},
+                            terminal={"server": socket, "session": "waiting", "window": window, "pane": pane},
+                            server_pid=int(server), server_started_at=int(started))
+                    else:
+                        self.tmux("rename-session", "-t", "=jarvis", "fleet")
+                        renamed = True
+                        parent["terminal"]["session"] = "fleet"
+                        world["overseer"]["tmux_session"] = "fleet"
+                        if mode == "fleet-with-jarvis":
+                            foreign = self.tmux("new-session", "-d", "-s", "jarvis", "-P", "-F", "#{window_id}",
+                                self.env["JARVIS_TEST_BASH"], "--noprofile", "--norc").stdout.strip()
+                    Path(self.record_path).write_text(json.dumps(world))
+                    before = self.record_path.read_bytes()
+                    if mode in ("native-ended", "unconfirmed"):
+                        windows = self.tmux("list-windows", "-a", "-F", "#{window_id}").stdout
+                        tasks = sorted(self.task_root.glob("*.json"))
+                        scratch = sorted((self.home / "tmp/scratch").iterdir())
+                        acknowledgements = sorted(self.home.glob("ack-*.json"))
+                        refused = self.launch("codex", mode, model="gpt-5", success=False)
+                        self.assertIn("refused=session-not-running", refused.stderr)
+                        self.assertEqual(self.tmux("list-windows", "-a", "-F", "#{window_id}").stdout, windows)
+                        self.assertEqual(sorted(self.task_root.glob("*.json")), tasks)
+                        self.assertEqual(sorted((self.home / "tmp/scratch").iterdir()), scratch)
+                        self.assertEqual(sorted(self.home.glob("ack-*.json")), acknowledgements)
+                    else:
+                        task = self.launch("codex", mode, model="gpt-5")
+                        self.acknowledgement(task)
+                        expected_session = "jarvis" if mode == "retained" else "fleet"
+                        self.assertEqual(task["terminal"]["server"], controller["terminal"]["server"])
+                        self.assertEqual(task["terminal"]["session"], expected_session)
+                        self.assertEqual((task["server_pid"], task["server_started_at"]),
+                                         (controller["server_pid"], controller["server_started_at"]))
+                        self.assertEqual(self.tmux("display-message", "-p", "-t", task["terminal"]["pane"],
+                                                   "#{session_name}").stdout.strip(), expected_session)
+                        if foreign:
+                            self.assertEqual(self.tmux("list-windows", "-t", "=jarvis", "-F", "#{window_id}").stdout.splitlines(), [foreign])
+                        self.call("complete", "--id", task["id"], "--outcome", "failed")
+                        self.call("cleanup", "--id", task["id"])
+                    self.assertEqual(self.record_path.read_bytes(), before)
+                finally:
+                    if foreign:
+                        self.tmux("kill-session", "-t", "=jarvis")
+                    if renamed:
+                        self.tmux("rename-session", "-t", "=fleet", "jarvis")
+                    if waiting:
+                        subprocess.run([*waiting, "kill-server"], env=self.env, capture_output=True, timeout=10)
+                    Path(self.record_path).write_bytes(original)
 
     def test_failed_pick_releases_task_scratch(self):
         self.home.joinpath("refuse-pick").touch()
@@ -328,7 +401,7 @@ sys.exit(task.main())
             self.bin.joinpath("claude").chmod(0o755)
             shutil.copyfile(Path(__file__).with_name("fixtures") / "harness.py", self.home / ".fixture-harness.py")
             (self.home / ".fixture.json").write_text(json.dumps({"rows": str(self.root / "rows.jsonl"),
-                "gate": str(self.root / "gate"), "bash": self.env["JARVIS_TEST_BASH"], "skills": str(self.skills)}))
+                "gate": str(self.root / "gate"), "bash": self.env["JARVIS_TEST_BASH"], "skills": str(self.skills), "home": str(self.home)}))
             session = self.skills / "jarvis/scripts/jarvis-session"
             for recovery in ("start", "stop"):
                 with self.subTest(recovery=recovery):
@@ -382,13 +455,12 @@ sys.exit(task.main())
             ("close-refused", False, {}, refuse_close),
         )
         start = ("--harness", "claude", "--account", str(self.account), "--mode", "new", "--origin", "manual")
-        self.record_path.write_text(json.dumps(dict(json.loads(self.record_path.read_text()), pending={"generation": 1})))
         with native_launcher() as launcher:
             shutil.copyfile(launcher, self.bin / "claude")
             self.bin.joinpath("claude").chmod(0o755)
             shutil.copyfile(Path(__file__).with_name("fixtures") / "harness.py", self.home / ".fixture-harness.py")
             (self.home / ".fixture.json").write_text(json.dumps({"rows": str(self.root / "rows.jsonl"),
-                "gate": str(self.root / "gate"), "bash": self.env["JARVIS_TEST_BASH"], "skills": str(self.skills)}))
+                "gate": str(self.root / "gate"), "bash": self.env["JARVIS_TEST_BASH"], "skills": str(self.skills), "home": str(self.home)}))
             for name, ended, identity, wrapper in rows:
                 with self.subTest(record=name):
                     task = self.launch("codex", name, model="gpt-5")
@@ -476,7 +548,7 @@ sys.exit(task.main())
         with native_launcher() as launcher:
             shutil.copyfile(Path(__file__).with_name("fixtures") / "harness.py", self.home / ".fixture-harness.py")
             (self.home / ".fixture.json").write_text(json.dumps({"rows": str(self.root / "rows.jsonl"),
-                "gate": str(self.root / "gate"), "bash": self.env["JARVIS_TEST_BASH"], "skills": str(self.skills)}))
+                "gate": str(self.root / "gate"), "bash": self.env["JARVIS_TEST_BASH"], "skills": str(self.skills), "home": str(self.home)}))
 
             def install(name, contents):
                 # Replace, never rewrite: a running process may execute it.
@@ -633,6 +705,16 @@ while True: signal.pause()
 
     def test_regression_controls(self):
         rows = (
+            ("controller-verdict", "task.py", (('answer = parent.answer(controller)',
+                'answer = {"state": controller["state"], "terminal": parent.terminal(controller)}'),
+                ('controller = parent.controller(controller)',
+                 'controller = controller if True else parent.controller(controller)')),
+             "test_launch_contract"),
+            ("controller-session", "task.py", (('"=" + terminal["session"]', '"=jarvis"'),),
+             "test_launch_contract"),
+            ("selected-controller", "task.py", (('controller = parent.controller(controller)',
+                'controller = controller if True else parent.controller(controller)'),),
+             "test_launch_contract"),
             ("controller-init", "task.py", (('self.controller = Session(home)',
                 'self.controller = Session(home)\n        self.controller.backend("state-init")'),),
              "test_tasks_never_write_or_initialize_controller"),
@@ -715,4 +797,4 @@ while True: signal.pause()
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2, failfast=len(sys.argv) == 1)

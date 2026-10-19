@@ -47,6 +47,8 @@ def launch_prompt(harness, args):
     # after its options and its resume id: `codex [resume ID] [PROMPT]`.
     if harness == "copilot":
         return args[args.index("-i") + 1] if "-i" in args else None
+    if harness == "claude":
+        return args[-1] if "--resume" in args and args.index("--resume") + 2 < len(args) else None
     words, skip = [], False
     for arg in args:
         if skip:
@@ -197,9 +199,20 @@ def main():
         sys.stdin.read()
         return
     record_path = Path(os.environ["JARVIS_RECORD"])
-    runtime = runpy.run_path(str(session_backend(fixture["skills"]).with_name("controller-session.py")))
-    session = runtime["Session"](os.getcwd())
+    backend = session_backend(fixture["skills"])
+    shared = backend.parent == Path(fixture["skills"]) / "orch/scripts/lib"
+    os.environ["JARVIS_BASH"] = fixture["bash"]
+    if shared:
+        os.environ["ORCH_STATE_DIR"] = str(record_path.parent)
+    # Select the tested revision once. A reader failure never falls back.
+    runtime = runpy.run_path(str(backend.with_name("controller-session.py" if shared else "session.py")))
+    session = runtime["Session"](fixture["home"])
+    assert session.path.resolve() == record_path.resolve(), "the production reader selected another controller record"
     record = session.read()
+    submitted = None
+    if (record.get("launch") or {}).get("resume") and record.get("brief_delivered"):
+        submitted = launch_prompt(harness, args)
+        assert submitted == record["launch"]["brief"], "the native resume prompt differs from its delivered brief"
     identity = record["pending"].get("native_session_id")
     if harness == "codex":
         identity = args[args.index("resume") + 1] if "resume" in args else "codex-native-" + os.environ["JARVIS_GENERATION"]
@@ -278,7 +291,7 @@ def main():
     if harness != "copilot":
         payload["transcript_path"] = str(file)
     rows_shell = 'source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/mailbox/scripts/lib/mailbox-append.sh"; source "$1/orch/scripts/lib/lane-state.sh"; source "$1/orch/scripts/lib/lane-context.sh"; source "$1/orch/scripts/lib/session-rows.sh"; session_rows_write "$PWD" "$2" SessionStart'
-    if "overseer" not in owner:
+    if not shared:
         # Main controls exercise the former standalone record through its
         # native carrier; candidate launches always exercise the shared hook.
         rows_shell = 'source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/orch/scripts/lib/lane-context.sh"; source "$1/orch/scripts/lib/session-rows.sh"; key="$(tmux display-message -p -t "$TMUX_PANE" "#{pid} #{pane_id}")"; session_rows_jarvis_write "$JARVIS_RECORD" "$JARVIS_GENERATION" "$key" "$2"'
@@ -300,7 +313,7 @@ def main():
         # Hold its prompt marker so automatic delivery cannot race that probe.
         with gate.open() as stream:
             stream.read(1)
-    if deferred:
+    if deferred and submitted is None:
         # The kickoff turn ends: its native turn-end hook stamps the record.
         brief_taken(fixture, harness, identity, "Stop")
     auth_mode = fixture.get("auth_mode")
@@ -310,7 +323,7 @@ def main():
         print(PI_IDLE, flush=True)
     else:
         print("❯\u00a0", flush=True)
-    prompt = sys.stdin.readline()
+    prompt = submitted if submitted is not None else sys.stdin.readline()
     if prompt == "":
         with rows.open("a") as stream:
             stream.write(json.dumps({"eof": True, "id": identity, "harness": harness}) + "\n")

@@ -84,9 +84,12 @@ class Task:
         parent = self.controller
         with parent.locked(parent.path):
             controller = parent.read()
-            terminal = parent.terminal(controller)
-            if not controller or controller["state"] != "running" or not terminal:
+            # A native exit can leave its pane alive; status owns that verdict.
+            answer = parent.answer(controller)
+            terminal = answer["terminal"]
+            if answer["state"] != "running" or not terminal:
                 raise Refusal("session-not-running")
+            controller = parent.controller(controller)
             task_file = str(Path(args.task_file).resolve(strict=True))
             result = Path(args.result_file).resolve()
             inputs = [str(Path(path).resolve(strict=True)) for path in args.input]
@@ -131,7 +134,7 @@ class Task:
                                   account=prepared["account"], effort=prepared["effort"])
                     if not shutil.which(prepared["harness"], path=self.controller.env["PATH"]):
                         raise Refusal("app-missing", prepared["harness"])
-                    created = self.controller.tmux("new-window", "-d", "-t", "=jarvis", "-n", args.name,
+                    created = self.controller.tmux("new-window", "-d", "-t", "=" + terminal["session"], "-n", args.name,
                                         "-c", self.home, "-P", "-F", "#{window_id}\t#{pane_id}",
                                         BASH, "--noprofile", "--norc", socket=terminal["server"])
                     window, pane = created.stdout.strip().split("\t")

@@ -87,8 +87,8 @@ controller_fixture_install() { # HOME SCRIPTS NATIVE_BIN
   mkdir -p -- "$home" "$bin" || return 1
   cp -- "$fixture" "$home/.fixture-harness.py" || return 1
   jq -n --arg skills "$skills" --arg bash "$BASH" --arg rows "$TMP_ROOT/native-events.jsonl" \
-    --arg gate "$TMP_ROOT/native-gate" --arg idle "$TMP_ROOT/idle" --arg process "${HARNESS_PIDS:-}" \
-    '{skills:$skills,bash:$bash,rows:$rows,gate:$gate,idle_marker:$idle,process_markers:$process}' > "$home/.fixture.json" || return 1
+    --arg gate "$TMP_ROOT/native-gate" --arg idle "$TMP_ROOT/idle" --arg process "${HARNESS_PIDS:-}" --arg home "$home" \
+    '{skills:$skills,bash:$bash,rows:$rows,gate:$gate,idle_marker:$idle,process_markers:$process,home:$home}' > "$home/.fixture.json" || return 1
   local harness
   for harness in claude codex copilot pi; do
     if ! cmp -s -- "$ORCH_TEST_NATIVE" "$bin/$harness"; then

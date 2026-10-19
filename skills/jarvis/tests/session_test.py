@@ -116,7 +116,7 @@ class SessionContract(unittest.TestCase):
         self.rows = self.root / "rows.jsonl"
         self.gate = self.root / "gate"
         (self.home / ".fixture.json").write_text(json.dumps({"rows": str(self.rows), "gate": str(self.gate),
-            "bash": os.environ["JARVIS_TEST_BASH"], "skills": str(SKILLS)}))
+            "bash": os.environ["JARVIS_TEST_BASH"], "skills": str(SKILLS), "home": str(self.home)}))
         shutil.copyfile(HARNESS_SCRIPT, self.home / ".fixture-harness.py")
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
@@ -1296,4 +1296,4 @@ class SessionContract(unittest.TestCase):
 
 if __name__ == "__main__":
     with native_launcher() as HARNESS:
-        unittest.main()
+        unittest.main(verbosity=2, failfast=len(sys.argv) == 1)

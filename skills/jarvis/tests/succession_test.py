@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import unittest
 from unittest.mock import patch
@@ -1020,4 +1021,4 @@ print(json.dumps({"config_dir": row["account"]}))
 if __name__ == "__main__":
     with native_launcher() as native:
         session_test.HARNESS = native
-        unittest.main(defaultTest=["SuccessionContract.test_succession_contract", "SuccessionContract.test_succession_identity", "SuccessionContract.test_succession_foreign_session", "SuccessionContract.test_succession_recovery", "SuccessionContract.test_shared_first_launch", "SuccessionContract.test_shared_registration", "SuccessionContract.test_shared_orch_launch_and_recovery", "SuccessionContract.test_shared_recovery_harnesses", "SuccessionContract.test_legacy_controller_refuses_replacement", "SuccessionContract.test_orch_retirement_order", "SuccessionContract.test_shared_controller_mail", "SuccessionContract.test_watch_publication_keeps_controller", "SuccessionContract.test_account_succession", "SuccessionContract.test_missing_orch_keeps_predecessor"])
+        unittest.main(verbosity=2, failfast=len(sys.argv) == 1, defaultTest=["SuccessionContract.test_succession_contract", "SuccessionContract.test_succession_identity", "SuccessionContract.test_succession_foreign_session", "SuccessionContract.test_succession_recovery", "SuccessionContract.test_shared_first_launch", "SuccessionContract.test_shared_registration", "SuccessionContract.test_shared_orch_launch_and_recovery", "SuccessionContract.test_shared_recovery_harnesses", "SuccessionContract.test_legacy_controller_refuses_replacement", "SuccessionContract.test_orch_retirement_order", "SuccessionContract.test_shared_controller_mail", "SuccessionContract.test_watch_publication_keeps_controller", "SuccessionContract.test_account_succession", "SuccessionContract.test_missing_orch_keeps_predecessor"])
