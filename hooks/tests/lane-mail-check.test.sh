@@ -3633,7 +3633,9 @@ successor_transition() { # NAME CALLER ARM [HOOK]
   (
   PASS=0 FAIL=0
   local before state_before judged_before state_path transition_dir transition_socket real_tmux next_pane
-  local OVERSEER_PANE OVERSEER_SERVER OVERSEER_SERVER_START
+  local OVERSEER_PANE="$OVERSEER_PANE"
+  local OVERSEER_SERVER="$OVERSEER_SERVER"
+  local OVERSEER_SERVER_START="$OVERSEER_SERVER_START"
   local -a SESSION_ENV
   transition_world "$1" "${4:-$HOOK}"
   overseer_transcript
