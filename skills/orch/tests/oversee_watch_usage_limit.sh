@@ -440,10 +440,11 @@ PAUSES='[.lanes[] | "\(.item):" + ((.pauses // []) | map("\(.from)-\(.to):\(.cau
 next_pass() { rm -f -- "${STUB_DIR:?}/pane-gh-2.calls" "${STUB_DIR:?}/cmd-gh-2.calls"; }
 wall_then() { # NAME END — a wall on gh-2 at RESET_NOW, then END 600 s on
   new_case "$1"
-  printf '{"triaged":[],"lanes":[{"item":"KEN-1","window":"gh-1"},{"item":"KEN-2","window":"gh-2"}]}\n' > "$STUB_DIR/oversee-state.json"
+  printf '{"triaged":[],"lanes":[{"item":"KEN-1","window":"gh-1","status":"running"},{"item":"KEN-2","window":"gh-2","status":"running"}]}\n' > "$STUB_DIR/oversee-state.json"
   screen banner_idle
   printf '%s' "$RESET_NOW" > "$STUB_DIR/now.epoch"
   run TZ=UTC
+  jq -r '.lanes | map(.walled.at // "-") | join(" ")' "$STUB_DIR/oversee-state.json"
   local lanes=""
   case "$2" in
     cleared) screen healthy ;;
@@ -451,25 +452,45 @@ wall_then() { # NAME END — a wall on gh-2 at RESET_NOW, then END 600 s on
     gone) printf 'gh-1\n' > "$STUB_DIR/windows.txt" ;;
     left) lanes=gh-1 ;;
     emptied) lanes=none ;;
+    stopped|done)
+      jq --arg status "$2" '.lanes[1].status = $status | .lanes[1].cycle = {gate_waits:{paused:300},cause:"paused"}' \
+        "$STUB_DIR/oversee-state.json" > "$STUB_DIR/edited"
+      mv "$STUB_DIR/edited" "$STUB_DIR/oversee-state.json"
+      screen healthy ;;
     *) echo "wall_then: unknown end $2" >&2; exit 1 ;;
   esac
   next_pass
   printf '%s' "$((RESET_NOW + 600))" > "$STUB_DIR/now.epoch"
   RUN_LANES="$lanes" run TZ=UTC
   jq -r "$PAUSES" "$STUB_DIR/oversee-state.json"
+  jq -r '.lanes | map(.walled.at // "-") | join(" ")' "$STUB_DIR/oversee-state.json"
+  [[ "$2" != done && "$2" != stopped ]] || jq -c '.lanes[1].cycle' "$STUB_DIR/oversee-state.json"
 }
 WALL_PAUSE="KEN-1: KEN-2:2026-09-02T16:00:00Z-2026-09-02T16:10:00Z:walled"
 while IFS='|' read -r label end; do
-  assert_eq "$(wall_then "wall_$end" "$end")" "$WALL_PAUSE" "$label" "$ERR"
+  end_wall='- -'
+  [[ "$end" != replaced ]] || end_wall='- 2026-09-02T16:10:00Z'
+  saved_cycle=""
+  [[ "$end" != done && "$end" != stopped ]] || saved_cycle=$'\n''{"gate_waits":{"paused":300},"cause":"paused"}'
+  assert_eq "$(wall_then "wall_$end" "$end")" "- 2026-09-02T16:00:00Z
+$WALL_PAUSE
+$end_wall$saved_cycle" "$label" "$ERR"
 done <<'ROWS'
 a banner gone from the screen closes the wall at that pass, on the walled lane's record alone|cleared
 a banner replaced by another wall closes the first one|replaced
 a window gone from tmux closes its wall the same way|gone
 a window the fleet no longer carries closes its wall the same way|left
 the last windows leaving the fleet close their walls the same way|emptied
+a stopped item completes its wall and retains its saved cycle|stopped
+a done item completes its wall after merge and retains its saved cycle|done
 ROWS
+wall_mutant wall-start-unwritten oversee-watch '.walled = {at: ($from | todate)}' '. # .walled = {at: ($from | todate)}
+'
+assert_eq "$(WATCH_BIN="$WALL_WATCH" wall_then wall_start_control cleared)" "- -
+KEN-1: KEN-2:
+- -" "control: omitting the first-seen write loses the item-owned pause" "$ERR"
 new_case wall_unrecorded_window
-printf '{"triaged":[],"lanes":[{"item":"KEN-1","window":"gh-1"}]}\n' > "$STUB_DIR/oversee-state.json"
+printf '{"triaged":[],"lanes":[{"item":"KEN-1","window":"gh-1","status":"running"}]}\n' > "$STUB_DIR/oversee-state.json"
 screen banner_idle
 printf '%s' "$RESET_NOW" > "$STUB_DIR/now.epoch"
 run TZ=UTC
@@ -485,26 +506,123 @@ assert_eq "$(jq -r "$PAUSES" "$STUB_DIR/oversee-state.json") $(grep -c wall-unre
 # so this case runs the real workflow-state over two directories, the fleet
 # record only in the fleet one. It prints the fleet record's pauses and the
 # ORCH_STATE_DIR state whole.
-wall_in_fleet_dir() { # NAME
-  local orch fleet
+wall_in_fleet_dir() { # NAME INPUT END
+  local orch fleet input end="${3:-cleared}"
   new_case "$1"
   orch="$STUB_DIR/orch" fleet="$STUB_DIR/fleet"
   mkdir -p -- "$orch" "$fleet"
   printf '{"triaged":[]}\n' > "$orch/workflow-state-oversee.json"
   printf '{"triaged":[],"lanes":[{"item":"KEN-1","window":"gh-1","status":"running"},{"item":"KEN-2","window":"gh-2","status":"running"}]}\n' > "$fleet/workflow-state-oversee.json"
+  input="$fleet/workflow-state-oversee.json"
+  if [[ "${2:-canonical}" == alias ]]; then
+    input="$fleet/watch-input.json"
+    cp "$fleet/workflow-state-oversee.json" "$input"
+  fi
   set -- TZ=UTC ORCH_STATE_DIR="$orch" \
     OVERSEE_WATCH_WORKFLOW_STATE="$REPO_ROOT/skills/orch/scripts/workflow-state"
   screen banner_idle
   printf '%s' "$RESET_NOW" > "$STUB_DIR/now.epoch"
-  run_watch "$@" -- --max-loops 1 --state "$fleet/workflow-state-oversee.json" > /dev/null 2>"$ERR" || return
-  screen healthy
+  run_watch "$@" -- --max-loops 1 --state "$input" > /dev/null 2>"$ERR" || return
+  # Preserve the sighting across restart and repair a missing lane stamp.
+  "$REPO_ROOT/skills/orch/scripts/workflow-state" --state-dir "$fleet" update oversee 'del(.lanes[1].walled)' >/dev/null
+  next_pass
+  printf '%s' "$((RESET_NOW + 300))" > "$STUB_DIR/now.epoch"
+  run_watch "$@" -- --max-loops 1 --state "$input" > /dev/null 2>"$ERR" || return
+  jq -r '.lanes[1].walled.at' "$fleet/workflow-state-oversee.json"
+  case "$end" in
+    cleared) screen healthy ;;
+    moved|done)
+      "$REPO_ROOT/skills/orch/scripts/workflow-state" --state-dir "$fleet" update oversee \
+        --arg end "$end" 'if $end == "moved" then .lanes[1].window = "replacement:gh-2"
+          else .lanes[1].status = "done" end' >/dev/null ;;
+  esac
   next_pass
   printf '%s' "$((RESET_NOW + 600))" > "$STUB_DIR/now.epoch"
-  run_watch "$@" -- --max-loops 1 --state "$fleet/workflow-state-oversee.json" > /dev/null 2>"$ERR" || return
+  run_watch "$@" -- --max-loops 1 --state "$input" > /dev/null 2>"$ERR" || return
   printf '%s | %s\n' "$(jq -r "$PAUSES" "$fleet/workflow-state-oversee.json")" "$(jq -c . "$orch/workflow-state-oversee.json")"
 }
-assert_eq "$(wall_in_fleet_dir wall_fleet_dir)" "$WALL_PAUSE | {\"triaged\":[]}" \
-  "a wall that ends is kept in the fleet state directory, never in ORCH_STATE_DIR" "$ERR"
+while IFS='|' read -r input end; do
+  assert_eq "$(wall_in_fleet_dir "wall_fleet_${input}_${end}" "$input" "$end")" "2026-09-02T16:00:00Z
+$WALL_PAUSE | {\"triaged\":[]}" \
+    "a $input input keeps first-seen repair and $end completion in the canonical fleet record" "$ERR"
+done <<'ROWS'
+canonical|cleared
+alias|cleared
+alias|moved
+alias|done
+ROWS
+wall_mutant wall-snapshot-only oversee-watch \
+  '[[ "$changed" == true || ( -n "$STATE_FILE" && ( "$standing" == true || "$prior_wall" -eq 1 ) ) ]] || exit 0' \
+  '[[ "$changed" == true ]] || exit 0'
+assert_eq "$(WATCH_BIN="$WALL_WATCH" wall_in_fleet_dir wall_alias_control alias cleared)" "2026-09-02T16:00:00Z
+KEN-1: KEN-2: | {\"triaged\":[]}" \
+  'control: an unchanged input alias cannot decide canonical wall completion' "$ERR"
+
+# Exercise optional fleet state through the direct-list CLI outside tmux.
+# The real state owner must refuse required state and leave absent optional
+# state absent. The watch's own first pass supplies the wall sighting.
+wall_state_passes() { # STATE END
+  local mode="$1" end="$2" fleet file first_rc=0 first_wall second_rc=0 captured=0 record=absent
+  local args=(--max-loops 1) windows=(gh-2) env
+  new_case "wall_state_${mode}_${end}"
+  fleet="$STUB_DIR/fleet"; file="$fleet/workflow-state-oversee.json"
+  mkdir -p "$fleet"
+  if [[ "$mode" != absent ]]; then
+    printf '{"triaged":[],"lanes":[{"item":"KEN-2","window":"gh-2","status":"running"}]}\n' > "$file"
+  fi
+  case "$mode" in
+    explicit) args+=(--state "$file") ;;
+
+  esac
+  env=(TZ=UTC TMUX= ORCH_TMUX_SESSION=main LINEAR_TEAM= ORCH_STATE_DIR="$fleet"
+    OVERSEE_WATCH_WORKFLOW_STATE="$REPO_ROOT/skills/orch/scripts/workflow-state")
+  ERR="$STUB_DIR/wall-state.err"
+  screen banner_idle
+  printf '%s' "$RESET_NOW" > "$STUB_DIR/now.epoch"
+  run_watch "${env[@]}" -- "${args[@]}" "${windows[@]}" > "$STUB_DIR/first.out" 2>"$ERR" || first_rc=$?
+  first_wall="$(grep -c '^EVENT usage-limit gh-2 ' "$STUB_DIR/first.out" || true)"
+  case "$end" in
+    cleared) screen healthy ;;
+    standing) ;;
+    gone) printf 'gh-1\n' > "$STUB_DIR/windows.txt" ;;
+    left) windows=(gh-1) ;;
+    emptied) windows=() ;;
+  esac
+  [[ "$mode" != unavailable ]] || printf 'invalid\n' > "$file"
+  next_pass
+  printf '%s' "$((RESET_NOW + 600))" > "$STUB_DIR/now.epoch"
+  run_watch "${env[@]}" -- "${args[@]}" ${windows[@]+"${windows[@]}"} > "$STUB_DIR/second.out" 2>>"$ERR" || second_rc=$?
+  [[ ! -f "$STUB_DIR/pane-gh-2.calls" ]] || captured="$(cat "$STUB_DIR/pane-gh-2.calls")"
+  if [[ -e "$file" ]]; then
+    if [[ "$mode" == unavailable ]]; then record="$(cat "$file")"
+    else record="$(jq -c '[.lanes[].pauses[]?]' "$file")"; fi
+  fi
+  WALL_STATE_RESULT="$first_rc $first_wall $second_rc $captured $record"
+}
+wall_state_table() {
+  local row mode end expect
+  for row in "$@"; do
+    IFS='|' read -r mode end expect <<<"$row"
+    wall_state_passes "$mode" "$end"
+    assert_eq "$WALL_STATE_RESULT" "$expect" "fleet state $mode after $end" "$ERR"
+    [[ "$mode" != unavailable ]] || assert_eq "$(grep -c '^oversee-watch: wall-unrecorded ' "$ERR" || true)" 1 \
+      'an unavailable implicit fleet read reports its accounting failure' "$ERR"
+  done
+}
+wall_state_table \
+  'absent|cleared|0 1 0 1 absent' \
+  'absent|standing|0 1 0 1 absent' \
+  'absent|gone|0 1 0 0 absent' \
+  'absent|left|0 1 0 0 absent' \
+  'absent|emptied|0 1 0 0 absent' \
+  'implicit|cleared|0 1 0 1 [{"from":"2026-09-02T16:00:00Z","to":"2026-09-02T16:10:00Z","cause":"walled"}]' \
+  'explicit|cleared|0 1 0 1 [{"from":"2026-09-02T16:00:00Z","to":"2026-09-02T16:10:00Z","cause":"walled"}]' \
+  'unavailable|cleared|0 1 0 1 invalid'
+
+new_case wall_explicit_absent
+run_watch TMUX= ORCH_TMUX_SESSION=main -- --max-loops 1 --state "$STUB_DIR/missing-state.json" gh-2 \
+  >"$STUB_DIR/out" 2>"$STUB_DIR/err" && RC=0 || RC=$?
+assert_eq "$RC" 2 'a missing explicit fleet input fails its existing reader' "$STUB_DIR/err"
 cat > "$TMP_ROOT/bin/grep" <<'EOF'
 #!/usr/bin/env bash
 if [[ -f "$STUB_DIR/reset-grep-fail" && "${1:-}" == "-Em1" ]]; then

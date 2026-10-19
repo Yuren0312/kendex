@@ -6,7 +6,8 @@
 # oversee_watch_usage_limit.sh's; this suite builds the same sandbox from
 # lib/oversee-watch-harness.sh.
 # Surface: wall_route admission through lane_recovery_args.
-# Inputs: scripts/oversee-watch, scripts/lib, tests/fixtures/lane-host,
+# Inputs: scripts/oversee-watch, scripts/open-terminal, scripts/workflow-state,
+# scripts/lib, tests/lib/open-terminal-stubs.sh, tests/lib/question-off.sh, tests/fixtures/lane-host,
 # tests/lib/oversee-watch-harness.sh.
 #
 # One table. A row names the screen gh-2 shows, what `lanes pick` answers and
@@ -18,6 +19,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/git-env.sh"
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/oversee-watch-harness.sh"
 # shellcheck source=lib/growth-state.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/growth-state.sh"
+# shellcheck source=lib/question-off.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/question-off.sh"
 # shellcheck source=lib/open-terminal-stubs.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/open-terminal-stubs.sh"
 LAUNCH_BIN="$TMP_ROOT/launch-bin"
@@ -131,6 +134,7 @@ stage() {
     printf 'esc to interrupt\n' > "$STUB_DIR/pane-gh-2.txt"
   fi
   cp "$STUB_DIR/oversee-state.json" "$STUB_DIR/saved-state.json"
+  jq '.lanes[0].walled = {at: "2026-09-02T16:00:00Z"}' "$STUB_DIR/saved-state.json" > "$STUB_DIR/expected-wall-state.json"
   cp "$STUB_DIR/windows.txt" "$STUB_DIR/saved-windows.txt"
   local pick_file="$STUB_DIR/pick-$harness-$model"
   mkdir -p "${pick_file%/*}"
@@ -178,7 +182,7 @@ facts() {
       killed) value=none; [[ ! -f "$STUB_DIR/kill-window.calls" ]] || value="$(paste -sd, - < "$STUB_DIR/kill-window.calls")" ;;
       stopped) value=0; [[ ! -f "$STUB_DIR/host.calls" ]] || value="$(grep -c '^stop ' "$STUB_DIR/host.calls" || true)" ;;
       marker) value=false; [[ ! -f "$STATE_DIR/wall-relaunch.gh-2" && ! -f "$STATE_DIR/wall-relaunch.gh-2.exit" ]] || value=true ;;
-      record) value=changed; cmp -s "$STUB_DIR/saved-state.json" "$STUB_DIR/oversee-state.json" && value=retained ;;
+      record) value=changed; cmp -s "$STUB_DIR/expected-wall-state.json" "$STUB_DIR/oversee-state.json" && value=retained ;;
       windows) value=changed; cmp -s "$STUB_DIR/saved-windows.txt" "$STUB_DIR/windows.txt" && value=retained ;;
       cwd) relaunch_args >/dev/null; value="$(cat "$STUB_DIR/open-terminal.cwd")"; [[ "$value" != "$STUB_DIR/peer" ]] || value=peer ;;
       session) relaunch_args >/dev/null; value="$(cat "$STUB_DIR/open-terminal.session")" ;;
@@ -206,7 +210,7 @@ wall_table() {
     [[ "$setting" == - ]] || env+=(ORCH_WALL_RELAUNCH="$setting")
     ERR="$TMP_ROOT/run-$((++RUN_SEQ)).err"
     OUT="$(run_watch "${env[@]}" -- --max-loops 1 --state "$STUB_DIR/oversee-state.json" gh-1 gh-2 2>"$ERR")" && RC=0 || RC=$?
-    assert_eq "$(facts "$expect")" "$expect" "$label" "$ERR"
+    assert_eq "$(facts "$expect")" "$expect" "$label" "$ERR";
   done
 }
 
@@ -240,6 +244,100 @@ wall_table "$ROW_RELAUNCH" \
   "unknown original hosted choices refuse before stop|walled:hosted-legacy|fresh|auto|rc=0 stopped=0 out~EVENT+usage-limit=true relaunch~--relaunch=false" \
   "a hosted stop failure keeps the window and refuses replacement|walled:stop-failed|fresh|auto|rc=0 stopped=1 err~reason%estop-failed=true killed=none relaunch~--relaunch=false" \
   "a stop without confirmation cannot start a replacement|walled:stop-unconfirmed|fresh|auto|rc=0 stopped=1 err~reason%estop-failed=true killed=none relaunch~--relaunch=false"
+
+# The real launcher changes the item record while a direct list still reads
+# the old pane. A current replacement is observed before that stale pane.
+item_lifetime() { # MODE
+  local mode="$1" old=gh-2 new=replacement:gh-2 launch=--tmux
+  local args=() row
+  stage walled:github none
+  ERR="$STUB_DIR/item-lifetime.err"
+  if [[ "$mode" == custom ]]; then
+    old=custom
+    jq '.lanes[0].window = "main:custom"' "$STUB_DIR/oversee-state.json" > "$STUB_DIR/edited"
+    mv "$STUB_DIR/edited" "$STUB_DIR/oversee-state.json"
+    printf 'custom\n' >> "$STUB_DIR/windows.txt"
+    cp "$STUB_DIR/pane-gh-2.txt" "$STUB_DIR/pane-custom.txt"
+    cp "$STUB_DIR/cmd-gh-2.txt" "$STUB_DIR/cmd-custom.txt"
+  fi
+  run_watch TZ=UTC ORCH_WALL_RELAUNCH=ask -- --max-loops 1 --state "$STUB_DIR/oversee-state.json" "$old" >>"$ERR" 2>&1 || return
+  jq --arg cwd "$TMP_ROOT/repo" '.overseer = {cwd:$cwd}' "$STUB_DIR/oversee-state.json" > "$STUB_DIR/workflow-state-oversee.json"
+  [[ "$mode" != gui ]] || { launch=--ghostty; new=""; }
+  (cd "$TMP_ROOT/repo" && env -i PATH="$LAUNCH_BIN:$PATH" HOME="$TMP_ROOT/launch-home" \
+    STUB_DIR="$STUB_DIR" WORKTREE_CLI="$LAUNCH_BIN/worktree" LANES_CLI="$TMP_ROOT/bin/lanes-stub.sh" \
+    OT_CHECKOUT_REPO=owner/repo ORCH_TMUX_SESSION=replacement ORCH_OVERSEER_LANES=1000 OT_TMUX_SERVER_PID="$$" OT_TMUX_PANES="$STUB_DIR/item-panes" OT_SLEEP_INSTANT=1 \
+    OT_TMUX_LOG="$STUB_DIR/item-tmux.log" OT_WT_LOG="$STUB_DIR/item-worktree.log" \
+    "$REPO_ROOT/skills/orch/scripts/open-terminal" --relaunch "$launch" --harness claude --host local --tracker github --repo owner/repo \
+      --state-dir "$STUB_DIR" --cmd "true --model $MODEL --effort high $QUESTION_OFF_ALL $COMPACTION_OFF_ALL" 2) >>"$ERR" 2>&1 || return
+  [[ "$(jq -r '.lanes[0].window // ""' "$STUB_DIR/workflow-state-oversee.json")" == "$new" ]] || return 1
+  cp "$STUB_DIR/workflow-state-oversee.json" "$STUB_DIR/oversee-state.json"
+  printf '%s' "$((RESET_NOW + 600))" > "$STUB_DIR/now.epoch"
+  if [[ -n "$new" ]]; then
+    printf 'gh-2\n' > "$STUB_DIR/windows-replacement.txt"
+    cp "$STUB_DIR/cmd-gh-2.txt" "$STUB_DIR/cmd-$new.txt"
+    if [[ "$mode" == walled ]]; then cp "$STUB_DIR/pane-$old.txt" "$STUB_DIR/pane-$new.txt"
+    else printf '⏺ Working on the replacement.\n' > "$STUB_DIR/pane-$new.txt"; fi
+    args+=("$new")
+  fi
+  if [[ "$mode" == reused ]]; then
+    jq '.lanes += [{item:"issue-3",window:"gh-2",status:"running"}]' "$STUB_DIR/oversee-state.json" > "$STUB_DIR/edited"
+    mv "$STUB_DIR/edited" "$STUB_DIR/oversee-state.json"
+    printf '⏺ Working on another item.\n' > "$STUB_DIR/pane-gh-2.txt"
+  fi
+  args+=("$old")
+  run_watch TZ=UTC ORCH_WALL_RELAUNCH=ask -- --max-loops 1 "${args[@]}" >>"$ERR" 2>&1 || return
+  run_watch TZ=UTC ORCH_WALL_RELAUNCH=ask -- --max-loops 1 "${args[@]}" >>"$ERR" 2>&1 || return
+  jq -c '[.lanes[0] | {pauses, walled: (.walled // null)}] + [.lanes[1] // null]' "$STUB_DIR/oversee-state.json"
+}
+ITEM_PAUSE='[{"pauses":[{"from":"2026-09-02T16:00:00Z","to":"2026-09-02T16:10:00Z","cause":"walled"}],"walled":null},null]'
+while IFS='|' read -r mode expect; do
+  assert_eq "$(item_lifetime "$mode")" "$expect" "item wall lifetime after real $mode relaunch" "$ERR"
+done <<ROWS
+tmux|$ITEM_PAUSE
+gui|$ITEM_PAUSE
+custom|$ITEM_PAUSE
+walled|[{"pauses":[{"from":"2026-09-02T16:00:00Z","to":"2026-09-02T16:10:00Z","cause":"walled"}],"walled":{"at":"2026-09-02T16:10:00Z"}},null]
+reused|[{"pauses":[{"from":"2026-09-02T16:00:00Z","to":"2026-09-02T16:10:00Z","cause":"walled"}],"walled":null},{"item":"issue-3","window":"gh-2","status":"running"}]
+ROWS
+
+# A lookup that ignores sessions assigns the stale pane to the moved item.
+item_scripts="$(mutant_scripts item-current-record/orch oversee-watch)" || exit 1
+ln -s "$REPO_ROOT/skills/github" "$TMP_ROOT/item-current-record/github"
+mutate_file "$item_scripts/oversee-watch" 'lane_running_record "$records" "$window" "" session' \
+  'lane_running_record "$records" "$window" "" window'
+control_rc=0
+control_result="$(WATCH_BIN="$item_scripts/oversee-watch" item_lifetime tmux)" || control_rc=$?
+assert_eq "$control_rc" 0 'the item-owner control reaches the actual launcher' "$ERR"
+assert_eq "$([[ "$control_result" == "$ITEM_PAUSE" ]] && echo accepted || echo rejected)" rejected \
+  'control: a stale pane assigned to the moved item fails its unchanged lifetime assertion' "$ERR"
+
+for profile in hosted-verb pi; do
+  stage "walled:$profile" none
+  ERR="$STUB_DIR/unavailable-wall.err"
+  run_watch TZ=UTC ORCH_WALL_RELAUNCH=ask ${PROFILE_ENV[@]+"${PROFILE_ENV[@]}"} -- \
+    --max-loops 1 --state "$STUB_DIR/oversee-state.json" > /dev/null 2>"$ERR"
+  printf '%s' "$((RESET_NOW + 600))" > "$STUB_DIR/now.epoch"
+  if [[ "$profile" == pi ]]; then
+    # The carrier publishes null when its working-agent read fails.
+    printf '%s\n' '{"event":"Stop","working_agents":null,"message":"task read unavailable"}' \
+      > "$STUB_DIR/tree/tmp/lane-mail/KEN-2/session-rows.jsonl"
+  fi
+  run_watch TZ=UTC ORCH_WALL_RELAUNCH=ask ${PROFILE_ENV[@]+"${PROFILE_ENV[@]}"} LANE_HOST_STUB_CAPTURE_STATUS=7 -- \
+    --max-loops 1 --state "$STUB_DIR/oversee-state.json" > /dev/null 2>>"$ERR"
+  assert_eq "$(jq -c '.lanes[0] | {walled, pauses: (.pauses // [])}' "$STUB_DIR/oversee-state.json")" \
+    '{"walled":{"at":"2026-09-02T16:00:00Z"},"pauses":[]}' \
+    "an unavailable $profile observation keeps the item wall standing" "$ERR"
+  if [[ "$profile" == pi ]]; then
+    printf '%s\n' '{"at":1,"event":"Stop","stop_reason":"error","message":"429 Usage limit reached for this model"}' \
+      > "$STUB_DIR/tree/tmp/lane-mail/KEN-2/session-rows.jsonl"
+  fi
+  printf '%s' "$((RESET_NOW + 900))" > "$STUB_DIR/now.epoch"
+  run_watch TZ=UTC ORCH_WALL_RELAUNCH=ask ${PROFILE_ENV[@]+"${PROFILE_ENV[@]}"} -- \
+    --max-loops 1 --state "$STUB_DIR/oversee-state.json" > /dev/null 2>>"$ERR"
+  assert_eq "$(jq -c '.lanes[0] | {walled, pauses: (.pauses // [])}' "$STUB_DIR/oversee-state.json")" \
+    '{"walled":{"at":"2026-09-02T16:00:00Z"},"pauses":[]}' \
+    "a resumed $profile read retains the original first-seen time" "$ERR"
+done
 
 new_case wall_setting_invalid
 OUT="$(run_watch ORCH_WALL_RELAUNCH=maybe -- --max-loops 1 gh-1 gh-2 2>"$TMP_ROOT/invalid.err")" && RC=0 || RC=$?
@@ -335,6 +433,7 @@ mv "$STUB_DIR/edited" "$STUB_DIR/oversee-state.json"
 cp "$STUB_DIR/oversee-state.json" "$STUB_DIR/workflow-state-oversee.json"
 cp "$STUB_DIR/oversee-state.json" "$STUB_DIR/saved-state.json"
 canonical_saved="$(jq -Sc '.lanes[0]' "$STUB_DIR/workflow-state-oversee.json")"
+watch_saved="$(jq -Sc '.lanes[0] + {walled: {at: "2026-09-02T16:00:00Z"}}' "$STUB_DIR/saved-state.json")"
 ERR="$TMP_ROOT/actual-launcher.err"
 OUT="$(run_watch ORCH_WALL_RELAUNCH=auto OVERSEE_WATCH_OPEN_TERMINAL="$REPO_ROOT/skills/orch/scripts/open-terminal" \
   PATH="$TMP_ROOT/bin:$LAUNCH_BIN:$PATH" LANES_CLI="$TMP_ROOT/bin/lanes-stub.sh" WORKTREE_CLI="$LAUNCH_BIN/worktree" \
@@ -356,7 +455,7 @@ assert_file_contains "$STUB_DIR/wall-relaunch-issue-2.log" 'open-terminal: marke
 assert_eq "$(grep -c '^stop ' "$STUB_DIR/host.calls" || true)" 0 'failed wall setup never retires the predecessor'
 assert_eq "$(grep -vc 'workflow-state handoff-standing ' "$STUB_DIR/launcher-tmux.log.handoff" || true)" 0 'failed wall setup executes no remote successor command'
 assert_eq "$(jq -Sc '.lanes[0]' "$STUB_DIR/workflow-state-oversee.json")" "$canonical_saved" 'failed wall setup keeps the complete canonical lane record'
-assert_eq "$(jq -Sc '.lanes[0]' "$STUB_DIR/oversee-state.json")" "$canonical_saved" 'failed wall setup keeps the complete watch lane record'
+assert_eq "$(jq -Sc '.lanes[0]' "$STUB_DIR/oversee-state.json")" "$watch_saved" 'failed wall setup keeps the complete watch lane record and its wall'
 
 printf 'pass: %d   fail: %d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
