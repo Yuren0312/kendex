@@ -570,8 +570,7 @@ print(json.dumps({"config_dir": row["account"]}))
             self.assertEqual(len(rows.read_text().splitlines()), count + 1, "retained-native-row")
             # Two refused operations retain waiting resources above the live
             # controller. Its real callbacks still belong to the sole record.
-            flag = self.refuse_teardown()
-            try:
+            with self.refuse_teardown():
                 failed = subprocess.run([str(self.orch_scripts / "oversee"), "launch", "--predecessor", terminal["pane"],
                                          "--handoff", "state/handoff.md", "--wait-secs", "30"],
                                         cwd=self.home, env=self.env, capture_output=True, text=True, timeout=60)
@@ -609,8 +608,6 @@ print(json.dumps({"config_dir": row["account"]}))
                         break
                     time.sleep(0.05)
                 self.assertEqual((exited.get("run") or {}).get("harness_pid"), str(native["pid"]), "retained-native-exit-chain")
-            finally:
-                flag.unlink()
             self.call("start", mode="new")
             self.wait()
             for resource in resources:
