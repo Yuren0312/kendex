@@ -79,6 +79,41 @@ api_launch_room
 assert_eq "session_env=$(typed 'tmux set-environment')" 'session_env=0' \
   'a hosted Pi launch on an Anthropic model hands no session environment'
 
+# A retired plan leaves the account's live grant to a named launch, which the
+# judge spends on the grant's own expiry; a plan launch stays refused.
+RETIRED_PLAN="ORCH_LANE_RETIRE=eclaude=2000-01-01"
+api_retired_result() { # what a named launch did: created, typed, refused
+  local typed_ssh
+  typed_ssh="$(typed "clear; ssh 'lane.example'")"
+  printf 'rc=%s account=%s launched=%s refused=%s' "$RC" \
+    "$(awk '/^create / { for(i=1;i<=NF;i++) if($i == "--account") print $(i+1) }' "$RUN/host.log" 2>/dev/null)" \
+    "${typed_ssh:-0}" "$(awk '$2 == "lane-refused" {n++} END {print n+0}' <<<"$OUT")"
+}
+api_retired_grant() { # SPELLING ENV
+  run_ot "$API_ENV;$RETIRED_PLAN$2" --host "$HOST_STUB" --harness pi --lane "$1" --repo o/r KEN-4428
+  assert_eq "$(api_retired_result)" "rc=0 account=$H/.eclaude launched=1 refused=0" \
+    "a retired account launches a named Pi lane on its live API grant, spelled $1"
+}
+# spelling|env
+while IFS='|' read -r retired_spelling retired_env; do
+  api_retired_grant "$retired_spelling" "$retired_env"
+done <<ROWS
+$H/.eclaude|
+work|;ORCH_LANE_ALIASES=eclaude=work
+ROWS
+# The control asks lanes check without the launch's harness and model.
+API_RETIRED_SHIPPED="$OPEN_TERMINAL"
+OPEN_TERMINAL="$(mutant_scripts ctl-api-retired/orch open-terminal)/open-terminal" || exit 1
+orch_fixture_shared_libs "$TMP_ROOT/ctl-api-retired/orch"
+mutate_file "$OPEN_TERMINAL" 'named_lane_resolve "$LAUNCH_HARNESS" "$LAUNCH_MODEL"' 'named_lane_resolve "" ""'
+API_RETIRED_SAVED_FAIL="$FAIL"; FAIL=0
+api_retired_grant "$H/.eclaude" '' > "$TMP_ROOT/api-retired-control.out"
+API_RETIRED_CONTROL="$FAIL"; FAIL="$API_RETIRED_SAVED_FAIL"; OPEN_TERMINAL="$API_RETIRED_SHIPPED"
+assert_eq "$API_RETIRED_CONTROL" 1 'control: a named check without the launch model fails the retired grant launch row'
+run_ot "$HARNESS_UP;$RETIRED_PLAN;flags=--model fable --effort high" --host local --harness claude --lane "$H/.eclaude" --repo o/r KEN-4429
+assert_eq "$(api_retired_result)" 'rc=1 account= launched=0 refused=1' \
+  'a retired account stays refused for a named plan launch'
+
 # The preference walk spends the hosted API grant before the local Claude
 # account. A restricted source posture must reach the fallback before flags
 # are built, since the shared builder refuses that cross-harness transfer.
@@ -103,6 +138,51 @@ printf '%s\n' \
 while IFS='|' read -r credit flags expected preference; do
   api_preference_case "$credit" "$flags" "$expected" "$preference"
 done < "$TMP_ROOT/api-preference-rows"
+# A walk naming a retired account judges each entry's own allowance: a plan
+# entry is refused and skipped, in either order, and the grant entry launches
+# on its live grant. A walk with no entry left ends refused; an exclusion
+# refuses every entry, one a permission skip would drop as well.
+API_PLAN_FIRST="claude:fable:high,pi@$HOST_STUB:anthropic/claude-opus-5-5:high"
+api_retired_walk() { # REMAINING SETTING PREFERENCE EXPECTED [FLAGS]
+  api_hosted_rows "$1"
+  run_ot "$API_PREFERENCE_ENV;$2;ORCH_LANE_PREFERENCE=$3;flags=${5:---dangerously-skip-permissions}" --host local --harness claude --lane "$H/.eclaude" --repo o/r KEN-4428
+  walk_hosted="$(typed 'env PI_CODING_AGENT_DIR=/pi bash -lc')"
+  assert_eq "$(observe 'rc=0 claim_lanes=eclaude') hosted=${walk_hosted:-0} refused=$(awk '$2 == "lane-refused" {n++} END {print n+0}' <<<"$OUT")" \
+    "$4" "a walk $3 naming an account under $2 with $1 dollars of grant left${5:+, flags $5}"
+}
+# remaining|setting|preference|expected|flags
+printf '%s\n' \
+  "150|$RETIRED_PLAN|$API_PREFERENCE|rc=0 claim_lanes=eclaude hosted=1 refused=0" \
+  "150|$RETIRED_PLAN|$API_PLAN_FIRST|rc=0 claim_lanes=eclaude hosted=1 refused=0" \
+  "4|$RETIRED_PLAN|$API_PREFERENCE|rc=1 claim_lanes=none hosted=0 refused=1" \
+  "150|ORCH_LANE_EXCLUDE=eclaude|$API_PLAN_FIRST|rc=1 claim_lanes=none hosted=0 refused=1" \
+  "150|ORCH_LANE_EXCLUDE=eclaude|pi@$HOST_STUB:anthropic/claude-opus-5-5:high|rc=1 claim_lanes=none hosted=0 refused=1|--permission-mode dontAsk" \
+  > "$TMP_ROOT/api-retired-walk-rows"
+api_retired_walk_table() {
+  while IFS='|' read -r credit setting preference expected flags; do
+    api_retired_walk "$credit" "$setting" "$preference" "$expected" "$flags"
+  done < "$TMP_ROOT/api-retired-walk-rows"
+}
+api_retired_walk_table
+# Each control reruns the table against a mutant of the walk's per-entry
+# verdict: a refusal that ends the walk fails the plan-first row, a check
+# without the entry's harness and model fails both grant rows, and a check
+# only of an entry the permission skip keeps fails the skipped exclusion row.
+# name|shipped|mutant|failures
+while IFS='|' read -r walk_ctl walk_shipped walk_mutant walk_failures; do
+  API_WALK_SHIPPED="$OPEN_TERMINAL"
+  OPEN_TERMINAL="$(mutant_scripts "ctl-api-walk-$walk_ctl/orch" open-terminal)/open-terminal" || exit 1
+  orch_fixture_shared_libs "$TMP_ROOT/ctl-api-walk-$walk_ctl/orch"
+  mutate_file "$OPEN_TERMINAL" "$walk_shipped" "$walk_mutant"
+  API_WALK_SAVED_FAIL="$FAIL"; FAIL=0
+  api_retired_walk_table > "$TMP_ROOT/api-walk-$walk_ctl-control.out"
+  API_WALK_CONTROL="$FAIL"; FAIL="$API_WALK_SAVED_FAIL"; OPEN_TERMINAL="$API_WALK_SHIPPED"
+  assert_eq "$API_WALK_CONTROL" "$walk_failures" "control: the $walk_ctl mutant of the walk's per-entry verdict fails the retired walk table"
+done <<'ROWS'
+skip|4) preference_refused=true; continue ;;|4) ot_message lane-refused "lane=$LANE" >&2; return 1 ;;|1
+scope|named_lane_resolve "$OL_ENTRY_HARNESS" "$OL_ENTRY_MODEL"|named_lane_resolve "" ""|2
+order|if [[ "$preference_named" == true ]]; then|if [[ "$preference_named" == true ]] && OL_HARNESS="$OL_ENTRY_HARNESS" && ol_entry_permitted "$preference_entry"; then|1
+ROWS
 API_PREFERENCE_SHIPPED="$OPEN_TERMINAL"
 OPEN_TERMINAL="$(mutant_scripts ctl-api-preference/orch lib/lane-launch.sh)/open-terminal" || exit 1
 orch_fixture_shared_libs "$TMP_ROOT/ctl-api-preference/orch"

@@ -775,11 +775,11 @@ lane_context_columns() {
 # The HEADROOM cell both lane tables print, as a jq def over one record: the
 # credit balance of a Codex account room on its credits, binding_bucket
 # `credits`, whose window headroom is spent and says nothing of its room;
-# otherwise headroom_pct.
+# otherwise headroom_pct, which for a dollar API grant is its share left.
 # shellcheck disable=SC2016  # jq source, never expanded by the shell.
 LANE_HEADROOM_CELL_JQ='
 def headroom_cell:
-  if .binding_bucket == "credits"
+  if .binding_bucket == "credits" and .credits.unit != "usd"
   then (.credits.balance | if . >= 1000 then (((. / 100) | floor) / 10 | tostring) + "k cr"
                            else (floor | tostring) + " cr" end)
   elif .headroom_pct == null then "-" else (.headroom_pct | tostring) + "%" end;
@@ -796,7 +796,7 @@ lane_context_message() {
       printf 'lane-context: tokens kind=recorded absent=-\n'
       printf 'CONTEXT_TOKENS: the tokens the last response left in the context, read from the transcript by the harness adapter at the session'"'"'s last turn end; a dash where no reading is recorded.\n'
       printf 'lane-context: headroom kind=account-binding handoff=threshold\n'
-      printf 'HEADROOM: percent remaining in the account binding bucket; HANDOFF is required at or below ORCH_HANDOFF_HEADROOM_PCT. A Codex account room on its credits shows its balance in cr, and headroom never marks it (lanes --help, context).\n'
+      printf 'HEADROOM: percent remaining in the account binding bucket; HANDOFF is required at or below ORCH_HANDOFF_HEADROOM_PCT. Headroom never marks a Codex account room on its credits, which shows its balance in cr, or a Pi lane on an anthropic/ API grant, which shows the grant share left and is marked only when the grant is walled (lanes --help, context).\n'
       printf 'lane-context: handoff kind=lane-threshold context=ORCH_HANDOFF_CONTEXT_PCT overseer-trigger=ORCH_OVERSEER_HEADROOM_PCT\n'
       printf 'HANDOFF: required by the shared context rule, or at the LANE headroom threshold. It never reports the overseer'"'"'s own ORCH_OVERSEER_HEADROOM_PCT, wall or qualifying-accounts triggers: by default the overseer succeeds itself at 5 percent headroom against the lane'"'"'s 3, so its own row can read - at a headroom that already fires its succession.\n'
       printf 'lane-context: caller kind=lane-marker marker=*\n'
