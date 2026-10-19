@@ -120,9 +120,8 @@ write    prints the rows and writes the same bytes to the path
          passed on to it, then sends the owner the report notice,
          `lane-mail notice --item overseer --to owner --attach <that file>`
          with the summary file's text as its text, so a relay carries the
-         file to the owner. Open the summary with the repository's outcome
-         readings, each with its date and source, reused from existing
-         evidence comments and rulings. Use no Landed-count opening.
+         file to the owner. Follow the Owner summary template cited below
+         for the summary's opening and section order.
          The summary is the notice's text alone, never
          in the file or the print: the relay posts it as the file's Slack
          comment, in Slack's mrkdwn markup, which Markdown does not read
@@ -141,8 +140,8 @@ write    prints the rows and writes the same bytes to the path
          Before rendering, writing or sending, write checks the summary in
          its posted mrkdwn form. Each finding prints one stderr line:
          oversee-report: summary-shape=RULE, with RULE bare-id, github-link,
-         waiting-on-you or layout. A matched line adds line=N. Each item
-         over 20 words adds words=W. An item count above
+         waiting-on-you or layout. A matched line adds line=N. Each bullet
+         over 20 words adds words=W. A top-level bullet count above
          ORCH_REPORT_SUMMARY_LINES adds item-lines=N cap=CAP.
          These findings are advisory: write sends on the writer's word.
          Argument, setting and notice failures still refuse.
@@ -256,9 +255,9 @@ Settings, read through the kendex settings ladder:
   ORCH_REPORT_UPCOMING       Next rows, default 5
   ORCH_REPORT_COLUMNS        comma-separated column names, default
                              `issue,what it is,why it matters`
-  ORCH_REPORT_SUMMARY_LINES  positive item-line cap for write's summary,
-                             default 20; excludes blank lines, labels and
-                             the opening line
+  ORCH_REPORT_SUMMARY_LINES  positive top-level bullet cap for write's summary,
+                             default 20; excludes prose, labels, separators,
+                             indented bullets and the Next report line
   ORCH_CONNECTED_REPOS       blank-separated OWNER/REPO list, read through
                              orch-env in this checkout as oversee-watch reads
                              it: each entry, lowercased, is read after the
@@ -452,9 +451,10 @@ if ! SHAPE_FINDINGS="$(LC_ALL=C awk -v cap="$SUMMARY_LINES" '
     label = $0
     gsub(/\*/, "", label)
     sub(/^[[:space:]]+/, "", label)
+    sub(/^:[[:alnum:]_+-]+:[[:space:]]*/, "", label)
     if (label ~ /^Waiting on you(:|[[:space:]]*$)/) waiting = 1
-    if (NR > 1 && NF && label !~ /^(Landed|Running|Blocked|Waiting on you):?[[:space:]]*$/) {
-      items++
+    if ($0 ~ /^[[:space:]]*[-*][[:space:]]+/) {
+      if ($0 ~ /^[-*][[:space:]]+/) items++
       words = $0
       gsub(/<https?:\/\/[^<>|[:space:]]+\|/, "", words)
       gsub(/>/, "", words)
