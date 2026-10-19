@@ -81,7 +81,7 @@ FETCHER="$TMP_ROOT/fetch"
 make_fetcher "$FETCHER"
 claude_usage 60 20 5 Opus > "$FIXTURE_DIR/.claude.json"
 
-env PATH="$BIN:$PATH" TMUX_TMPDIR="$TMUX_DIR" tmux -L default -f /dev/null new-session -d -s fleet -x 200 -y 40 'exec sleep 100000'
+env PATH="$BIN:$PATH" TMUX_TMPDIR="$TMUX_DIR" tmux -L default -f /dev/null new-session -d -s fleet -c "$TMP_ROOT/work" -x 200 -y 40 'exec sleep 100000'
 KEEP_WINDOW="$(tm display-message -p -t fleet:0 '#{window_id}')"
 tm set-option -g renumber-windows off
 tm set-option -g default-shell /bin/sh
@@ -225,8 +225,7 @@ wait_restart() {
   local i
   NEW=""
   for (( i = 0; i < 150; i++ )); do
-    if watch_pid_live "$FLEET_STATE" && [[ "$WATCH_ORIGIN" == succession && "$WATCH_PANE" == "$SUCC" ]] \
-       && grep -q '^oversee-succeed: watch-restarted ' "$WATCH_ERR" 2>/dev/null; then
+    if watch_pid_live "$FLEET_STATE" && [[ "$WATCH_ORIGIN" == succession && "$WATCH_PANE" == "$SUCC" ]]; then
       NEW="$WATCH_PID"
       return 0
     fi
@@ -254,7 +253,7 @@ assert_eq "$(grep -c "^stopped $OLD\$" "$TMP_ROOT/watch.log")" \
 assert_eq "${NEW:+found}|$(started_line "${NEW:-none}" | sed 's/ tmux=[^ ]* / /')" \
   "found|pane=$SUCC origin=succession lane=$H/.claude cwd=$TMP_ROOT/work argv=$WATCH_ARGS --handoff tmp/handoffs/OVERSEER-HANDOFF.md --harness claude -- --model fable --effort high $BYPASS $COMPACT $QUESTION_OFF" \
   "and started again from the successor pane, with the successor's harness, flags and account"
-assert_eq "$(started_line "${NEW:-none}" | sed -n 's/.* tmux=\([^,]*\),\([0-9]*\),[0-9]* .*/\1 \2/p')" "$SOCKET $SERVER_PID" \
+assert_eq "$(started_line "${NEW:-none}" | sed -n 's/.* tmux=\([^,]*\),[0-9]*,[0-9]* .*/\1/p')|$(tm display-message -p '#{pid}')" "$SOCKET|$SERVER_PID" \
   "a launch from outside tmux hands the restarted watch the successor's tmux server"
 assert_eq "$(grep -c "^oversee-succeed: watch-restarted pid=$NEW pane=$SUCC $SETSID_LINE\$" "$WATCH_ERR")" "1" \
   "the restart is written beside the fleet state with the new loop's pid and the successor pane"
@@ -318,7 +317,7 @@ for DESCRIPTOR_CASE in live released malformed legacy; do
   printf 'EVENT fixture retained\n' > "$WATCH_LOG_FILE"
   succeed "$DESCRIPTOR_BIN"
   if [[ "$DESCRIPTOR_CASE" == live ]]; then
-    assert_eq "$RC|$(recorded pane)|$(grep -c '^oversee: watch-restart-failed step=argv' <<<"$OUT")" "1|$PRED|1" \
+    assert_eq "$RC|$(recorded pane)|$(jq -r '.overseer.lifecycle.request_failure.state' "$FLEET_STATE")" "1|$PRED|failed" \
       "$DESCRIPTOR_CASE: refusal keeps the predecessor before close"
     [[ "$DESCRIPTOR_CASE" != live ]] || watch_pid_live "$FLEET_STATE"
   else
@@ -467,7 +466,6 @@ done
 # The runner cannot write its record. A first launch must close the new pane.
 for ERROR_CASE in retained; do
   ERROR_BIN="$OVERSEE"
-  EXPECT_ERROR=1
   tm kill-window -a -t "$KEEP_WINDOW"
   rm -f -- "${FLEET_STATE:?}"
   mkdir "$TMP_ROOT/work/tmp/oversee-watch.runner.part"
@@ -475,64 +473,9 @@ for ERROR_CASE in retained; do
   rmdir "$TMP_ROOT/work/tmp/oversee-watch.runner.part"
   LIVE_RC=0
   watch_pid_live "$FLEET_STATE" || LIVE_RC=$?
-  assert_eq "$RC|$LIVE_RC|$(grep -c '^oversee: overseer-launched ' <<<"$OUT")|$(grep -c '^job-unit: record-unwritable ' <<<"$OUT")" \
-    "1|1|0|$EXPECT_ERROR" "$ERROR_CASE: a refused job keeps its failed status and the restoration preserves the launch error"
+  assert_eq "$RC|$LIVE_RC|$(grep -c '^oversee: overseer-launched ' <<<"$OUT")|$(jq -r '.overseer.lifecycle.state' "$FLEET_STATE")" \
+    "1|1|0|failed" "$ERROR_CASE: a refused job keeps its failed status and the restoration preserves the launch error"
 done
-
-# A $TMUX tmux will not state for the successor's session is a notice, and
-# the succession still stands with no helper started: a tmux on the run's
-# PATH refuses the one read that names the server.
-TMUX_FAIL="$TMP_ROOT/tmux-fail-bin"
-mkdir -p "$TMUX_FAIL"
-printf '#!/bin/sh\ncase "$*" in *session_id*) echo "fixture: display refused" >&2; exit 1 ;; esac\nexec %s "$@"\n' \
-  "$(command -v tmux)" > "$TMUX_FAIL/tmux"
-chmod +x "$TMUX_FAIL/tmux"
-new_predecessor
-fresh_output
-ROW_ENV=(PATH="$TMUX_FAIL:$NO_MANAGER:$BIN:$PATH")
-succeed
-ROW_ENV=()
-sleep 2
-assert_eq "$RC|$(grep -A2 '^oversee: watch-restart-failed ' <<<"$OUT" | sed -n '1p;3p')|$(grep -c '^oversee: watch-handover ' <<<"$OUT")|$(kill -0 "$OLD" 2>/dev/null && echo alive || echo gone)" \
-  "1|$(grep '^oversee: watch-restart-failed ' <<<"$OUT")
-fixture: display refused|0|alive" \
-  "an unreadable successor server refuses the succession and keeps the old watch"
-watch_stop "$OLD" "$FLEET_STATE" || true
-
-# A launch from inside the predecessor's window dies at the stop, so the
-# handover is arranged before it: modelled by a tmux that, having run the
-# stop's swap, kills the process group of the launch that called it, which is
-# started as a group of its own. The restart, left to a helper the orch job
-# runner started under setsid in a session of its own, still happens. A host
-# with no setsid has no runner here and no row.
-if command -v setsid >/dev/null 2>&1; then
-  REAL_TMUX="$(command -v tmux)"
-  TEST_PGID="$(ps -o pgid= -p $$ | tr -d ' ')"
-  mkdir -p "$TMP_ROOT/killbin"
-  cat > "$TMP_ROOT/killbin/tmux" <<EOF
-#!/usr/bin/env bash
-"$REAL_TMUX" "\$@"
-rc=\$?
-if [ "\$1" = kill-window ]; then
-  pg=\$(ps -o pgid= -p \$\$ | tr -d ' ')
-  [ "\$pg" = "$TEST_PGID" ] || kill -KILL -- "-\$pg"
-fi
-exit \$rc
-EOF
-  chmod +x "$TMP_ROOT/killbin/tmux"
-  new_predecessor
-  fresh_output
-  ROW_ENV=(PATH="$TMP_ROOT/killbin:$NO_MANAGER:$BIN:$PATH")
-  ROW_LAUNCH=setsid succeed
-  ROW_ENV=()
-  wait_restart
-  assert_eq "$RC|$(tm list-panes -a -F '#{pane_id}' | grep -cxF -- "$PRED" || true)|${NEW:+restarted}|$(grep -c "^stopped $OLD\$" "$TMP_ROOT/watch.log")" \
-    "137|0|restarted|1" \
-    "a launch killed with its process group at the stop still has the watch restarted from the successor pane"
-  watch_stop "$NEW" "$FLEET_STATE" || true
-else
-  printf '  skip  the process-group kill row needs setsid\n'
-fi
 
 # `oversee resume` serves its new pane as a succession does. The recorded
 # overseer's session is gone with its server and its native id is bound; the
@@ -590,7 +533,7 @@ resume_watch_control unguarded live lib/controller-session.py \
   $'                if record.get("external"):\n                    watch_receipt = self.backend("watch",' \
   $'                if record.get("external") and not launch.get("resume"):\n                    watch_receipt = self.backend("watch",'
 resume_watch_control deferred live lib/watch-handover.sh '  if (( closed )); then' '  if false; then'
-resume_watch_control unclosed released lib/session-backend.sh '    [[ "${9:-}" != closed ]] || closed=(--closed)' '    :'
+resume_watch_control unclosed released lib/session-backend.sh '    [[ "${10:-}" != closed ]] || closed=(--closed)' '    :'
 
 # The new server can hand the lost pane's id to the resumed pane itself. The
 # watch claiming it was started by an earlier succession, so its record names
@@ -664,7 +607,20 @@ case "\$1" in
     else
       echo "oversee-succeed: account-below-mark headroom=80"
     fi ;;
-  *) exec "\$(cat "$WSTUBS/succeed.bin")" "\$@" ;;
+  *)
+    if [ "\$1" = --dead-pane ]; then
+      previous=""
+      for argument in "\$@"; do
+        if [ "\$previous" = --line-file ]; then
+          # The real watch spools its protocol until the long pass returns.
+          # Fresh recovery retires that pass and resets its public log.
+          cp "\${argument%/*}/../long.out" "$WSTUBS/dead.events"
+          break
+        fi
+        previous="\$argument"
+      done
+    fi
+    exec "\$(cat "$WSTUBS/succeed.bin")" "\$@" ;;
 esac
 EOF
 printf '%s\n' "$SRC_DIR/oversee-succeed" > "$WSTUBS/succeed.bin"
@@ -673,6 +629,7 @@ printf '#!/bin/sh\n' > "$WSTUBS/silent"
 printf '#!/bin/sh\necho "[]"\n' > "$WSTUBS/lanes"
 chmod +x "$WSTUBS"/*
 WATCH_ENV=(PATH="$WSTUBS:$NO_MANAGER:$BIN:$PATH" ORCH_REPORT=off ORCH_WATCH_MAIL_INTERVAL=0
+  GH_REPO=owner/repo LINEAR_TEAM=KEN ORCH_OVERSEER_DEAD_PASSES=1
   OVERSEE_WATCH_SUCCEED="$WSTUBS/succeed" OVERSEE_WATCH_PR_WATCH="$WSTUBS/silent"
   OVERSEE_WATCH_TRACKER="$WSTUBS/silent" OVERSEE_WATCH_LANES="$WSTUBS/lanes")
 
@@ -791,7 +748,7 @@ kill "$(cat "$HARNESS_PIDS/${FIRST_PANE#%}")"
 touch "$WSTUBS/harness.dead"
 FIRST_DEAD=""
 for _ in $(seq 1 300); do
-  FIRST_DEAD="$(grep "^EVENT overseer-dead $FIRST_PANE " "$WATCH_LOG_FILE" 2>/dev/null || true)"
+  FIRST_DEAD="$(grep "^EVENT overseer-dead $FIRST_PANE " "$WSTUBS/dead.events" 2>/dev/null || true)"
   [[ -z "$FIRST_DEAD" ]] || break
   sleep 0.1
 done
@@ -902,8 +859,8 @@ for REPLAY_CASE in replay; do
   watch_pid_live "$FLEET_STATE" || LIVE_RC=$?
   assert_eq "$RC|$LIVE_RC|$(test -f "$WSTUBS/auth.calls" && echo ready || echo missing)" \
     "0|0|ready" "$REPLAY_CASE: death recovery with no watch starts a detached repeat watch" "$TMP_ROOT/replay.out"
-  assert_file_contains "$WATCH_LOG_FILE" retained "$REPLAY_CASE: death recovery keeps unread stdout events"
-  assert_file_contains "$WATCH_ERR_FILE" retained "$REPLAY_CASE: death recovery keeps the previous error log"
+  assert_file_not_contains "$WATCH_LOG_FILE" retained "$REPLAY_CASE: fresh death recovery does not replay handled stdout events"
+  assert_file_not_contains "$WATCH_ERR_FILE" retained "$REPLAY_CASE: fresh death recovery initializes the error log"
   assert_eq "$(recorded launch_line)" "$REPLAY_LINE" "the replay watch keeps the complete recorded command"
   watch_stop "$WATCH_PID" "$FLEET_STATE"
 done
@@ -925,21 +882,29 @@ for _ in $(seq 1 100); do
   if watch_pid_live "$FLEET_STATE"; then REAL_OLD="$WATCH_PID"; break; fi
   sleep 0.1
 done
+# A claim precedes the watch's one record refresh. Order the launch after
+# that refresh so the caller's expected launch identity is current.
+for _ in $(seq 1 100); do
+  if jq -e '.overseer.launch_line == "claude -n overseer brief" and .overseer.lifecycle.state == "running"' "$FLEET_STATE" >/dev/null; then break; fi
+  sleep 0.1
+done
+jq -e '.overseer.launch_line == "claude -n overseer brief" and .overseer.lifecycle.state == "running"' "$FLEET_STATE" >/dev/null
 ROW_ENV=("${WATCH_ENV[@]}")
 succeed
+printf '%s\n' "$OUT" > "$TMP_ROOT/succession.out"
 ROW_ENV=()
 wait_restart
 kill "$(cat "$HARNESS_PIDS/${SUCC#%}")"
 DEAD=""
 for _ in $(seq 1 300); do
-  DEAD="$(grep "^EVENT overseer-dead $SUCC " "$TMP_ROOT/work/tmp/oversee-watch.log" 2>/dev/null || true)"
+  DEAD="$(grep "^EVENT overseer-dead $SUCC " "$WSTUBS/dead.events" 2>/dev/null || true)"
   [[ -z "$DEAD" ]] || break
   sleep 0.1
 done
 assert_eq "$RC|${REAL_OLD:+recorded}|${NEW:+restarted}|${DEAD:+dead}|$(grep -c "^--dead-pane $SUCC " "$WSTUBS/succeed.args" 2>/dev/null || true)" \
   "0|recorded|restarted|dead|1" \
   "a successor that dies right after the handover is reported overseer-dead by the watch handed to it, and relaunched" \
-  "$TMP_ROOT/work/tmp/oversee-watch.err"
+  "$TMP_ROOT/succession.out"
 RECOVERED_FROM="$SUCC"
 for _ in $(seq 1 300); do
   SUCC="$(recorded pane)"

@@ -10,7 +10,7 @@
 # lane-mail-check copy the control at the end runs against.
 set -euo pipefail
 
-unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE
+unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE ORCH_STATE_DIR JARVIS_RECORD JARVIS_GENERATION
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOKS="$(cd "$TEST_DIR/.." && pwd)"
@@ -86,6 +86,8 @@ new_checkout() { # NAME [HOOK_HOME]
   CHECKOUT="$TMP_ROOT/$1"
   mkdir -p "$CHECKOUT"
   git -C "$CHECKOUT" init -q
+  git -C "$CHECKOUT" config gc.auto 0
+  git -C "$CHECKOUT" config maintenance.auto false
   git -C "$CHECKOUT" checkout -q -b main
   git -C "$CHECKOUT" -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m base
   mkdir -p "$CHECKOUT/.agents/skills/orch" "$CHECKOUT/$HOOK_HOME" "$CHECKOUT/.claude/skills" \
@@ -106,6 +108,21 @@ new_checkout() { # NAME [HOOK_HOME]
 }
 
 RC=0
+# Each owned Perl carrier binds its actual live identity before its hook.
+# Synthetic server/pane values remain parser inputs, never liveness evidence.
+NATIVE_BIND="$TMP_ROOT/native-bind"
+cat > "$NATIVE_BIND" <<'NATIVEBIND'
+set -euo pipefail
+[[ -f "$JARVIS_RECORD" ]] || exit 0
+jq -e '.overseer.lifecycle | type == "object"' "$JARVIS_RECORD" >/dev/null 2>&1 || exit 0
+source "$SESSION_ROWS_TEST_LIB"
+started="$(lane_process_start "$1")" || exit 1
+[[ -n "$started" ]]
+jq --argjson pid "$1" --arg at "$started" \
+  '.overseer.lifecycle.native_process = {pid:$pid,started_at:$at}' \
+  "$JARVIS_RECORD" > "$JARVIS_RECORD.fixture"
+mv "$JARVIS_RECORD.fixture" "$JARVIS_RECORD"
+NATIVEBIND
 # in_pane COMMAND... — COMMAND as a harness in pane %9 runs its hook: a pane
 # shell, whose pid is the pane's, then one process that is no shell, perl
 # standing in for the harness, forking COMMAND. NESTED=1 puts a second such
@@ -115,7 +132,9 @@ in_pane() { # COMMAND...
     TMUX_PANE_PID=9000 "$@"
     return
   fi
-  local harness=(perl -e 'exit(system(@ARGV) >> 8)' --)
+  local harness=(perl -e 'if (length($ENV{JARVIS_RECORD} // "")) {
+    system($ENV{SESSION_ROWS_TEST_BASH}, $ENV{SESSION_ROWS_TEST_BIND}, $$) == 0 or exit 1;
+  } exit(system(@ARGV) >> 8)' --)
   [ "${NESTED:-0}" -eq 0 ] || harness+=(perl -e 'exit(system(@ARGV) >> 8)' --)
   bash -c 'TMUX_PANE_PID=$$ "$@"; exit $?' pane-shell "${harness[@]}" "$@"
 }
@@ -128,6 +147,8 @@ run() { # WRAPPER PAYLOAD [ENV=VAL...]
   printf '%s' "$payload" |
     (cd "$CHECKOUT" && env -u CLAUDE_PROJECT_DIR -u CODEX_HOME -u LANE_MAIL_ITEM \
       "PATH=$TMUX_BIN:$PATH" TMUX=fake TMUX_PANE=%9 TMUX_SERVER_ID=7000 \
+      SESSION_ROWS_TEST_BASH="$BASH" SESSION_ROWS_TEST_BIND="$NATIVE_BIND" \
+      SESSION_ROWS_TEST_LIB="$REPO_ROOT/skills/orch/scripts/lib/lane-state.sh" \
       CLAUDE_CONFIG_DIR=/accounts/one "$@" bash -c "$(declare -f in_pane); in_pane \"\$@\"" _ \
       bash "$CHECKOUT/$HOOK_HOME/$wrapper.sh") \
     >"$TMP_ROOT/stdout" 2>"$ERR_FILE" || RC=$?
@@ -565,10 +586,11 @@ jarvis_checkout() { # LABEL HOOK_HOME [PREASSIGNED] [MAILBOX=absent]
   new_checkout "$1" "$2"
   [ "${4:-absent}" = present ] || rm -rf -- "${CHECKOUT:?}/tmp"
   RECORD="$TMP_ROOT/$1-record.json"
-  jq -nc --arg harness "$harness" --arg id "${3:-}" '{harness: $harness, generation: 3, pending: ({generation: 3, server: 7000, pane: "%9"}
-    + (if $id == "" then {} else {native_session_id: $id} end))}' >"$RECORD"
+  jq -nc --arg harness "$harness" --arg id "${3:-}" '{overseer:{lifecycle:{harness: $harness, generation: 3, pending: ({generation: 3, server: 7000, pane: "%9"}
+    + (if $id == "" then {} else {native_session_id: $id} end))}}}' >"$RECORD"
 }
-pending() { jq -r '[.pending.native_session_id, .pending.session_file, (.pending.started_at | type)] | map(. // "-") | join(",")' "$RECORD"; }
+pending() { jq -r '.overseer.lifecycle | [.pending.native_session_id, .pending.session_file, (.pending.started_at | type)] | map(. // "-") | join(",")' "$RECORD"; }
+record_contents() { jq -c 'del(.overseer.lifecycle.native_process)' "$RECORD"; }
 JARVIS_ENV=(JARVIS_GENERATION=3)
 while IFS='|' read -r label home preassigned payload want account; do
   jarvis_checkout "jarvis_$label" "$home" "$preassigned"
@@ -576,7 +598,7 @@ while IFS='|' read -r label home preassigned payload want account; do
     "JARVIS_RECORD=$RECORD" "${JARVIS_ENV[@]}"
   assert_eq "RC=$RC first=$(first_line) pending=$(pending) mailbox=$([ -e "$CHECKOUT/tmp" ] && echo made || echo none)" \
     "RC=0 first=- pending=$want mailbox=none" "a managed $label start records its native identity with no mailbox"
-  assert_eq "$(jq -r '.pending.observed_account' "$RECORD")" "$account" \
+  assert_eq "$(jq -r '.overseer.lifecycle.pending.observed_account' "$RECORD")" "$account" \
     "a managed $label start acknowledges its native account"
 done <<JARVISTABLE
 claude|.claude/hooks|5f0c|$START|5f0c,/t/5f0c.jsonl,number|/accounts/one
@@ -593,9 +615,9 @@ JARVISTABLE
 jarvis_untouched() { # LABEL PAYLOAD WANT_FIRST [ENV=VAL...]
   local label="$1" payload="$2" want="$3" before
   shift 3
-  before="$(cat "$RECORD")"
+  before="$(record_contents)"
   run session-start-row "$payload" "$@"
-  assert_eq "RC=$RC first=$(first_line) same=$([ "$(cat "$RECORD")" = "$before" ] && echo yes || echo no)" \
+  assert_eq "RC=$RC first=$(first_line) same=$([ "$(record_contents)" = "$before" ] && echo yes || echo no)" \
     "RC=0 first=$want same=yes" "$label"
 }
 jarvis_checkout jarvis_unmanaged .claude/hooks
@@ -616,7 +638,7 @@ run session-start-row "$START" "JARVIS_RECORD=$RECORD" "${JARVIS_ENV[@]}"
 jarvis_untouched "a second start of a recorded launch leaves the first identity" \
   "${START/5f0c/6a1d}" - "JARVIS_RECORD=$RECORD" "${JARVIS_ENV[@]}"
 jarvis_checkout jarvis_other_harness .claude/hooks
-jq '.harness = "codex"' "$RECORD" >"$RECORD.next"
+jq '.overseer.lifecycle.harness = "codex"' "$RECORD" >"$RECORD.next"
 mv "$RECORD.next" "$RECORD"
 jarvis_untouched "another native harness leaves the managed record unchanged" "$START" - \
   "JARVIS_RECORD=$RECORD" "${JARVIS_ENV[@]}"
@@ -659,18 +681,18 @@ COP_SUB_TOOL='{"sessionId":"s9","timestamp":1790975267602,"cwd":"/work","toolNam
 assert_eq "$(find "$COP_HOME_DIR" -path '*/copilot-leads/*' | wc -l | tr -d ' ')" "0" \
   "no Copilot lead record stands for the brief-taken rows"
 jarvis_delivered() { # PATCH
-  jq -c "{state: \"starting\", brief_delivered: true} + . | .pending += {started_at: 1790000001} | $1" "$RECORD" >"$RECORD.next"
+  jq -c ".overseer.lifecycle |= ({state: \"starting\", brief_delivered: true} + . | .pending += {started_at: 1790000001} | $1)" "$RECORD" >"$RECORD.next"
   mv "$RECORD.next" "$RECORD"
 }
-taken() { jq -r '.pending.brief_taken // "none"' "$RECORD"; }
+taken() { jq -r '.overseer.lifecycle.pending.brief_taken // "none"' "$RECORD"; }
 while IFS='|' read -r label home id wrapper payload patch want env; do
   jarvis_checkout "jarvis_taken_$label" "$home" "$id"
   jarvis_delivered "$patch"
-  before="$(jq -c 'del(.pending.brief_taken)' "$RECORD")"
+  before="$(jq -c 'del(.overseer.lifecycle.pending.brief_taken,.overseer.lifecycle.native_process)' "$RECORD")"
   # shellcheck disable=SC2086  # env is a list of assignments.
   run "$wrapper" "$payload" "JARVIS_RECORD=$RECORD" $env
   # A turn end goes on to judgements of its own, which report on this fixture.
-  assert_eq "RC=$RC unwritten=$(grep -c '^lane-mail-check: jarvis-rows-' "$ERR_FILE" || true) taken=$(taken) rest=$([ "$(jq -c 'del(.pending.brief_taken)' "$RECORD")" = "$before" ] && echo same || echo changed)" \
+  assert_eq "RC=$RC unwritten=$(grep -c '^lane-mail-check: jarvis-rows-' "$ERR_FILE" || true) taken=$(taken) rest=$([ "$(jq -c 'del(.overseer.lifecycle.pending.brief_taken,.overseer.lifecycle.native_process)' "$RECORD")" = "$before" ] && echo same || echo changed)" \
     "RC=0 unwritten=0 taken=$want rest=same" "brief-taken stamp: $label"
 done <<JARVISTAKEN
 claude-tool|.claude/hooks|5f0c|lane-mail-halt|$TOOL|.|true|JARVIS_GENERATION=3
@@ -705,19 +727,19 @@ JARVISTAKEN
 # agentStop for a subagent under its own session id.
 COP_SUB_STOP='{"sessionId":"s9","timestamp":1790975267602,"cwd":"/work","stopReason":"end_turn"}'
 stamp() { # FIELD
-  jq -r --arg field "$1" '.pending[$field] // "none"' "$RECORD"
+  jq -r --arg field "$1" '.overseer.lifecycle.pending[$field] // "none"' "$RECORD"
 }
 jarvis_kickoff() { # PATCH
-  jq -c "{state: \"starting\"} + . | .pending += {started_at: 1790000001} | $1" "$RECORD" >"$RECORD.next"
+  jq -c ".overseer.lifecycle |= ({state: \"starting\"} + . | .pending += {started_at: 1790000001} | $1)" "$RECORD" >"$RECORD.next"
   mv "$RECORD.next" "$RECORD"
 }
 while IFS='|' read -r label home id wrapper payload patch want env; do
   jarvis_checkout "jarvis_kickoff_$label" "$home" "$id"
   jarvis_kickoff "$patch"
-  before="$(jq -c 'del(.pending.kickoff_ended)' "$RECORD")"
+  before="$(jq -c 'del(.overseer.lifecycle.pending.kickoff_ended,.overseer.lifecycle.native_process)' "$RECORD")"
   # shellcheck disable=SC2086  # env is a list of assignments.
   run "$wrapper" "$payload" "JARVIS_RECORD=$RECORD" $env
-  assert_eq "RC=$RC unwritten=$(grep -c '^lane-mail-check: jarvis-rows-' "$ERR_FILE" || true) ended=$(stamp kickoff_ended) rest=$([ "$(jq -c 'del(.pending.kickoff_ended)' "$RECORD")" = "$before" ] && echo same || echo changed)" \
+  assert_eq "RC=$RC unwritten=$(grep -c '^lane-mail-check: jarvis-rows-' "$ERR_FILE" || true) ended=$(stamp kickoff_ended) rest=$([ "$(jq -c 'del(.overseer.lifecycle.pending.kickoff_ended,.overseer.lifecycle.native_process)' "$RECORD")" = "$before" ] && echo same || echo changed)" \
     "RC=0 unwritten=0 ended=$want rest=same" "kickoff-ended stamp: $label"
 done <<JARVISKICKOFF
 codex-stop|.codex/hooks|019a|lane-mail-check|$CODEX_STOP|.|true|JARVIS_GENERATION=3
@@ -763,13 +785,13 @@ while IFS='@' read -r old new label preassigned env; do
   LIB="$CHECKOUT/.agents/skills/orch/scripts/lib/session-rows.sh"
   mutate_lib "$old" "$new"
   if [ "$label" = harness ]; then
-    jq '.harness = "codex"' "$RECORD" >"$RECORD.next"
+    jq '.overseer.lifecycle.harness = "codex"' "$RECORD" >"$RECORD.next"
     mv "$RECORD.next" "$RECORD"
   fi
-  before="$(cat "$RECORD")"
+  before="$(record_contents)"
   # shellcheck disable=SC2086  # env is a list of assignments.
   run session-start-row "$START" "JARVIS_RECORD=$RECORD" $env
-  assert_eq "changed=$([ "$(cat "$RECORD")" = "$before" ] && echo no || echo yes)" \
+  assert_eq "changed=$([ "$(record_contents)" = "$before" ] && echo no || echo yes)" \
     "changed=$([ "$label" = call ] && echo no || echo yes)" "control: $label"
 done <<'JARVISCONTROL'
 session_rows_jarvis_write "$JARVIS_RECORD" "${JARVIS_GENERATION:-}" "$key" "$2" <<<"$payload"@:@call@@JARVIS_GENERATION=3
@@ -842,7 +864,7 @@ cp -R "$REPO_ROOT/skills/orch/scripts" "$CHECKOUT/.agents/skills/orch/scripts"
 LIB="$CHECKOUT/.agents/skills/orch/scripts/lib/session-rows.sh"
 mutate_lib 'observed_account: $account' 'observed_account: ""'
 run session-start-row "$START" "JARVIS_RECORD=$RECORD" "${JARVIS_ENV[@]}"
-CONTROL_OUT="$(assert_eq "$(jq -r '.pending.observed_account' "$RECORD")" /accounts/one \
+CONTROL_OUT="$(assert_eq "$(jq -r '.overseer.lifecycle.pending.observed_account' "$RECORD")" /accounts/one \
   'native account acknowledgement')"
 assert_eq "$(grep -c '^  FAIL  native account acknowledgement$' <<<"$CONTROL_OUT")" "1" \
   "control: absent native acknowledgement fails the account assertion"

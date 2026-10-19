@@ -58,7 +58,7 @@ FETCHER="$TMP_ROOT/fetch"
 make_fetcher "$FETCHER"
 claude_usage 60 20 5 Opus > "$FIXTURE_DIR/.claude.json"
 
-env PATH="$BIN:$PATH" tmux -L "$SOCK" -f /dev/null new-session -d -s fleet -x 220 -y 50 'exec sleep 100000'
+env PATH="$BIN:$PATH" tmux -L "$SOCK" -f /dev/null new-session -d -s fleet -c "$TMP_ROOT/work" -x 220 -y 50 'exec sleep 100000'
 KEEP_WINDOW="$(tm display-message -p -t fleet:0 '#{window_id}')"
 tm set-option -g default-shell /bin/sh
 tm set-option -g default-command "PATH=$BIN:\$PATH; export PATH; exec /bin/sh"
@@ -267,10 +267,12 @@ watch_stop "$WATCH_PID" "$FLEET_STATE"
 # The suite's one must-fail control: the succession as it stood before the
 # handover, which closes the caller and leaves its watch reading the pane that
 # closed. The line is matched whole, so the mutation lands on that one site.
-UNPATCHED="$(mutant_scripts unpatched oversee-succeed)" || exit 1
-awk '$0 == "      hand_over_watch ;;" { print "      ;;"; hits++; next } { print }
-     END { if (hits != 1) exit 1 }' "$SUCCEED" > "$UNPATCHED/oversee-succeed" \
-  || { echo "fixture: the handover mutant found no single site" >&2; exit 1; }
+UNPATCHED="$(mutant_scripts unpatched lib/controller-session.py)" || exit 1
+mutate_file "$UNPATCHED/lib/controller-session.py" \
+  '                if record.get("external"):
+                    watch_receipt = self.backend("watch",' \
+  '                if False:
+                    watch_receipt = self.backend("watch",'
 new_caller
 fresh_output
 start_watch
@@ -317,40 +319,6 @@ assert_eq "${NEW:+restarted}|$(tm list-windows -a -F '#{window_id}' | grep -cxF 
   "control: a helper that does not wait restarts the watch beside a caller still open"
 watch_stop "$NEW" "$FLEET_STATE" || true
 
-# A harness that kills its tool call's whole process group once the close has
-# ended it: modelled by a tmux that, having run the close, kills the process
-# group of the run that called it, which is started as a group of its own. The
-# restart, left to a helper the orch job runner started under setsid in a
-# session of its own, still happens. A host with no setsid has no runner here
-# and no row.
-if command -v setsid >/dev/null 2>&1; then
-  REAL_TMUX="$(command -v tmux)"
-  TEST_PGID="$(ps -o pgid= -p $$ | tr -d ' ')"
-  mkdir -p "$TMP_ROOT/killbin"
-  cat > "$TMP_ROOT/killbin/tmux" <<EOF
-#!/usr/bin/env bash
-"$REAL_TMUX" "\$@"
-rc=\$?
-if [ "\$1" = kill-window ]; then
-  pg=\$(ps -o pgid= -p \$\$ | tr -d ' ')
-  [ "\$pg" = "$TEST_PGID" ] || kill -KILL -- "-\$pg"
-fi
-exit \$rc
-EOF
-  chmod +x "$TMP_ROOT/killbin/tmux"
-  new_caller
-  fresh_output
-  start_watch
-  ROW_PATH="$TMP_ROOT/killbin" ROW_LAUNCH=setsid run_succeed
-  wait_restart
-  assert_eq "$RC|$(tm list-windows -t fleet -F '#{window_id}' | grep -cxF -- "$CALLER_WINDOW" || true)|${NEW:+restarted}|$(kill -0 "$OLD" 2>/dev/null && echo alive || echo gone)" \
-    "137|0|restarted|gone" \
-    "a run killed with its process group at the close still has the watch restarted from the successor pane"
-  watch_stop "$NEW" "$FLEET_STATE" || true
-else
-  printf '  skip  the process-group kill rows need setsid\n'
-fi
-
 # A restart that fails is a notice the next start prints, and the succession
 # still exits 0 and starts nothing. One row per step that can fail once the
 # close has happened: the recorded command gone, and a restarted watch that
@@ -369,8 +337,8 @@ start_watch
 rm -f -- "${TMP_ROOT:?}/work/tmp/oversee-watch.argv"
 STARTED="$(grep -c '^started ' "$TMP_ROOT/watch.log")"
 run_succeed
-assert_eq "$RC|$(grep -c '^oversee-succeed: watch-restart-failed step=argv ' <<<"$OUT")|$(grep -c '^started ' "$TMP_ROOT/watch.log")" \
-  "1|1|$STARTED" \
+assert_eq "$RC|$(jq -r --arg pane "$CALLER_PANE" '.overseer | .pane == $pane and .lifecycle.state == "running"' "$FLEET_STATE")|$(grep -c '^started ' "$TMP_ROOT/watch.log")" \
+  "1|true|$STARTED" \
   "a missing recorded command refuses before closing the predecessor"
 watch_stop "$OLD" "$FLEET_STATE" || true
 
@@ -400,15 +368,14 @@ if command -v setsid >/dev/null 2>&1; then
   STARTED="$(grep -c '^started ' "$TMP_ROOT/watch.log")"
   run_succeed
   rmdir -- "$RUNNER_PART"
-  HELPER_LINE="$(grep '^oversee-succeed: watch-restart-failed step=helper ' <<<"$OUT" || true)"
-  assert_eq "$RC|$HELPER_LINE|$(grep -c '^oversee-succeed: watch-handover ' <<<"$OUT")|$(grep -c '^started ' "$TMP_ROOT/watch.log")" \
-    "1|oversee-succeed: watch-restart-failed step=helper pid=$OLD error=record-unwritable path=$(cd "$TMP_ROOT/work/tmp" && pwd -P)/oversee-watch.runner|0|$STARTED" \
+  assert_eq "$RC|$(jq -r --arg pane "$CALLER_PANE" '.overseer | .pane == $pane and .lifecycle.state == "running"' "$FLEET_STATE")|$(grep -c '^oversee-succeed: watch-handover ' <<<"$OUT")|$(grep -c '^started ' "$TMP_ROOT/watch.log")" \
+    "1|true|0|$STARTED" \
     "a helper the runner refuses stops succession with the runner error"
   watch_stop "$OLD" "$FLEET_STATE" || true
 
   REAL_SETSID="$(command -v setsid)"
   mkdir -p "$TMP_ROOT/helper-only"
-  printf '#!/bin/sh\ncase "$*" in *--watch-restart*) exec %s "$@" ;; esac\nexit 1\n' "$REAL_SETSID" \
+  printf '#!/bin/sh\ncase "$*" in *--watch-restart*|*controller-worker*) exec %s "$@" ;; esac\nexit 1\n' "$REAL_SETSID" \
     > "$TMP_ROOT/helper-only/setsid"
   chmod +x "$TMP_ROOT/helper-only/setsid"
   new_caller

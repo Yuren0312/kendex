@@ -34,12 +34,11 @@ def main():
                     ("walled account reused", "orch/scripts/lib/controller-session.py",
                      'choice = json.loads(self.backend("select", record["harness"], record["account"], self.home,\n                                             choice.get("model", ""), choice.get("effort", "")).stdout)',
                      'choice = {"harness": record["harness"], "account": record["account"], "model": "", "effort": ""}', "test_account_succession"),
-                    ("missing dependency status", "orch/scripts/lib/controller-session.py",
-                     'if not (BACKEND.parents[3] / "orch/scripts").is_dir():',
-                     'if False:', "test_missing_orch_keeps_predecessor"),
+                    ("missing dependency status", "jarvis/scripts/jarvis-session",
+                     'exit 2; }', 'exit 1; }', "test_missing_orch_keeps_predecessor"),
                     ("model context helper missing", "orch/scripts/lib/session-backend.sh",
-                     '    source "$SCRIPT_DIR/lib/lane-context.sh"',
-                     '    : source "$SCRIPT_DIR/lib/lane-context.sh"', "test_account_succession"),
+                     '    source "$SCRIPT_DIR/lib/lane-context.sh"\n    source "$SCRIPT_DIR/lib/overseer-launch.sh"',
+                     '    : source "$SCRIPT_DIR/lib/lane-context.sh"\n    source "$SCRIPT_DIR/lib/overseer-launch.sh"', "test_account_succession"),
                     ("selected launch words dropped", "orch/scripts/lib/session-backend.sh",
                      'if [[ -n "${13:-}${14:-}" ]]; then',
                      'if false && [[ -n "${13:-}${14:-}" ]]; then', "test_account_succession"),
@@ -59,6 +58,21 @@ def main():
                      'if not shutil.which(choice["harness"]):',
                      'if False and not shutil.which(choice["harness"]):', "test_account_succession")]
         controls.extend([
+            ("retained native generation", "orch/scripts/lib/session-rows.sh",
+             '| select(bound($generation; $server; $pane; $harness))',
+             '| select(bound($generation; $server; $pane; $harness) and (.generation | tostring) == $generation)', "test_orch_retirement_order"),
+            ("retained native chain", "orch/scripts/lib/session-rows.sh", '.overseer.lifecycle | owned',
+             '[.overseer.lifecycle,.overseer.lifecycle.predecessor][]', "test_orch_retirement_order"),
+            ("retained native exit chain", "orch/scripts/lib/overseer-launch.sh", 'path(owned | select(native_run))',
+             'path(. | select(native_run))', "test_orch_retirement_order"),
+            ("retained controller selection", "orch/scripts/lib/controller-session.py",
+             'named = self.controller(record, include_ended=True) or record', 'named = record', "test_orch_retirement_order"),
+            ("Start candidate cleanup", "orch/scripts/lib/controller-session.py",
+             'cleanup_window = verb in ("succeed", "launch") or bool((acquired or record or {}).get("predecessor"))',
+             'cleanup_window = verb in ("succeed", "launch")', "test_orch_retirement_order"),
+            ("retained controller completion", "orch/scripts/lib/controller-session.py",
+             '            failure = (current or {}).get("request_failure")\n            if failure and failure["generation"] == generation:\n                return self.answer(current, state=failure["state"], reason=failure["reason"], detail=failure["detail"]), 1\n            if answer["state"] not in ("starting", "handing-over"):\n                pending = (current or {}).get("pending") or {}\n                complete = (answer["state"] == "running" and current["generation"] == generation\n                            and pending.get("generation") == generation and pending.get("brief_taken"))',
+             '            if answer["state"] not in ("starting", "handing-over"):\n                complete = answer["state"] == "running" and current["generation"] == generation', "test_orch_retirement_order"),
             ("selected registration record", "orch/scripts/lib/overseer-launch.sh",
              'ORCH_STATE_DIR="${path%/*}" "$SCRIPT_DIR/controller-session" register --home "${PROJECT_ROOT:-$PWD}"',
              '"$SCRIPT_DIR/controller-session" register --home "${cwd:-$PWD}"', "test_registration_selected_record"),
@@ -67,10 +81,21 @@ def main():
              '                    path = Path(self.home) / path', "test_shared_orch_launch_and_recovery"),
             ("sole controller", "orch/scripts/lib/controller-session.py", '        state["overseer"] = owner',
              '        owner = {"lifecycle": record}\n        state["overseer"] = owner', "test_shared_controller_mail"),
-            ("retirement before native work", "orch/scripts/lib/controller-session.py", '                    self.end_owned(record.get("predecessor"), window=True)',
-             '                    if False:\n                        self.end_owned(record.get("predecessor"), window=True)', "test_orch_retirement_order"),
+            ("native question policy", "orch/scripts/lib/lane-launch.sh",
+             '      [[ "$native_words" != *"$nl${question_words// /$nl}$nl"* ]] || question_policy=(--question-off)',
+             '      :', "test_shared_recovery_harnesses"),
+            ("registered native exit", "orch/scripts/lib/controller-session.py", '"native_exit": owner.get("exit"),',
+             '"native_exit": None,', "test_shared_recovery_harnesses"),
+            ("watch service policy", "orch/scripts/lib/controller-session.py",
+             '("select", "open", "watch", "worker-launch", "worker-cancel")',
+             '("select", "open", "worker-launch", "worker-cancel")', "test_shared_orch_launch_and_recovery"),
+            ("retirement before native work", "orch/scripts/lib/controller-session.py", '                self.end_owned(predecessor, window=True, predecessors=True)',
+             '                if False:\n                    self.end_owned(predecessor, window=True, predecessors=True)', "test_orch_retirement_order"),
             ("legacy authority", "orch/scripts/lib/controller-session.py", '        if self.legacy.exists():',
              '        if False and self.legacy.exists():', "test_legacy_controller_refuses_replacement"),
+            ("legacy retirement generation", "orch/scripts/lib/controller-session.py",
+             'if any(current_legacy.get(key) != legacy.get(key) for key in ("generation", "terminal", "worker")):',
+             'if False:', "test_legacy_controller_refuses_replacement"),
             ("legacy worker retirement", "orch/scripts/lib/controller-session.py", '            if legacy.get("worker") and self.worker_live(legacy):',
              '            if False and legacy.get("worker") and self.worker_live(legacy):', "test_legacy_controller_refuses_replacement"),
         ])
@@ -87,11 +112,32 @@ def main():
             result = subprocess.run([os.environ["JARVIS_TEST_BASH"], str(ROOT / "skills/jarvis/tests/succession.test.sh"),
                                      "--failfast", "SuccessionContract." + case], env=env, capture_output=True, text=True, timeout=180)
             assert result.returncode != 0, name + " passed its planted defect"
-            assert "FAILED (failures=" in result.stderr, result.stdout + result.stderr
+            outcome = next((line for line in reversed(result.stderr.splitlines()) if line.startswith("FAILED (")), "")
+            assert outcome.startswith("FAILED (failures=") and "errors=" not in outcome, result.stdout + result.stderr
+            if name == "retained controller completion":
+                assert "replacement-failed-retained" in result.stderr, result.stdout + result.stderr
+            if name == "retained native chain":
+                assert "retained-native-chain" in result.stderr, result.stdout + result.stderr
+            if name == "retained native exit chain":
+                assert "retained-native-exit-chain" in result.stderr, result.stdout + result.stderr
+            if name == "retained controller selection":
+                assert "retained-retry-controller" in result.stderr, result.stdout + result.stderr
+            if name == "Start candidate cleanup":
+                assert "before-retirement-keeps-native" in result.stderr, result.stdout + result.stderr
+            if name == "retained native generation":
+                assert "retained-native-row" in result.stderr, result.stdout + result.stderr
             if name == "selected registration record":
                 assert "registration-selected-record" in result.stderr, result.stdout + result.stderr
             if name == "session-relative handoff":
                 assert "session-handoff" in result.stderr, result.stdout + result.stderr
+            if name == "native question policy":
+                assert "native-question-policy" in result.stderr, result.stdout + result.stderr
+            if name == "registered native exit":
+                assert "legacy-native-exit" in result.stderr, result.stdout + result.stderr
+            if name == "legacy retirement generation":
+                assert "legacy-retirement-generation" in result.stderr, result.stdout + result.stderr
+            if name == "watch service policy":
+                assert "watch-policy-environment" in result.stderr, result.stdout + result.stderr
             if name.startswith("main="):
                 expected = {"test_shared_first_launch": "shared-controller-record",
                             "test_shared_registration": "registration-native-pending",
@@ -99,7 +145,9 @@ def main():
                             "test_shared_orch_launch_and_recovery": "shared-controller-record",
                             "test_shared_recovery_harnesses": "shared-controller-record",
                             "test_shared_controller_mail": "shared-controller-record",
-                            "test_watch_publication_keeps_controller": "watch-controller-native"}
+                            "test_orch_retirement_order": "shared-controller-record",
+                            "test_legacy_controller_refuses_replacement": "legacy-controller-authority",
+                            "test_watch_publication_keeps_controller": "shared-controller-record"}
                 if case in expected:
                     assert expected[case] in result.stderr, result.stdout + result.stderr
             completed += 1

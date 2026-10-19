@@ -103,6 +103,19 @@ watch_handover() { # [--closed] PREDECESSOR SUCCESSOR LANE_VAR LANE_HOME HARNESS
     *) WATCH_HANDOVER_KEY=watch-restart-failed WATCH_HANDOVER_FIELDS=(step=claim); return 1 ;;
   esac
   old="$WATCH_PID"
+  if [[ -z "$1" ]]; then
+    # Fresh placement has no live predecessor cursor to inherit, even if
+    # the previous controller's watch still holds its claim.
+    if ! watch_stop "$old" "$state" 2>"$DEP_ERR"; then
+      WATCH_HANDOVER_KEY=watch-restart-failed WATCH_HANDOVER_FIELDS=(step=stop "pid=$old")
+      return 1
+    fi
+    if ! { : > "$WATCH_LOG_FILE" && : > "$WATCH_ERR_FILE"; } 2>"$DEP_ERR"; then
+      WATCH_HANDOVER_KEY=watch-restart-failed WATCH_HANDOVER_FIELDS=(step=logs)
+      return 1
+    fi
+    watch_start fresh "$state" "${@:2}"; return $?
+  fi
   # Recovery's repeat loop releases its claim after this launch returns.
   # Capture the complete command before that owner can finish.
   if ! watch_argv_read "$state" 2>"$DEP_ERR"; then

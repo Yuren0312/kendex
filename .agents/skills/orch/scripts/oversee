@@ -118,7 +118,9 @@
 #            or the record's own where it already names this pane, so
 #            registering twice launches nothing and counts nothing twice.
 #            During native confirmation, `registration-pending` acknowledges
-#            the session without publishing it as the active controller.
+#            the session at exit 1 without publishing it as the controller.
+#            Retry a hand-opened session after its SessionStart row arrives;
+#            a managed launch completes through its native Start receipt.
 #            A server start that cannot be read refuses `record-unwritten`
 #            and writes nothing.
 #            Prints `registered` naming the session and generation, with
@@ -244,7 +246,7 @@ message() { # KEY FIELD=VALUE...
     session-id-unrecorded) text='The fleet state at the path field records no native session id for its overseer, so there is no session to resume. Nothing was opened. Launch a fresh overseer through oversee launch.' ;;
     resume-unsupported) text='The recorded harness has no resume form by session id in the overseer launch builder. Nothing was opened. Launch a fresh overseer through oversee launch.' ;;
     resumed) text='The recorded overseer session runs again in a new pane, and the record names that pane.' ;;
-    registration-pending) text='Native confirmation is still in progress. The session is acknowledged; controller publication waits for its Start receipt.' ;;
+    registration-pending) text='Native confirmation is incomplete. Retry registration after SessionStart; a managed launch publishes only after its Start receipt.' ;;
     identity-fallback) text='No SessionStart row of this session stands, so its harness, account and directory are read off its pane and environment, the named fallback. No model or effort is read; a record proven to name this same pane keeps fields the fallback cannot read.' ;;
     context-reader=missing) text='The Copilot context reader could not be configured. The running session is registered, but its context mark has no new reader. Repair the named home and register again.' ;;
     context-reader=next-start) text='The configured Copilot reader loads at the next session start. This running session does not load a newly installed extension.' ;;
@@ -367,6 +369,8 @@ register() {
   server="${key%% *}"
   window="$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}' 2>"$DEP_ERR")" \
     || die pane-unreadable "pane=$TMUX_PANE" field=window_id
+  cwd="$(tmux display-message -p -t "$TMUX_PANE" '#{pane_current_path}' 2>"$DEP_ERR")" \
+    || die pane-unreadable "pane=$TMUX_PANE" field=pane_current_path
   # The launch identity a hand-opened session can state, from what its own
   # harness said at its start where its SessionStart row stands
   # (lib/session-rows.sh): the harness its hook install names, the account its
@@ -378,7 +382,8 @@ register() {
   # process and directory are read instead, the named fallback, said as
   # `identity-fallback`, and no model is known.
   model="" start_rc=0
-  session_rows_start "$(session_rows_overseer_file "$PWD" "$server" "$TMUX_PANE")" || start_rc=$?
+  registration_rows="$(session_rows_overseer_file "$cwd" "$server" "$TMUX_PANE")"
+  session_rows_start "$registration_rows" || start_rc=$?
   if (( start_rc == 0 )) && [[ -n "$SR_HARNESS" && -n "$SR_CWD" ]]; then
     cwd="$SR_CWD" model="$SR_MODEL" shape="$SR_HARNESS"
     [[ -n "$ACCOUNT" ]] || ACCOUNT="$SR_ACCOUNT"
@@ -386,8 +391,6 @@ register() {
     cause=no-start-row
     [[ "$start_rc" -ne 2 ]] || cause=unreadable
     message identity-fallback "session=$TMUX_PANE" "cause=$cause" >&2
-    cwd="$(tmux display-message -p -t "$TMUX_PANE" '#{pane_current_path}' 2>"$DEP_ERR")" \
-      || die pane-unreadable "pane=$TMUX_PANE" field=pane_current_path
     cmd="$(tmux display-message -p -t "$TMUX_PANE" '#{pane_current_command}' 2>"$DEP_ERR")" \
       || die pane-unreadable "pane=$TMUX_PANE" field=pane_current_command
     pane_pid="$(tmux display-message -p -t "$TMUX_PANE" '#{pane_pid}' 2>"$DEP_ERR")" \
@@ -416,11 +419,13 @@ register() {
     *) harness="$shape" ;;
   esac
   ol_identity "$harness" "$ACCOUNT" "$home" "$model" "" "$cwd" || die record-unwritten field=overseer step=identity
+  OL_IDENTITY="$(jq -c --arg rows "$registration_rows" '. + {session_rows:$rows}' <<<"$OL_IDENTITY" 2>"$DEP_ERR")" \
+    || die record-unwritten field=overseer step=identity
   ol_record_write tmux "$TMUX_PANE" "$window" "$server" "$OL_IDENTITY" "" \
     || die record-unwritten field=overseer
-  if [[ "$OL_RECORD_STATE" != running ]]; then
+  if [[ "$OL_REGISTRATION" != complete ]]; then
     message registration-pending "session=$TMUX_PANE" "state=$OL_RECORD_STATE"
-    return 0
+    return 1
   fi
   # The writer retains unknown fields only for this same session. Check that
   # resulting identity, not the fallback's empty fields.
@@ -565,7 +570,7 @@ fi
 [[ -z "$live_pane" || -n "$PREDECESSOR" ]] \
   || die overseer-live "session=$live_pane" "server=$SERVER_SOCKET" "generation=$live_generation"
 
-if [[ "$COMMAND" == register ]]; then register; fi
+if [[ "$COMMAND" == register ]]; then register; exit $?; fi
 
 # resume's steps 4 and 5: the command built out of the launch identity the
 # record OL_PRIOR holds, into OL_CMD, RESUME_LINE, OL_HARNESS and lane_dir,

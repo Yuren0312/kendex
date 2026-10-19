@@ -1165,17 +1165,17 @@ ol_model_recovery_check() { # REQUEST CURRENT
 
 # Policy stays with the callers. The controller owner acquires a waiting runner,
 # retires the exact predecessor and waits for native identity and brief receipt.
-ol_succession() { # PREDECESSOR CWD LINE IDENTITY PENDING LANE_VAR LANE_DIR FORM WAIT_SECS
+ol_succession() { # PREDECESSOR CWD LINE IDENTITY PENDING LANE_VAR LANE_DIR FORM WAIT_SECS [HANDOFF_POLICY]
   local predecessor="$1" cwd="$2" line="$3" identity="$4" wait="$9"
-  ol_controller_launch "$cwd" "$line" "$identity" "$predecessor" "" "$wait"
+  ol_controller_launch "$cwd" "$line" "$identity" "$predecessor" "" "$wait" "${10:-required}"
 }
 
-ol_controller_launch() { # CWD LINE IDENTITY PREDECESSOR SESSION WAIT_SECS
+ol_controller_launch() { # CWD LINE IDENTITY PREDECESSOR SESSION WAIT_SECS [HANDOFF_POLICY]
   local out record fields receipt_lines field path receipt=()
   ol_checkout_sync "$1" || ol_checkout_notice
   path="$(ol_record_path)" || return 1
   out="$(ORCH_STATE_DIR="${path%/*}" "$SCRIPT_DIR/controller-session" launch --home "${PROJECT_ROOT:-$PWD}" --line "$2" --identity "$3" \
-    --predecessor "$4" --session-name "$5" --handoff "${HANDOFF:-}" --wait-secs "$6" \
+    --predecessor "$4" --session-name "$5" --handoff "${HANDOFF:-}" --handoff-policy "${7:-required}" --wait-secs "$6" \
     --expected "${OL_PRIOR:-null}" --recovery "${OL_RECOVERY_RECORD:-null}" 2>"$DEP_ERR")" || {
       OL_REASON=controller-launch-failed
       printf '%s\n' "$out" >>"$DEP_ERR"
@@ -1292,15 +1292,17 @@ ol_record_get() { # [OUT_VAR]
 # prior fields. OL_GENERATION names the generation written. OL_RECORD_RETAINED
 # and OL_RECORD_FRESH name the retained non-empty fields and the fields read
 # afresh, as sorted comma-separated lists, or `none`, for register's report.
-# All three are empty where the write failed. Returns 1 with the writer's
+# OL_REGISTRATION is complete or pending, independently of OL_RECORD_STATE,
+# the app-facing state. All are empty where the write failed. Returns 1 with the writer's
 # words in DEP_ERR.
-OL_GENERATION="" OL_RECORD_RETAINED="" OL_RECORD_FRESH="" OL_RECORD_STATE=""
+OL_GENERATION="" OL_RECORD_RETAINED="" OL_RECORD_FRESH="" OL_RECORD_STATE="" OL_REGISTRATION=""
 ol_record_write() { # RUNTIME SESSION WINDOW SERVER IDENTITY [LINE]
   local prior="${OL_PRIOR:-null}" result record cwd rows="" start="" socket="" fields path answer
-  OL_GENERATION="" OL_RECORD_RETAINED="" OL_RECORD_FRESH="" OL_RECORD_STATE=""
+  OL_GENERATION="" OL_RECORD_RETAINED="" OL_RECORD_FRESH="" OL_RECORD_STATE="" OL_REGISTRATION=""
   if [[ "$1" == tmux ]]; then
     cwd="$(jq -r '.cwd // empty' <<<"$5" 2>"$DEP_ERR")" || return 1
-    rows="$(session_rows_overseer_file "${cwd:-$PWD}" "$4" "$2")"
+    rows="$(jq -r '.session_rows // empty' <<<"$5" 2>"$DEP_ERR")" || return 1
+    [[ -n "$rows" ]] || rows="$(session_rows_overseer_file "${cwd:-$PWD}" "$4" "$2")"
     if ! start="$(ol_session_start "$4" "$2")"; then
       printf 'the start of tmux server %s holding pane %s could not be read\n' "$4" "$2" > "$DEP_ERR"
       return 1
@@ -1329,10 +1331,17 @@ ol_record_write() { # RUNTIME SESSION WINDOW SERVER IDENTITY [LINE]
          retained: ($base | nonempty | with_entries(select(.key as $key | $fresh | has($key) | not)) | field_names),
          fresh: ($fresh | field_names)}' 2>"$DEP_ERR")" || return 1
   record="$(jq -c '.record' <<<"$result" 2>"$DEP_ERR")" || return 1
+  if session_rows_start "$rows"; then
+    record="$(jq -c --argjson native "$SESSION_ROW" '
+      if $native.harness == .harness and ($native.session_id | type) == "string"
+        and ($native.account == null or $native.account == .account or $native.account == .home)
+      then .session_id = $native.session_id else . end' <<<"$record" 2>"$DEP_ERR")" || return 1
+  fi
   fields="$(jq -r '[.record.generation, .retained, .fresh] | @tsv' <<<"$result" 2>"$DEP_ERR")" || return 1
   path="$(ol_record_path)" || return 1
   answer="$(ORCH_STATE_DIR="${path%/*}" "$SCRIPT_DIR/controller-session" register --home "${PROJECT_ROOT:-$PWD}" --record "$record" 2>"$DEP_ERR")" || return 1
   OL_RECORD_STATE="$(jq -er '.state' <<<"$answer" 2>"$DEP_ERR")" || return 1
+  OL_REGISTRATION="$(jq -er '.registration' <<<"$answer" 2>"$DEP_ERR")" || return 1
   IFS=$'\t' read -r OL_GENERATION OL_RECORD_RETAINED OL_RECORD_FRESH <<<"$fields"
 }
 
@@ -1392,8 +1401,27 @@ ol_record_heal() { # SERVER PANE START HARNESS HOME SESSION_ID
 # for that completed binding before the single start update. The update
 # rechecks the generation against a replacement between the read and write.
 ol_record_start() { # SERVER PANE PID PROCESS_START
-  local start record generation run passes=50
+  local start record generation run path passes=50
   start="$(ol_session_start "$1" "$2")" || { printf 'server-start-unreadable\n' > "$DEP_ERR"; return 1; }
+  if [[ -n "${ORCH_CONTROLLER_RUN_REQUEST:-}" ]]; then
+    path="$(ol_record_path)" || return 1
+    [[ "${JARVIS_RECORD:-}" == "$path" ]] || { printf 'controller-record-unbound\n' > "$DEP_ERR"; return 1; }
+    run="$(jq -cn --arg server "$1" --arg start "$start" --arg pane "$2" --arg generation "$ORCH_CONTROLLER_RUN_REQUEST" \
+      --arg pid "$3" --arg process_start "$4" \
+      '{server:$server,server_start:($start|tonumber),pane:$pane,generation:($generation|tonumber),
+        request_generation:$generation,harness_pid:$pid,harness_start:$process_start}' 2>"$DEP_ERR")" || return 1
+    "$SCRIPT_DIR/workflow-state" update oversee --argjson run "$run" "$SESSION_ROWS_JARVIS_BOUND"'
+      .overseer.lifecycle as $l
+      | if ($l | bound($run.request_generation; $run.server; $run.pane; .harness))
+          and ($l.generation | tostring) == $run.request_generation
+          and $l.server_started_at == $run.server_start and $l.state == "starting"
+          and $l.transfer.phase == "predecessor-ended"
+        then .overseer.lifecycle |= (del(.native_exit)
+          | .native_process={pid:($run.harness_pid|tonumber),started_at:$run.harness_start})
+        else error("overseer-run-unbound") end' >/dev/null 2>"$DEP_ERR" || return 1
+    printf '%s\n' "$run"
+    return 0
+  fi
   while :; do
     ol_record_get record || { [[ -s "$DEP_ERR" ]] || printf 'record-unavailable\n' > "$DEP_ERR"; return 1; }
     generation="$(jq -r --arg server "$1" --arg start "$start" --arg pane "$2" "$OL_JQ_DEFS"'
@@ -1420,8 +1448,23 @@ ol_record_start() { # SERVER PANE PID PROCESS_START
 ol_record_exit() { # RUN_JSON STATUS
   local at
   at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" || return 1
-  "$SCRIPT_DIR/workflow-state" update oversee --argjson run "$1" --argjson status "$2" --arg at "$at" "$OL_JQ_DEFS"'
-    if (.overseer | ol_names($run.server; ($run.server_start | tostring); $run.pane)
+  "$SCRIPT_DIR/workflow-state" update oversee --argjson run "$1" --argjson status "$2" --arg at "$at" "$OL_JQ_DEFS$SESSION_ROWS_JARVIS_BOUND"'
+    if $run.request_generation != null then
+      def native_run:
+        (.pending.generation | tostring) == $run.request_generation
+        and (.server_pid | tostring) == $run.server and .server_started_at == $run.server_start
+        and .terminal.pane == $run.pane
+        and (.native_process.pid | tostring) == $run.harness_pid
+        and .native_process.started_at == $run.harness_start;
+      .overseer.lifecycle |= ([path(owned | select(native_run))] as $matches
+        | if ($matches | length) == 1 then setpath($matches[0]+["native_exit"]; {status:$status,at:$at})
+          else error("overseer-run-unbound") end)
+      | if (.overseer | ol_names($run.server; ($run.server_start | tostring); $run.pane)
+              and .harness_pid == $run.harness_pid and .harness_start == $run.harness_start)
+            then .overseer |= (.generation as $generation | del(.harness_pid,.harness_start)
+              | .exit={status:$status,at:$at,run:($run | del(.request_generation) | .generation=$generation)})
+            else . end
+    elif (.overseer | ol_names($run.server; ($run.server_start | tostring); $run.pane)
         and .generation == $run.generation
         and .harness_pid == $run.harness_pid and .harness_start == $run.harness_start)
     then .overseer |= (del(.harness_pid, .harness_start) | .exit = {status: $status, at: $at, run: $run})

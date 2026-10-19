@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import subprocess
 import select
+import socket
+import struct
 import sys
 import shutil
 import tempfile
@@ -72,12 +74,47 @@ def await_inspections(events, count):
 def brief_taken(fixture, harness, identity, event, **fields):
     # The native hook's stamp, written by its real library at the default wait.
     shell = 'source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/orch/scripts/lib/lane-context.sh"; source "$1/orch/scripts/lib/session-rows.sh"; key="$(tmux display-message -p -t "$TMUX_PANE" "#{pid} #{pane_id}")"; session_rows_jarvis_taken "$JARVIS_RECORD" "$JARVIS_GENERATION" "$key" "$2" "$3"'
-    result = subprocess.run([fixture["bash"], "-c", shell, "fixture", fixture["skills"], harness, event],
-                            input=json.dumps({"session_id": identity, **fields}), text=True, capture_output=True)
-    with Path(fixture["rows"]).open("a") as stream:
-        stream.write(json.dumps({"stamp": event, "harness": harness,
-                                 "exit": result.returncode, "stderr": result.stderr}) + "\n")
-    result.check_returncode()
+    result = None
+    try:
+        result = native_hook([fixture["bash"], "-c", shell, "fixture", fixture["skills"], harness, event],
+                             {"session_id": identity, **fields})
+    except subprocess.CalledProcessError as error:
+        result = error
+        raise
+    finally:
+        if result is not None:
+            with Path(fixture["rows"]).open("a") as stream:
+                stream.write(json.dumps({"stamp": event, "harness": harness,
+                                         "exit": result.returncode,
+                                         "stderr": result.stderr.decode(errors="replace")}) + "\n")
+
+
+def native_hook(args, payload):
+    # The native CLI owns hook children; the Python model simulator does not.
+    def receive(stream, size):
+        data = bytearray()
+        while len(data) < size:
+            chunk = stream.recv(size - len(data))
+            if not chunk:
+                raise RuntimeError("native-fixture: hook-relay-eof")
+            data.extend(chunk)
+        return bytes(data)
+
+    fields = [arg.encode() for arg in args]
+    body = struct.pack("!I", len(fields))
+    body += b"".join(struct.pack("!I", len(field)) + field for field in fields)
+    value = json.dumps(payload).encode()
+    body += struct.pack("!I", len(value)) + value
+    with socket.socket(socket.AF_UNIX) as stream:
+        stream.settimeout(30)
+        stream.connect(os.environ["JARVIS_TEST_HOOK_SOCKET"])
+        stream.sendall(body)
+        status = struct.unpack("!i", receive(stream, 4))[0]
+        output = [receive(stream, struct.unpack("!I", receive(stream, 4))[0]) for _ in range(2)]
+    if status:
+        sys.stderr.write(output[1].decode(errors="replace"))
+        raise subprocess.CalledProcessError(status, args, output[0], output[1])
+    return subprocess.CompletedProcess(args, status, output[0], output[1])
 
 
 @contextmanager
@@ -100,7 +137,8 @@ def native_launcher():
                                  str(Path(__file__).resolve().with_name("harness_launcher.rs")), "-o", str(path)],
                                 # This fixture uses the installed compiler;
                                 # repository toolchain installation belongs to CI setup.
-                                cwd=path.parent, capture_output=True, text=True, timeout=60)
+                                cwd=path.parent, env=os.environ | {"JARVIS_TEST_NATIVE_ROOT": str(path.parent)},
+                                capture_output=True, text=True, timeout=60)
         if result.returncode:
             raise RuntimeError("native-fixture: compile-failed\n" + result.stderr)
         yield path
@@ -113,12 +151,15 @@ def native_header(harness, identity, cwd):
     return {"type": "session", "id": identity, "cwd": cwd}
 
 
+def session_backend(skills):
+    backend = Path(skills) / "orch/scripts/lib/session-backend.sh"
+    return backend if backend.exists() else Path(skills) / "jarvis/scripts/lib/session-backend.sh"
+
+
 def observe_retirement(fixture, identity):
     if fixture.get("retiring"):
         predecessor = fixture["retiring"]
-        backend = Path(fixture["skills"]) / "orch/scripts/lib/session-backend.sh"
-        if not backend.exists():
-            backend = Path(fixture["skills"]) / "jarvis/scripts/lib/session-backend.sh"
+        backend = session_backend(fixture["skills"])
         probe = subprocess.run([fixture["bash"], str(backend), "worker-live", str(predecessor["pid"]), predecessor["started_at"]], capture_output=True)
         ended = probe.returncode == 1
         with Path(fixture["rows"]).open("a") as stream:
@@ -128,6 +169,8 @@ def observe_retirement(fixture, identity):
 
 def main():
     fixture = json.loads(Path(".fixture.json").read_text())
+    if os.environ.get("JARVIS_TEST_TRUST_FILE"):
+        fixture["trust"] = os.environ["JARVIS_TEST_TRUST_FILE"]
     if fixture.get("idle_marker"):
         fixture["idle"] = Path(fixture["idle_marker"]).exists()
     harness = fixture.get("harness", os.environ["JARVIS_TEST_HARNESS"])
@@ -137,6 +180,15 @@ def main():
     if harness == "codex":
         assert args.count("--dangerously-bypass-hook-trust") <= 1
     if "JARVIS_RECORD" not in os.environ:
+        if fixture.get("manual_session"):
+            payload = {"session_id": fixture["manual_session"], "cwd": os.getcwd(), "source": "startup"}
+            shell = ('source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/mailbox/scripts/lib/mailbox-append.sh"; '
+                     'source "$1/orch/scripts/lib/lane-state.sh"; source "$1/orch/scripts/lib/lane-context.sh"; '
+                     'source "$1/orch/scripts/lib/session-rows.sh"; session_rows_write "$PWD" "$2" SessionStart')
+            native_hook([fixture["bash"], "-c", shell, "fixture", fixture["skills"], harness], payload)
+            if fixture.get("manual_command"):
+                native_hook(fixture["manual_command"], {})
+                return
         # The pre-change orch command starts its brief directly, without the
         # later native binding handshake. Main controls exercise that command.
         observe_retirement(fixture, "unbound-native")
@@ -184,7 +236,7 @@ def main():
     if history == "pending":
         print(TRUST_HISTORY[history], flush=True)
     gate = Path(fixture["gate"])
-    if gate.exists():
+    if gate.exists() and not fixture.get("hold_prompt"):
         with gate.open() as stream:
             stream.read(1)
     file = account / "sessions" / (identity + ".jsonl")
@@ -223,12 +275,12 @@ def main():
                "model": "pi-claude/claude-fable-5-1" if harness == "pi" else "fixture-native"}
     if harness != "copilot":
         payload["transcript_path"] = str(file)
-    shell = 'source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/orch/scripts/lib/lane-context.sh"; source "$1/orch/scripts/lib/session-rows.sh"; SESSION_ROWS_WAIT=10; key="$(tmux display-message -p -t "$TMUX_PANE" "#{pid} #{pane_id}")"; session_rows_jarvis_write "$JARVIS_RECORD" "$JARVIS_GENERATION" "$key" "$2"'
-    subprocess.run([fixture["bash"], "-c", shell, "fixture", fixture["skills"], harness],
-                   input=json.dumps(payload), text=True, check=True)
     rows_shell = 'source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/mailbox/scripts/lib/mailbox-append.sh"; source "$1/orch/scripts/lib/lane-state.sh"; source "$1/orch/scripts/lib/lane-context.sh"; source "$1/orch/scripts/lib/session-rows.sh"; session_rows_write "$PWD" "$2" SessionStart'
-    subprocess.run([fixture["bash"], "-c", rows_shell, "fixture", fixture["skills"], harness],
-                   input=json.dumps(payload), text=True, check=True)
+    if "overseer" not in owner:
+        # Main controls exercise the former standalone record through its
+        # native carrier; candidate launches always exercise the shared hook.
+        rows_shell = 'source "$1/mailbox/scripts/lib/file-lock.sh"; source "$1/orch/scripts/lib/lane-context.sh"; source "$1/orch/scripts/lib/session-rows.sh"; key="$(tmux display-message -p -t "$TMUX_PANE" "#{pid} #{pane_id}")"; session_rows_jarvis_write "$JARVIS_RECORD" "$JARVIS_GENERATION" "$key" "$2"'
+    native_hook([fixture["bash"], "-c", rows_shell, "fixture", fixture["skills"], harness], payload)
     if barrier:
         # The kickoff turn still runs after its stamp and draws only its
         # composer, which the pane reads as idle: no brief may land before
@@ -263,6 +315,15 @@ def main():
         return
     with rows.open("a") as stream:
         stream.write(json.dumps({"prompt": prompt.strip(), "id": identity, "harness": harness}) + "\n")
+    capture = fixture.get("capture")
+    if capture:
+        Path(capture["prompt"]).write_text(prompt.strip())
+        Path(capture["cwd"]).write_text(os.getcwd())
+        model = args[args.index("--model") + 1] if "--model" in args else ""
+        Path(capture["model"]).write_text(model)
+        if Path(capture["enabled"]).exists():
+            handoff = prompt.strip().removeprefix(capture["prefix"])
+            Path(capture["snapshot"]).write_bytes(Path(handoff).read_bytes())
     if fixture.get("idle"):
         print("❯\u00a0", flush=True)
     elif auth_mode == "current":

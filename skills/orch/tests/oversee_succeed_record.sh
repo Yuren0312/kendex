@@ -103,7 +103,7 @@ mkdir -p "$PI_AGENT/packages/@vanillagreen/pi-hooks/extensions"
 jq -n '{compaction: {enabled: false}}' > "$PI_AGENT/settings.json"
 printf 'payload.context_window = usage.contextWindow;\n' > "$PI_AGENT/packages/@vanillagreen/pi-hooks/extensions/stop.ts"
 
-env PATH="$BIN:$PATH" ORCH_STATE_DIR="$TMP_ROOT/work/tmp" tmux -L "$SOCK" -f /dev/null new-session -d -s fleet -x 220 -y 50 'exec sleep 100000'
+env PATH="$BIN:$PATH" ORCH_STATE_DIR="$TMP_ROOT/work/tmp" tmux -L "$SOCK" -f /dev/null new-session -d -s fleet -c "$TMP_ROOT/work" -x 220 -y 50 'exec sleep 100000'
 KEEP_WINDOW="$(tm display-message -p -t fleet:0 '#{window_id}')"
 tm set-option -g default-shell /bin/sh
 # A relaunch types its line into a fresh pane: a non-login shell under this
@@ -215,26 +215,7 @@ model_switch_rows() (
   git -C "$TMP_ROOT/work" config gc.auto 0
   git -C "$TMP_ROOT/work" config maintenance.auto false
   git -C "$TMP_ROOT/work" symbolic-ref HEAD refs/heads/main
-  cat > "$BIN/claude" <<HARNESS
-#!/usr/bin/env bash
-set -euo pipefail
-for prompt in "\$@"; do :; done
-printf '%s\\n' "\$prompt" > '$TMP_ROOT/model.prompt'
-pwd -P > '$TMP_ROOT/model.cwd'
-if [[ -f '$TMP_ROOT/capture-handoff' ]]; then
-  handoff=\${prompt#'${BRIEF%tmp/handoffs/OVERSEER-HANDOFF.md}'}
-  cat -- "\$handoff" > '$TMP_ROOT/model.snapshot'
-fi
-model=""
-while [[ \$# -gt 0 ]]; do
-  if [[ \$1 == --model ]]; then model=\$2; break; fi
-  shift
-done
-case \$model in 'claude-opus-4-6[1m]' | claude-opus-4-6 | opus) ;; *) exit 1 ;; esac
-printf '%s\\n' "\$model" > '$TMP_ROOT/model.argv'
-printf '%s\\n' 'esc to interrupt'
-exec sleep 100000
-HARNESS
+  printf '#!/bin/sh\nexec "%s" "$@"\n' "$BIN/processes/claude" > "$BIN/claude"
   chmod +x "$BIN/claude"
   mv -- "$scripts/oversee-succeed" "$scripts/oversee-succeed.real"
   cat > "$scripts/oversee-succeed" <<BARRIER
@@ -308,26 +289,27 @@ BARRIER
       mutate_file "$scripts/lib/overseer-launch.sh" \
         "OL_HANDOFF_PROMPT='$current_prefix'" "OL_HANDOFF_PROMPT='$retained_prefix'"
     fi
-    if [[ "$relative_dir" == . ]]; then
-      line=$(model_env "$scripts/oversee-succeed" --print-launch-line --harness claude --handoff "$handoff_path" -- \
-        --model "$executable" --effort high "$BYPASS")
-      state "$(record "$CALLER_PANE" "$H/.claude" claude-opus-4-6 \
-        "$(jq -nc --arg line "$line" --arg cwd "$launch_dir" '{launch_line:$line,cwd:$cwd,session_id:"s1"}')")"
-    else
-      # The public producer supplies the recorded base, actual pane cwd and
-      # retained watch command. Recovery below still starts at the repo root.
-      state none
-      prior_pane=$CALLER_PANE
-      producer_handoff=(--handoff "$handoff_path")
-      [[ "$scenario" != sub-default ]] || producer_handoff=()
-      model_env env "ORCH_OVERSEER_PREFERENCE=claude:$executable:high" "$scripts/oversee" launch \
-        --session fleet --cwd "$launch_dir" ${producer_handoff[@]+"${producer_handoff[@]}"} --wait-secs 20 \
-        > "$TMP_ROOT/model-launch.out" 2> "$TMP_ROOT/model-launch.err"
-      CALLER_PANE=$(jq -r .overseer.pane "$FLEET_STATE")
-      tm kill-pane -t "$prior_pane"
-      "$scripts/workflow-state" --state-dir "$TMP_ROOT/work/tmp" update oversee '.overseer.session_id="s1"' >/dev/null
-      assert_eq "$(jq -r .overseer.cwd "$FLEET_STATE")" "$launch_dir" "$scenario public producer records its launch directory"
-    fi
+    controller_fixture_install "$launch_dir" "$scripts" "$BIN/processes" || exit 1
+    jq --arg root "$TMP_ROOT" --arg prefix "$current_prefix" \
+      '.capture={prompt:($root+"/model.prompt"),cwd:($root+"/model.cwd"),model:($root+"/model.argv"),
+        enabled:($root+"/capture-handoff"),snapshot:($root+"/model.snapshot"),prefix:$prefix}' \
+      "$launch_dir/.fixture.json" > "$launch_dir/.fixture.next" || exit 1
+    mv -- "$launch_dir/.fixture.next" "$launch_dir/.fixture.json"
+    state none
+    prior_pane=$CALLER_PANE
+    producer_handoff=(--handoff "$handoff_path")
+    [[ "$scenario" != sub-default ]] || producer_handoff=()
+    line=$(model_env "$scripts/oversee-succeed" --print-launch-line --harness claude --handoff "$handoff_path" -- \
+      --model "$executable" --effort high "$BYPASS")
+    model_env env "ORCH_OVERSEER_PREFERENCE=claude:${executable%\[1m\]}:high" "$scripts/oversee" launch \
+      --session fleet --cwd "$launch_dir" ${producer_handoff[@]+"${producer_handoff[@]}"} --wait-secs 30 \
+      > "$TMP_ROOT/model-launch.out" 2> "$TMP_ROOT/model-launch.err"
+    CALLER_PANE=$(jq -r .overseer.pane "$FLEET_STATE")
+    # The event callback and lifecycle are real. The retained command is the
+    # policy input under test, built through the existing print boundary.
+    "$scripts/workflow-state" --state-dir "$TMP_ROOT/work/tmp" update oversee '.overseer.launch_line=$line' --arg line "$line" >/dev/null
+    tm kill-pane -t "$prior_pane"
+    assert_eq "$(jq -r .overseer.cwd "$FLEET_STATE")" "$launch_dir" "$scenario public producer records its launch directory"
     model_env "$BASH" -euo pipefail -c '
       SCRIPT_DIR=$1 SUCCEED=$1/oversee-succeed WORKFLOW_STATE=$1/workflow-state
       PROJECT_ROOT=$(git rev-parse --show-toplevel)
@@ -398,7 +380,7 @@ BARRIER
     for delivery in first repeated; do
       status=0
       model_env "$BASH" "$hook" \
-        <<<"$(jq -nc --arg model "$model" --arg transcript "$transcript" '{session_id:"s1",hook_event_name:"PostModelSwitch",to_model:$model,transcript_path:$transcript}')" \
+        <<<"$(jq -nc --arg model "$model" --arg session "$(jq -r .overseer.session_id <<<"$before")" --arg transcript "$transcript" '{session_id:$session,hook_event_name:"PostModelSwitch",to_model:$model,transcript_path:$transcript}')" \
         >"$TMP_ROOT/model.out" 2>"$TMP_ROOT/model.err" || status=$?
       assert_eq "$status" 0 "$scenario $delivery callback remains advisory" "$TMP_ROOT/model.err"
     done
@@ -406,7 +388,10 @@ BARRIER
       assert_eq "$(jq -c . "$FLEET_STATE")" "$before" "$scenario models leave fleet state unchanged"
     elif [[ "$scenario" == switched || "$scenario" == custom || "$relative_dir" != . ]]; then
       deadline=$((SECONDS + 30))
-      while [[ "$SECONDS" -lt "$deadline" ]] && tm list-panes -a -F '#{pane_id}' | grep -Fxq -- "$old_pane"; do sleep 0.05; done
+      until jq -e --arg old "$old_pane" '.overseer | .pane != null and .pane != $old and .lifecycle.state == "running"' "$FLEET_STATE" >/dev/null; do
+        (( SECONDS < deadline )) || break
+        sleep 0.05
+      done
       after=$(jq -r .overseer.pane "$FLEET_STATE")
       assert_not_contains "$after" "$old_pane" 'a fallback starts a verified successor' "$TMP_ROOT/work/tmp/model-recovery-overseer.log"
       assert_eq "$(cat "$TMP_ROOT/model.argv" 2>/dev/null || :)" "$executable" 'a working successor receives the exact launched model' "$TMP_ROOT/work/tmp/model-recovery-overseer.log"
@@ -709,37 +694,15 @@ split_row "$SPLITCTL/oversee-succeed"
 assert_eq "$(jq -r '.overseer.model' "$FLEET_STATE")|$(judged)" \
   "claude-fable-5-1|mark-unmeasured kind=headroom reason=headroom-none succession=on" \
   "control: an identity that reads the bare model word leaves the next generation's account unjudged" "$TMP_ROOT/err"
-# A pi overseer nothing recorded, started with a bare `--model <id>`, whose
-# reading names `pi-claude/<id>`: it hands over at its context mark, and the
-# successor runs and records the provider-bearing model its account was chosen
-# from, so the next generation's judgement and succession read the claude
-# account rather than a bare model that names none.
-bare_row() { # [SUCCEED_BIN]
-  new_caller
-  mkdir -p "$MAILBOX_DIR"
-  lane_context_record "$MAILBOX_DIR" pi 100000 1000000 pi-claude/claude-fable-5-1 "" "$SERVER_PID $CALLER_PANE"
-  state null
-  SUCCEED_BIN="${1:-}" run_succeed "CLAUDE_CONFIG_DIR=$H/.claude" --context 950000:1000000 --wait-secs 20 \
-    -- --model claude-fable-5-1 --thinking high
-  BARE_RC="$RC" BARE_MODEL="$(jq -r '.overseer.model' "$FLEET_STATE")"
-  CALLER_PANE="$(jq -r '.overseer.pane' "$FLEET_STATE")"
-  SUCCEED_BIN="${1:-}" run_succeed "CLAUDE_CONFIG_DIR=$H/.claude" --check-marks
-  BARE_JUDGED="$(judged)"
-  SUCCEED_BIN="${1:-}" run_succeed "CLAUDE_CONFIG_DIR=$H/.claude" --context 950000:1000000 --wait-secs 20 \
-    -- --model claude-fable-5-1 --thinking high
-}
-bare_row
-assert_eq "$BARE_RC|$BARE_MODEL|$BARE_JUDGED|$RC|$(jq -r '.overseer.model' "$FLEET_STATE")" \
-  "0|pi-claude/claude-fable-5-1|account-below-mark headroom=90|0|pi-claude/claude-fable-5-1" \
-  "a bare --model pi overseer hands over on its reading's provider, and the next generation judges and hands over on the claude account" "$TMP_ROOT/err"
-# Its control: a successor that runs, and records, its caller's bare flag
-# leaves the next generation's succession refusing an account it cannot name.
-BARECTL="$(mutant_scripts barectl oversee-succeed)" || exit 1
-mutate_file "$BARECTL/oversee-succeed" '  if [[ "$CALLER_HARNESS" == pi && "$CALLER_MODEL" == ?*/?* ]]; then' '  if false; then'
-bare_row "$BARECTL/oversee-succeed"
-assert_eq "$BARE_MODEL|$RC|$(grep -m1 -o '^oversee-succeed: pi-account-unknown [^ ]*' <<<"$ERR")" \
-  "claude-fable-5-1|1|oversee-succeed: pi-account-unknown model=claude-fable-5-1" \
-  "control: a successor recording the bare flag leaves the next generation refusing pi-account-unknown"
+# A context reading is not permission to replace an unregistered controller.
+new_caller
+mkdir -p "$MAILBOX_DIR"
+lane_context_record "$MAILBOX_DIR" pi 100000 1000000 pi-claude/claude-fable-5-1 "" "$SERVER_PID $CALLER_PANE"
+state null
+run_succeed "CLAUDE_CONFIG_DIR=$H/.claude" --context 950000:1000000 --wait-secs 20 \
+  -- --model claude-fable-5-1 --thinking high
+assert_eq "$RC|$(tm list-panes -a -F '#{pane_id}' | grep -cxF -- "$CALLER_PANE")" "1|1" \
+  "a recordless Pi reading leaves its predecessor and refuses replacement"
 
 # The control for the model rule: a caller that ignores the record's model is
 # judged on the reading's.
@@ -986,13 +949,12 @@ done
 DEADCTL="$(mutant_scripts deadctl oversee-succeed)" || exit 1
 mutate_file "$DEADCTL/oversee-succeed" '! ol_record_line_identity "$cmd"; then' '! ol_identity "" "" "" "" "" ""; then'
 dead_relaunch "$OWN" "$DEADCTL/oversee-succeed"
-print_on_successor
-assert_eq "$RC|$(sed -n 1p <<<"$ERR")" "1|oversee-succeed: harness-unnamed pane=$SUCC_PANE" \
-  "control: a relaunch that records no identity leaves the next print refused"
+assert_eq "$RC|$(tm list-panes -a -F '#{pane_id}' | grep -cxF -- "$SUCC_PANE")" "1|1" \
+  "control: a relaunch without its recorded identity refuses before retiring the predecessor"
 # The control: a projection of the six positional fields alone drops the class.
 DEADCLASSCTL="$(mutant_scripts deadclassctl lib/overseer-launch.sh)" || exit 1
 mutate_file "$DEADCLASSCTL/lib/overseer-launch.sh" \
-  'def line_identity: ol_identity + (if has("class") then {class} else {} end);' 'def line_identity: ol_identity;'
+  'def line_identity: ol_identity + (if has("class") then {class} else {} end)' 'def line_identity: ol_identity'
 dead_relaunch "$PENDING_OWN" "$DEADCLASSCTL/oversee-succeed"
 assert_eq "$RC|$(jq -r '.overseer.class // "none"' "$FLEET_STATE")" "0|none" \
   "control: a relaunch that projects no class records none"
@@ -1001,12 +963,17 @@ assert_eq "$RC|$(jq -r '.overseer.class // "none"' "$FLEET_STATE")" "0|none" \
 DEAD_CWD="$TMP_ROOT/dead-cwd"
 mkdir -p "$DEAD_CWD"
 DEAD_CWD="$(cd "$DEAD_CWD" && pwd -P)"
+controller_fixture_install "$DEAD_CWD" "$SRC_DIR" "$BIN/processes" || exit 1
 PENDING_CWD="$(jq -c --arg cwd "$DEAD_CWD" '.pending.cwd = $cwd' <<<"$PENDING_OWN")"
 dead_relaunch "$PENDING_CWD"
 assert_eq "$RC|$SUCC_CWD|$(jq -r '.overseer.cwd' "$FLEET_STATE")" "0|$DEAD_CWD|$DEAD_CWD" \
   "--dead-pane over a pending successor opens in the directory it records"
-DEADCWDCTL="$(mutant_scripts deadcwdctl oversee-succeed)" || exit 1
-mutate_file "$DEADCWDCTL/oversee-succeed" '[[ -z "$replay_cwd" ]] || CALLER_PATH="$replay_cwd"' ':'
+DEADCWDCTL="$(mutant_scripts deadcwdctl lib/controller-session.py)" || exit 1
+mutate_file "$DEADCWDCTL/lib/controller-session.py" \
+  '            if record.get("external"):
+                session_cwd = (record.get("identity") or {}).get("cwd") or (' \
+  '            if False:
+                session_cwd = (record.get("identity") or {}).get("cwd") or ('
 dead_relaunch "$PENDING_CWD" "$DEADCWDCTL/oversee-succeed"
 assert_eq "$RC|$SUCC_CWD" "0|$DEAD_PANE_CWD" \
   "control: a relaunch that ignores the replayed directory opens in the dead pane's"

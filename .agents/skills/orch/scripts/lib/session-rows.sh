@@ -24,7 +24,7 @@
 # StopFailure row and dates the turn end oversee-watch holds the overseer's
 # context record against. The readers are oversee-watch's
 # overseer judgement, `oversee register` and oversee-succeed's caller identity.
-# The same hook writes the Jarvis runtime record below, never this file.
+# Managed native callbacks also fill the shared lifecycle confirmation below.
 #
 # A last row session_rows_verdict cannot judge reads `unsupported`, and its
 # reader takes the pane, the named fallback, reported as fallback.
@@ -45,9 +45,9 @@
 # (session_rows_lane_write, session_rows_lane_verdict). Claude Code and Codex
 # lanes write none: their pane is still what lib/lane-state.sh reads.
 #
-# A session the Jarvis runtime launched writes no file here of its own: its
-# SessionStart fills the launch's pending row in the runtime record its
-# environment names, with no fleet and no mailbox (session_rows_jarvis_write),
+# A managed session's SessionStart also fills the launch's pending row under
+# .overseer.lifecycle in the state its environment names, with or without a
+# mailbox (session_rows_jarvis_write),
 # and the lane-mail-check hook's own run at its first tool call, or on Claude
 # Code, Codex and Copilot CLI its turn end, after the Start brief stamps that
 # row once as the brief taken, and on Codex and Copilot CLI its turn end before
@@ -212,10 +212,9 @@ session_rows_verdict() { # FILE
 # session_rows_start FILE [SINCE] — the last SessionStart row of FILE, at or
 # after the epoch SINCE where given, split into SR_HARNESS, SR_ACCOUNT, SR_MODEL
 # and SR_CWD, each empty where the row carries none. The row's `session_id`
-# and `transcript_path` are not read here: the turn-end hook binds the
-# transcript to the session from its own payload (lib/lane-context.sh §
-# lane_context_transcript_owned), the one reader of that pair, and neither is
-# copied into a record. Exit 1 where no such row stands, 2 where the file
+# and `transcript_path` remain in SESSION_ROW: explicit registration reads
+# its native id; the turn-end hook binds the transcript from its own payload
+# (lib/lane-context.sh § lane_context_transcript_owned). Exit 1 where no such row stands, 2 where the file
 # could not be read.
 SR_HARNESS="" SR_ACCOUNT="" SR_MODEL="" SR_CWD=""
 session_rows_start() { # FILE [SINCE]
@@ -252,7 +251,7 @@ session_rows_codex_launcher() { # PID
 }
 
 # session_rows_top_level PANE_PID: 0 where exactly one harness stands
-# between this process and PANE_PID, the pane's own shell: the
+# between this process and PANE_PID, including that boundary process: the
 # harness that ran this hook, directly under that shell or under the shells
 # and exec'd wrappers a launch puts there (overseer-run, env). A harness
 # nested under another, which the other one's tool shell started, has two.
@@ -261,14 +260,12 @@ session_rows_codex_launcher() { # PID
 # the launcher, so another harness still excludes a nested session;
 # a process under no such pane never reaches it. Exit 1 for either, and for a
 # process table `ps` could not read, which is no evidence of a top-level
-# session. A harness that is the pane's process itself (`tmux new-window
-# claude`, `exec claude` at the prompt, a tmux default command) is where the
-# walk stops and is never counted, so it writes no row and its reader takes
-# the pane fallback; a launched overseer is typed into the pane's shell and is
-# not that shape. The shell set is lib/lane-state.sh's is_bare_shell.
+# session. Counting the boundary includes a native process that replaced
+# its pane shell or that a managed launch bound below its waiting supervisor.
+# The shell set is lib/lane-state.sh's is_bare_shell.
 session_rows_top_level() { # PANE_PID
   local pid="$$" line ppid comm child="" harnesses=0 steps=0
-  while [ "$pid" != "$1" ]; do
+  while :; do
     [ "$steps" -lt 64 ] && [ "$pid" -gt 1 ] || return 1
     line="$(ps -o ppid= -o comm= -p "$pid" 2>/dev/null)" || return 1
     read -r ppid comm <<<"$line"
@@ -281,6 +278,7 @@ session_rows_top_level() { # PANE_PID
     else
       harnesses=$((harnesses + 1))
     fi
+    [ "$pid" != "$1" ] || break
     child="$comm"
     pid="$ppid"
     steps=$((steps + 1))
@@ -315,11 +313,25 @@ session_rows_top_level() { # PANE_PID
 # build the row, and mailbox_append_locked's own 2 and 3 for the write and the
 # lock. The cause is on stderr.
 session_rows_write() { # DIR HARNESS [EVENT]
-  local key file payload event account row pane_pid jarvis_rc=0
+  local key file payload event account row pane_pid native native_pid native_start native_rc=0 jarvis_rc=0
   key="$(lane_context_caller_key)" || return 3
   file="$(session_rows_overseer_file "$1" "${key%% *}" "${key#* }")"
   [ -d "${file%/*}" ] || [ -n "${JARVIS_RECORD:-}" ] || return 0
   pane_pid="$(tmux display-message -p -t "${key#* }" '#{pane_pid}' 2>/dev/null)" || return 3
+  if [ -n "${JARVIS_RECORD:-}" ]; then
+    # A managed session has a waiting supervisor above its native command.
+    # The bound run, rather than that supervisor, is its top-level boundary.
+    native="$(jq -r --arg generation "${JARVIS_GENERATION:-}" --arg server "${key%% *}" --arg pane "${key#* }" \
+      --arg harness "$2" "$SESSION_ROWS_JARVIS_BOUND"'
+      .overseer.lifecycle | owned
+      | select(bound($generation; $server; $pane; $harness))
+      | .native_process | select(.pid != null and .started_at != null) | [.pid,.started_at] | @tsv' \
+      -- "$JARVIS_RECORD")" || return 1
+    [ -n "$native" ] || return 0
+    IFS=$'\t' read -r native_pid native_start <<<"$native"
+    lane_identity_status "$native_pid" "$native_start" || native_rc=$?
+    case "$native_rc" in 0) pane_pid="$native_pid" ;; 3) return 0 ;; *) return 1 ;; esac
+  fi
   session_rows_top_level "$pane_pid" || return 0
   payload="$(cat)" || return 1
   # A subagent's payload carries its agent_id: its failure is its own turn's,
@@ -363,7 +375,9 @@ SESSION_ROWS_JARVIS_BOUND='def bound($generation; $server; $pane; $harness):
   .harness == $harness and (.pending | type) == "object" and $generation != ""
   and (.pending.generation | tostring) == $generation
   and (.pending.server | tostring) == $server
-  and .pending.pane == $pane;'
+  and .pending.pane == $pane;
+  def owned:
+    ., (if .transfer.retired == true then empty else .predecessor? // empty | owned end);'
 
 # session_rows_jarvis_write RECORD GENERATION KEY HARNESS: the SessionStart payload on
 # stdin written as its session's native identity into the `pending` row of the
