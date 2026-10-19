@@ -87,8 +87,13 @@ lane_session_command() { # HARNESS NATIVE_ID RESUME_FILE [NAME [FLAG...]]
   LANE_SESSION_CMD="$(
   case "$harness" in
     (claude)
-      compaction="$(launch_choice_compaction claude "")" || return 1
-      printf 'claude %q -n %q' "$compaction" "$name"
+      printf 'claude'
+      # Overseer flags already carry launch policy; a replay keeps its saved policy.
+      if [[ "$name" != overseer ]]; then
+        compaction="$(launch_choice_compaction claude "")" || return 1
+        printf ' %q' "$compaction"
+      fi
+      printf ' -n %q' "$name"
       if [[ -n "$file" ]]; then printf ' --resume %q' "$id"
       else printf ' --session-id %q' "$id"; fi
       printf '%s' "$flags" ;;

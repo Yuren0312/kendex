@@ -2497,6 +2497,28 @@ QUESTION_TOOL=sometimes run_succeed deadpane '' --dead-pane "$DEAD_PANE" --line-
 assert_eq "$RC|$(overseer_index)|$(caller_open)|$(dead_open)|$(recorded claude)" \
   "0|0|yes|no|lane=$H/.claude;-n;overseer;relaunched from the record;" \
   "--dead-pane sends the recorded line into the dead overseer's window, asking that pane nothing, a mistyped question-tool setting unread"
+
+# Restoring the native builder's extra policy must reach recovery and fail
+# the zero-settings replay oracle, rather than fail before the native launch.
+REPLAYSETTINGSCTL="$(mutant_scripts replaysettings lib/lane-launch.sh)" || exit 1
+mutate_file "$REPLAYSETTINGSCTL/lib/lane-launch.sh" \
+  'if [[ "$name" != overseer ]]; then' 'if true; then'
+new_caller "$MARK"
+new_dead_pane
+QUESTION_TOOL=sometimes SUCCEED_BIN="$REPLAYSETTINGSCTL/oversee-succeed" \
+  run_succeed replaysettings '' --dead-pane "$DEAD_PANE" --line-file "$TMP_ROOT/line-file"
+assert_eq "$RC|$(overseer_index)|$(caller_open)|$(dead_open)" "0|0|yes|no" \
+  "control: the replay-settings mutant reaches successful native recovery"
+REPLAY_SETTINGS=0
+while IFS= read -r word; do
+  [[ "$word" != "$CLAUDE_COMPACT" ]] || REPLAY_SETTINGS=$((REPLAY_SETTINGS + 1))
+done < "$TMP_ROOT/argv.claude"
+assert_eq "$REPLAY_SETTINGS" 1 "control: the replay-settings mutant injects one setting"
+control_status=0
+(FAIL=0; assert_eq "$REPLAY_SETTINGS" 0 "zero-settings replay"; [[ "$FAIL" -eq 0 ]]) \
+  > "$TMP_ROOT/replay-settings-control.log" || control_status=$?
+assert_eq "$control_status" 1 "control: the zero-settings replay oracle rejects the injected setting"
+
 new_caller "$MARK"
 new_dead_pane
 SUCCESSION=off run_succeed deadoff '' --dead-pane "$DEAD_PANE" --line-file "$TMP_ROOT/line-file"
