@@ -279,6 +279,27 @@ environment_rows() {
 [2,"sh LAUNCH.sh WAIT TOOL --test 'timeout 5 \"env\" &'","compound-context-background-list"]
 [0,"sh LAUNCH.sh WAIT TOOL --test 'timeout 5 \"env\";'","compound-context-simple-terminator-data"]
 [0,"sh LAUNCH.sh WAIT TOOL --test '\ntimeout 5 \"env\"\n'","compound-context-simple-newline-data"]
+[0,"true; echo set","list-set-echo-after-semicolon"]
+[0,"true && echo set","list-set-echo-after-and"]
+[0,"true\necho set","list-set-echo-after-newline"]
+[0,"cd DIR && .agents/skills/orch/scripts/workflow-state set oversee launch_queue '[]'","list-set-workflow-state-argument"]
+[0,"tool set x; true","list-set-first-stage-argument"]
+[0,"true | tool set x","list-set-pipe-receiver-argument"]
+[0,"git -C x config set foo; git status","list-set-git-config-argument"]
+[0,"set -euo pipefail; tool set x","list-set-after-shell-options"]
+[2,"true; set","list-bare-set-after-semicolon"]
+[2,"set; true","list-bare-set-first"]
+[2,"true && set","list-bare-set-after-and"]
+[2,"true | set","list-bare-set-pipe"]
+[2,"echo set | bash","list-set-piped-to-shell"]
+[2,"echo set | xargs bash -c","list-set-piped-to-xargs-shell"]
+[2,"echo set > tmp/x.sh; bash tmp/x.sh","list-set-written-then-run"]
+[2,"echo set > tmp/x.sh; . tmp/x.sh","list-set-written-then-sourced"]
+[2,"true; timeout 5 bash -c set","list-shell-receiver-set"]
+[2,"timeout 5 bash -c set","unknown-head-shell-receiver-set"]
+[2,"true; tool env","list-env-argument"]
+[2,"true; tool export","list-export-argument"]
+[2,"true; tool /proc/self/environ","list-proc-environ-argument"]
 [2,"job-launcher env","unknown-launcher-bare-env"]
 [2,"job-launcher env -u NAME","unknown-launcher-unset-without-target"]
 [2,"job-launcher env -0","unknown-launcher-null-env"]
@@ -1464,11 +1485,11 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
     case "$control" in
       refuse)
         printf '%s\n' '#!/usr/bin/env bash' 'exit 2' >"$mutant"
-        control_labels=(unknown-launcher-named-unsets unknown-launcher-set-assignment-data unknown-launcher-set-argument-data unknown-launcher-quoted-heredoc-data unknown-fallback-forwarded-unset unknown-fallback-forwarded-nested-safe unknown-fallback-forwarded-assignment unknown-fallback-forwarded-set-data unknown-fallback-forwarded-set-text unknown-fallback-forwarded-env-assignment)
+        control_labels=(unknown-launcher-named-unsets unknown-launcher-set-assignment-data unknown-launcher-set-argument-data unknown-launcher-quoted-heredoc-data unknown-fallback-forwarded-unset unknown-fallback-forwarded-nested-safe unknown-fallback-forwarded-assignment unknown-fallback-forwarded-set-data unknown-fallback-forwarded-set-text unknown-fallback-forwarded-env-assignment list-set-echo-after-semicolon list-set-workflow-state-argument)
         control_actual=2; control_expected=0 ;;
       allow)
         printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$mutant"
-        control_labels=(unknown-launcher-bare-env unknown-launcher-unset-without-target unknown-launcher-null-env unknown-launcher-dump-target unknown-launcher-shell-dump bare-env bare-printenv shell-state unknown-fallback-forwarded-option-only unknown-fallback-forwarded-shell-dump)
+        control_labels=(unknown-launcher-bare-env unknown-launcher-unset-without-target unknown-launcher-null-env unknown-launcher-dump-target unknown-launcher-shell-dump bare-env bare-printenv shell-state unknown-fallback-forwarded-option-only unknown-fallback-forwarded-shell-dump list-bare-set-after-semicolon list-set-written-then-run)
         control_actual=0; control_expected=2 ;;
     esac
     cat "$hook_source" >>"$mutant"
@@ -1504,9 +1525,13 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       }
       defect == "no-check" { swap("if environment_dump \"$command_kind\"; then", "if false; then") }
       defect == "main-evidence-cut" { swap("[[ ! $evidence =~ $opaque_re ]] || return 0", ":") }
-      defect == "unknown-evidence-raw" { swap("if [ \"$evidence_context\" = unknown-head ]; then", "if [ unknown-correction-disabled = unknown-head ]; then") }
+      defect == "unknown-evidence-raw" { swap("if [ \"$evidence_context\" = unknown-head ] || [ \"$evidence_context\" = list ]; then", "if [ unknown-correction-disabled = unknown-head ]; then") }
+      defect == "list-context-loss" { swap("[ \"$command_stages\" -eq 1 ] || [ \"$command_context\" = compound ] || command_context=list", "[ \"$command_stages\" -eq 1 ] || command_context=compound") }
+      defect == "list-set-evidence" { swap("[ \"$evidence_context\" != list ] || opaque_re=\"$other_re|$env_re\"", ":") }
+      defect == "list-stdout-rule" { swap("[ \"${separators[$stage]}\" = '\''|'\'' ] || [ -n \"$output\" ] || evidence_context=list", "evidence_context=list") }
+      defect == "shell-receiver-selection" { swap("{ [ \"$program\" = env ] || [ \"$receiver\" = shell ]; }", "[ \"$program\" = env ]") }
       defect == "selected-producer-unresolved" { swap("environment_main_evidence conservative \"${args[@]:program_pos}\"", "false") }
-      defect == "compound-context-loss" { swap("[ \"$command_context\" = simple ]", "true") }
+      defect == "compound-context-loss" { swap("case \"$command_context\" in", "case simple in") }
       defect == "operand-word-boundary" { swap("[^A-Za-z0-9_.-]", "[^A-Za-z0-9_]"); swap("[^A-Za-z0-9_.-]", "[^A-Za-z0-9_]") }
       defect == "unresolved-redirect-loss" { swap("if [ -z \"$stdin_program\" ] && { [ -n \"$redirect_evidence\" ] || environment_main_evidence \"$evidence_context\" \"${args[@]}\"; }; then mode=dump-unknown; fi", "if [ -z \"$stdin_program\" ] && environment_main_evidence \"$evidence_context\" \"${args[@]}\"; then mode=dump-unknown; fi") }
       defect == "producer-implicit-clean" && $0 == "    mode=other" { swap("mode=other", "mode=clean") }
@@ -1613,6 +1638,19 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
     fi
   done <<'ENVIRONMENT_CONTROLS'
 compound-context-loss|FAIL environment: compound-context-test-env: exit=0 expected=2
+list-context-loss|FAIL environment: list-set-echo-after-semicolon: exit=2 expected=0
+list-context-loss|FAIL environment: list-set-echo-after-and: exit=2 expected=0
+list-context-loss|FAIL environment: list-set-echo-after-newline: exit=2 expected=0
+list-context-loss|FAIL environment: list-set-workflow-state-argument: exit=2 expected=0
+list-context-loss|FAIL environment: list-set-first-stage-argument: exit=2 expected=0
+list-context-loss|FAIL environment: list-set-pipe-receiver-argument: exit=2 expected=0
+list-context-loss|FAIL environment: list-set-git-config-argument: exit=2 expected=0
+list-context-loss|FAIL environment: list-set-after-shell-options: exit=2 expected=0
+list-set-evidence|FAIL environment: list-set-echo-after-semicolon: exit=2 expected=0
+list-stdout-rule|FAIL environment: list-set-written-then-run: exit=0 expected=2
+list-stdout-rule|FAIL environment: list-set-piped-to-shell: exit=0 expected=2
+shell-receiver-selection|FAIL environment: list-shell-receiver-set: exit=0 expected=2
+shell-receiver-selection|FAIL environment: unknown-head-shell-receiver-set: exit=0 expected=2
 selected-producer-unresolved|FAIL environment: selected-producer-forwarded-xargs-env: exit=0 expected=2
 receiver-named-method|FAIL environment: receiver-jarvis-config-named-method: exit=2 expected=0
 receiver-named-method|FAIL environment: receiver-jarvis-heredoc-named-method: exit=2 expected=0

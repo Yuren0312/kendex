@@ -5,7 +5,7 @@
 # matcher: Bash
 # description: On harnesses that execute hooks, refuse recognized whole-environment reads unless a proven direct pipe filters named variables. This fixed check runs outside Git and before project policy. Nested dumps and unsupported routing can refuse conservatively. It reads submitted text, not unseen programs, aliases or runtime-built commands. COMMAND_SAFETY_DENY_PATTERN replaces only the default systemd-run memory-cap pattern; `^$` disables only that project-pattern check.
 # summary: Refuses recognized whole-environment command text and gives a filter that names a variable. Also applies the project deny pattern or the default systemd-run memory-cap rule. Unreadable payloads warn and allow the call; unreadable policy support affects only the pattern check.
-# safety: Classify literal command producers and the program receiving inline code or registered heredoc input. Shells retain shell parsing, known interpreters use language-specific whole-environment evidence, and literal cat bodies retain their data contract. The unknown-head evidence fallback classifies unquoted literal env arguments with the shared producer option grammar and checks their selected targets; set in an unknown-head argument or assignment remains data. Known producers, registered bodies, compound syntax, exec and builtin retain their conservative evidence contracts. Unquoted body expansions are checked independently. Only proven direct named-variable filters grant dump permission; project-pattern matching remains independent and reads the submitted text. Unseen programs and runtime-built names are outside this text check; unreadable payloads or policy support warn and allow their affected check. Every diagnostic starts with command-safety: <key>=<value>.
+# safety: Classify literal command producers and the program receiving inline code or registered heredoc input. Shells retain shell parsing, known interpreters use language-specific whole-environment evidence, and literal cat bodies retain their data contract. The unknown-head evidence fallback classifies unquoted literal env and shell arguments with the shared producer option grammar and checks their selected targets; set in an unknown-head argument or assignment remains data. An unknown-head list stage (after ;, a newline, &&, || or a pipe, or before &) takes the same fallback plus every other known read word, unless its stdout feeds a pipe or a redirect, which keeps the conservative set evidence. Known producers, registered bodies, compound syntax, exec and builtin retain their conservative evidence contracts. Unquoted body expansions are checked independently. Only proven direct named-variable filters grant dump permission; project-pattern matching remains independent and reads the submitted text. Unseen programs and runtime-built names are outside this text check; unreadable payloads or policy support warn and allow their affected check. Every diagnostic starts with command-safety: <key>=<value>.
 # timeout: 10
 # requires-skills: [commit-guards]
 # ---
@@ -282,7 +282,9 @@ environment_main_evidence() { # context, then decoded words or conservative text
   local env_re='(^|[^A-Za-z0-9_.-])env([^A-Za-z0-9_.-]|$)'
   local set_re='(^|[^A-Za-z0-9_-])set([^A-Za-z0-9_-]|$)'
   local opaque_re="$other_re|$env_re|$set_re"
-  if [ "$evidence_context" = unknown-head ]; then
+  # A list stage's set word is an argument; bare set reaches the producer.
+  [ "$evidence_context" != list ] || opaque_re="$other_re|$env_re"
+  if [ "$evidence_context" = unknown-head ] || [ "$evidence_context" = list ]; then
     local evidence_args=(${args[@]+"${args[@]}"}) evidence_kinds=(${arg_kinds[@]+"${arg_kinds[@]}"})
     local evidence_unquoted=(${arg_unquoted[@]+"${arg_unquoted[@]}"}) evidence_roles=(${arg_roles[@]+"${arg_roles[@]}"})
     local args=() arg_kinds=() arg_unquoted=() arg_roles=()
@@ -294,7 +296,10 @@ environment_main_evidence() { # context, then decoded words or conservative text
       # Assignment values never name a builtin or a forwarded executable.
       case "${evidence_roles[$candidate]}" in prefix | syntax) continue ;; esac
       value=${evidence_args[$candidate]}
-      if [ "${evidence_roles[$candidate]}:${evidence_kinds[$candidate]}:${value##*/}" = argument:literal:env ] &&
+      # An env or shell word can be forwarded argv; judge what it would run.
+      program=${value##*/}; environment_receiver
+      if [ "${evidence_roles[$candidate]}:${evidence_kinds[$candidate]}" = argument:literal ] &&
+         { [ "$program" = env ] || [ "$receiver" = shell ]; } &&
          [ -n "${evidence_unquoted[$candidate]}" ]; then
         limit=${#evidence_args[@]}
         args=("${evidence_args[@]:candidate:limit-candidate}")
@@ -332,7 +337,7 @@ environment_main_evidence() { # context, then decoded words or conservative text
         [[ ! $evidence =~ $other_re ]] || return 0
       fi
     done
-    return 1
+    [ "$evidence_context" = list ] || return 1
   fi
   for value in "$@"; do
     evidence=${value//"$continuation"/}
@@ -1069,15 +1074,16 @@ environment_dump() { # command kind; arguments are already decoded data
     if [ "$i" -lt "$n" ]; then
       [ "${kinds[$i]}" = operator ] || continue
       case "${tokens[$i]}" in
-        '|') pipeline=1; command_context=compound ;;
-        '&&' | '||' | '&') command_context=compound ;;
+        # List boundaries keep each stage's words; lossy syntax stays compound.
+        '|') pipeline=1; [ "$command_context" = compound ] || command_context=list ;;
+        '&&' | '||' | '&') [ "$command_context" = compound ] || command_context=list ;;
         ';') ;;
         *) continue ;;
       esac
     fi
     if [ "$start" -lt "$i" ]; then
       command_stages=$((command_stages + 1))
-      [ "$command_stages" -eq 1 ] || command_context=compound
+      [ "$command_stages" -eq 1 ] || [ "$command_context" = compound ] || command_context=list
     fi
     starts[stage]=$start; ends[stage]=$i
     separators[stage]=${tokens[$i]:-end}; stage=$((stage + 1)); start=$((i + 1))
@@ -1148,12 +1154,17 @@ environment_dump() { # command kind; arguments are already decoded data
       for ((j=program_pos+1; j<${#args[@]}; j++)); do arg_roles[j]=argument; done
     fi
     environment_program_text
-    # Only proved simple command syntax receives the unknown-argv grammar.
+    # Only proved simple or list syntax receives the unknown-argv grammar.
     # Actual syntax survives recursion; conservative recursion alone does not
     # establish compound syntax. Both fallback paths consume this decision.
+    # A list stage whose stdout reaches a pipe or a redirect can feed a later
+    # interpreter, so its words keep the conservative set evidence.
     evidence_context=conservative
-    if [ "$command_context" = simple ] && [ -z "$unsupported$syntax_head$producer_known" ] && [ "$receiver" = unknown ]; then
-      evidence_context=unknown-head
+    if [ -z "$unsupported$syntax_head$producer_known" ] && [ "$receiver" = unknown ]; then
+      case "$command_context" in
+        simple) evidence_context=unknown-head ;;
+        list) [ "${separators[$stage]}" = '|' ] || [ -n "$output" ] || evidence_context=list ;;
+      esac
     fi
     # Supported shell source keeps this classification check in its queue.
     # Other unclassified forwarded argv retains the complete read evidence.
