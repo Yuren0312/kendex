@@ -276,6 +276,22 @@ MODE=default
 range_base=""
 selection_only=0
 scoped_only=0
+release_version=""
+if [ "${1:-}" = --released-packages ]; then
+  [ "$#" -ge 2 ] || refuse argument "$1"
+  release_binary=$2
+  release_dir=$(cd -- "$(dirname -- "$release_binary")" && pwd -P) || exit 1
+  release_version=$("$release_binary" --version) || exit 1
+  release_version=${release_version#kendex }
+  export PATH="$release_dir:$PATH"
+  # The harness-ci render suite otherwise replaces PATH with its own build.
+  export KENDEX_RELEASE_TEST=1 HARNESS_CI_REQUIRE_KENDEX=1 ORCH_REQUIRE_KENDEX=1 REVIEW_GATE_REQUIRE_KENDEX=1
+  # Reuse the shell text reader for comments and quoted spans. Only candidate
+  # command lines reach it: whole-file recovery is too broad for this selection.
+  source "$TOOLS_DIR/../skills/commit-guards/scripts/lib/command-position.sh" || exit 1
+  selection_only=1
+  shift 2
+fi
 if [ "${1:-}" = --selection ]; then
   selection_only=1
   shift
@@ -319,6 +335,8 @@ case "${1:-}" in
       '        DEV_VALIDATE_CLASS, DEV_VALIDATE_DOCS_ONLY and DEV_VALIDATE_PATHS, set by' \
       '        dev-validate-run, stand down the lanes tools/ci-job-set does not select.' \
       '--selection: report selection=all|subset without running checks or suites.' \
+      '--released-packages BINARY --range BASE: run every suite of each changed' \
+      '        shell package calling kendex with BINARY first on PATH, without scans or builds.' \
       '        DEV_VALIDATE_BASE selects range; otherwise selects full.' \
       '        DEV_VALIDATE_SCOPED=true runs the changed scripts and suites through' \
       '        the same suite mapper, leaving the full record to merge-group CI.'
@@ -326,6 +344,7 @@ case "${1:-}" in
     ;;
 esac
 [ "$#" -eq 0 ] || refuse argument "$1"
+[ -z "$release_version" ] || [ "$MODE" = range ] || refuse argument --released-packages-requires-range
 cd "$(git rev-parse --show-toplevel)"
 if [ "$MODE" = range ]; then
   # Resolved once, so every read below judges the same commit however the
@@ -1445,12 +1464,16 @@ path_role() { # DIR REL
     *) return 1 ;;
   esac
 }
-# A tree's whole set: each tests/ file path_role reads as a suite.
-skill_suites() { # DIR
+# A tree's whole set: each tests/ file path_role reads as a suite. The release
+# shell battery limits entrypoints here, not the implementations they execute.
+skill_suites() { # DIR [shell]
   local t
   for t in "$1"/tests/*.sh "$1"/tests/*.test.mjs; do
     [ -f "$t" ] || continue
     [ "$(path_role "$1" "${t#"$1"/}")" = suite ] || continue
+    if [ "${2:-}" = shell ]; then
+      case "$t" in *.sh) ;; *) continue ;; esac
+    fi
     printf '%s\n' "$t"
   done
 }
@@ -1465,6 +1488,76 @@ skill_files() { # DIR
       script | lib | helper | module | test-module | suite) printf '%s %s\n' "$role" "$f" ;;
     esac
   done
+}
+# Source language selects a reader, never suite eligibility. In particular,
+# Jarvis shell suites execute Python whose argv list calls the installed CLI.
+# Status 1 is no call (including empty source); status 2 is an unread scan.
+release_file_calls_kendex() { # FILE
+  local f=$1 code header language=other command candidates line answer hit=0
+  code=$(cat -- "$f") || return 2
+  [ -n "$code" ] || return 1
+  header=${code%%$'\n'*}
+  case "$f" in
+    *.py) language=python ;;
+    *.sh | *.bash) language=shell ;;
+    *)
+      if [[ $header =~ ^\#!.*[/\ ]python[0-9.]*([[:space:]]|$) ]]; then
+        language=python
+      elif [[ $header =~ ^\#!.*[/\ ](ba)?sh([[:space:]]|$) ]]; then
+        language=shell
+      fi
+      ;;
+  esac
+  case "$language" in
+    python)
+      # ast owns Python syntax: comments and docstrings cannot become argv.
+      # The literal argv first element is the shape watch.py ships, including
+      # its checked() wrapper rather than a hand-kept subprocess-name table.
+      answer=$(python3 - "$f" <<'PY'
+import ast
+from pathlib import Path
+import sys
+
+tree = ast.parse(Path(sys.argv[1]).read_bytes(), filename=sys.argv[1])
+print(any(isinstance(node, ast.Call) and node.args
+          and isinstance(node.args[0], (ast.List, ast.Tuple))
+          and node.args[0].elts
+          and isinstance(node.args[0].elts[0], ast.Constant)
+          and node.args[0].elts[0].value == 'kendex'
+          for node in ast.walk(tree)))
+PY
+      ) || return 2
+      case "$answer" in True) return 0 ;; False) return 1 ;; *) return 2 ;; esac
+      ;;
+    shell)
+      code=$(sed '/^[[:space:]]*#/d' <<<"$code") || return 2
+      # Shipped github and commit-guards scripts emit ordinary strings naming
+      # kendex. Require a command-shaped occurrence before the shell reader:
+      # it deliberately retains unread syntax, including some emitted prose.
+      command="(^|[;&|()\`])[[:space:]]*((if|elif|then|else|do|exec|command|!)[[:space:]]+)*[\"']?([^[:space:]\"':;|&()=]*/)?kendex[\"']?([[:space:]<>]|$)"
+      candidates=$(grep -E "$command" <<<"$code") || hit=$?
+      case "$hit" in 0) ;; 1) return 1 ;; *) return 2 ;; esac
+      # The shell reader owns heredoc data as well as quoted spans. Its source
+      # phase preserves candidate lines without whole-file quote recovery.
+      command_source "$code"
+      hit=0
+      candidates=$(grep -E "$command" <<<"$COMMAND_SOURCE") || hit=$?
+      case "$hit" in 0) ;; 1) return 1 ;; *) return 2 ;; esac
+      while IFS= read -r line; do
+        # Remove comments before cutting at their separators. Candidate lines
+        # avoid whole-file quote recovery hiding claude-model-classes calls.
+        uncommented "$line"
+        command_segments "$BARE"
+        # Masked whitespace is quoted data, not a command-word boundary.
+        hit=0
+        grep -Eq "$command" <<<"$SEGMENTS" || hit=$?
+        case "$hit" in 0) return 0 ;; 1) ;; *) return 2 ;; esac
+      done <<<"$candidates"
+      return 1
+      ;;
+    other) return 1 ;;
+    *) return 2 ;;
+  esac
 }
 # What the scan holds of each file skill_files lists for the tree SCAN_DIR,
 # loaded once for all of the tree's changed paths, one index per file:
@@ -1899,6 +1992,12 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
         ;;
       *) tree=tools; rel="../$f" ;;
     esac
+    if [ -n "$release_version" ]; then
+      [ "$tree" != tools ] || continue
+      tree_paths="$tree_paths$tree	$rel	$f
+"
+      continue
+    fi
     tree_paths="$tree_paths$tree	$rel	$f
 "
     if [ "$tree" != tools ]; then
@@ -1915,6 +2014,24 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
   # after every later battery is available to cancellation reporting.
   for d in $(cut -f1 <<<"$tree_paths" | sort -u); do
     suite_script=""
+    if [ -n "$release_version" ]; then
+      case "$d" in pi-extensions/*) continue ;; esac
+      release_suites=$(skill_suites "$d" shell) || { say scan "$d/tests"; continue; }
+      [ -n "$release_suites" ] || continue
+      release_inputs=$(skill_files "$d") || { say scan "$d"; continue; }
+      calls_kendex=0
+      while read -r role f; do
+        [ -n "$f" ] || continue
+        release_hit=0
+        release_file_calls_kendex "$f" || release_hit=$?
+        case "$release_hit" in
+          0) calls_kendex=1; break ;;
+          1) ;;
+          *) say scan "$f" ;;
+        esac
+      done <<<"$release_inputs"
+      [ "$calls_kendex" -eq 1 ] || continue
+    fi
     case "$d" in
       pi-extensions/*)
         [ -f "$d/package.json" ] || continue
@@ -1937,6 +2054,7 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
         [ -d "$d/tests" ] || continue
         run=all
         case "$d" in skills/* | hooks | refresh | tools) run="" ;; esac
+        [ -z "$release_version" ] || run=all
         [ "$scoped_only" -eq 0 ] || run=""
         if [ "$run" != all ]; then
           while IFS='	' read -r tree rel f; do
@@ -1969,7 +2087,11 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
         fi
         if [ "$run" = all ]; then
           suite_selection=all
-          run=$(skill_suites "$d")
+          if [ -n "$release_version" ]; then
+            run=$release_suites
+          else
+            run=$(skill_suites "$d")
+          fi
         else
           selected_count=$(count_lines "$run")
           total_count=$(count_lines "$(skill_suites "$d")")
@@ -1981,7 +2103,7 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
           note suites "$selected_count/$total_count reason=mapped tree=$d"
           [ -n "$run" ] || continue
         fi
-        if [ "$selection_only" -eq 1 ] && [ "$scoped_only" -eq 0 ]; then continue; fi
+        if [ "$selection_only" -eq 1 ] && [ "$scoped_only" -eq 0 ] && [ -z "$release_version" ]; then continue; fi
         ;;
     esac
     suite_trees+=("$d")
@@ -2016,6 +2138,9 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
   for ((suite_index = 0; suite_index < ${#suite_trees[@]}; suite_index++)); do
     d=${suite_trees[suite_index]}
     run=${suite_runs[suite_index]}
+    if [ -n "$release_version" ]; then
+      printf 'catalog-release: version=%s leg=package-suites package=%s\n' "$release_version" "$d"
+    fi
     if [ -n "${suite_scripts[suite_index]}" ]; then
       # Prove the npm launcher can start, including its Node interpreter,
       # once for the selected Pi suites before interpreting suite output.
@@ -2042,8 +2167,23 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
     while IFS= read -r t; do
       [ -n "$t" ] || continue
       t="${t##*/}"
+      t="${t%.test.mjs}"
       filters+=("=${t%.sh}")
     done <<<"$run"
+    if [ -n "$release_version" ]; then
+      # --local replaces PATH with a checkout build. The release leg uses
+      # its inherited release PATH; orch's native entry keeps its ALONE policy.
+      release_args=()
+      [ "$d" = skills/orch ] || release_args=(--battery "$d/tests")
+      bash "$TOOLS_DIR/../skills/orch/tests/run-all.sh" ${release_args[@]+"${release_args[@]}"} ${filters[@]+"${filters[@]}"} || {
+        printf 'catalog-release: version=%s leg=package-suites package=%s suite=%s\n' "$release_version" "$d" "$d/tests"
+        printf '%s\n' 'catalog-release: remedy=release-engine' \
+          'Release the engine first, then raise min_kendex. See app-deploy Catalog compatibility.'
+        fail=1
+      }
+      suite_runs[suite_index]=""
+      continue
+    fi
     if [ -f "$d/tests/run-all.sh" ]; then
       # Family aliases can expand these filters; the runner publishes its selection.
       echo "=== $d/tests/run-all.sh" ${filters[@]+"${filters[@]}"}
@@ -2064,7 +2204,9 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
 fi
 [ -n "$suite_selection" ] || suite_selection=all
 if [ "$selection_only" -eq 1 ]; then
-  if [ "$scoped_only" -eq 1 ]; then
+  if [ -n "$release_version" ]; then
+    printf 'catalog-release: version=%s leg=package-suites result=%s\n' "$release_version" "$fail"
+  elif [ "$scoped_only" -eq 1 ]; then
     printf 'validate: lanes=scoped-suites selection=subset\n'
     printf 'scoped=true\n'
   else
