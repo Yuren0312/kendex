@@ -1,6 +1,7 @@
 //! Required and selected optional dependencies stay within one catalog: a
-//! skill's from its SKILL.md, a hook's from its header. Derived install
-//! reasons preserve the manifest as a record of user choices.
+//! skill's from its SKILL.md, a hook's from its header, and a required
+//! agent's from its skill assignment. Derived install reasons preserve the
+//! manifest as a record of user choices.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -32,12 +33,20 @@ pub(crate) struct Dependencies {
 }
 
 /// Each supported edge: the declaring kind and its dependency kind.
-const DEPENDENT_KINDS: [(ItemKind, ItemKind); 4] = [
+const DEPENDENT_KINDS: [(ItemKind, ItemKind); 5] = [
     (ItemKind::Skill, ItemKind::Skill),
     (ItemKind::Skill, ItemKind::Agent),
+    (ItemKind::Agent, ItemKind::Skill),
     (ItemKind::Hook, ItemKind::Hook),
     (ItemKind::Hook, ItemKind::Skill),
 ];
+
+/// The kinds every walk starts from. An agent is walked only once a skill
+/// requires it: one the person declared alone took its skills at `add`
+/// time or was told not to (`--no-auto-skills`, a set's agents). One a
+/// skill requires brings its assignment whichever way it is declared, and
+/// the consumer's `[agent-skills]` row is what changes it.
+const DECLARING_KINDS: [ItemKind; 2] = [ItemKind::Skill, ItemKind::Hook];
 
 /// What an item's frontmatter declares it needs, `found` being what
 /// [`find_item`] returned for it: a skill's directory, whose SKILL.md is
@@ -106,12 +115,13 @@ pub(crate) fn declared_in(text: &str) -> Dependencies {
 /// may share a name without being the same dependency.
 type Node = (ItemKind, String);
 
-/// Everything the skills and hooks in this expansion require, walked until
-/// no installation learns another reason. Cycles are fine — `orch` and `dev`
-/// require each other on purpose, and so do the lane-mail hooks — because an
-/// item is only walked again when its reasons grow, and they cannot grow
-/// forever. Items that came in as bundle members are walked like any other:
-/// what an item needs does not depend on how it was chosen.
+/// Everything the skills and hooks in this expansion require, and the
+/// skills the agents they require load, walked until no installation
+/// learns another reason. Cycles are fine — `orch` and `dev` require each
+/// other on purpose, and so do the lane-mail hooks — because an item is
+/// only walked again when its reasons grow, and they cannot grow forever.
+/// Items that came in as bundle members are walked like any other: what
+/// an item needs does not depend on how it was chosen.
 ///
 /// Where the pass judges pins (`DesiredState::judge_pins`), a hook whose
 /// pin alone keeps it off a tool is asked about that tool again, by the
@@ -124,10 +134,7 @@ pub(super) fn expand(
     catalogs: &mut Catalogs,
     state: &mut DesiredState,
 ) {
-    let every_item = DEPENDENT_KINDS
-        .into_iter()
-        .map(|(kind, _)| kind)
-        .collect::<BTreeSet<_>>()
+    let every_item = DECLARING_KINDS
         .into_iter()
         .flat_map(|kind| {
             expansion
@@ -173,7 +180,12 @@ fn walk(
     // item is what stops a pair of items that require each other from
     // reporting everything twice.
     let mut wanted: BTreeMap<Node, Wanted> = BTreeMap::new();
-    while let Some((kind, parent)) = queue.pop_front() {
+    // An agent's assignment edge brings only skills nothing else holds
+    // ([`held_elsewhere`]), so every agent waits until no hard edge is
+    // left to walk: a skill some item requires is held by then, however
+    // deep, and keeps its own revision.
+    let mut agents: VecDeque<Node> = VecDeque::new();
+    while let Some((kind, parent)) = queue.pop_front().or_else(|| agents.pop_front()) {
         // A declaration no tool here can hold installs nothing, so it needs
         // nothing either; the declaration itself reports that.
         let Some(parent_decl) = expansion.decl_of(kind, &parent) else {
@@ -212,7 +224,21 @@ fn walk(
             }
             let node = (*dep_kind, dep.clone());
             if seen.insert(node.clone()) || grew {
-                queue.push_back(node);
+                match node.0 {
+                    ItemKind::Agent => agents.push_back(node),
+                    ItemKind::Skill
+                    | ItemKind::Hook
+                    | ItemKind::Command
+                    | ItemKind::McpServer
+                    | ItemKind::Plugin
+                    | ItemKind::PiExtension
+                    | ItemKind::OutputStyle => queue.push_back(node),
+                }
+            }
+        }
+        for skill in found.loads_held.iter().filter(|_| parent_decl.enabled) {
+            if expansion.turn_on_held(ItemKind::Skill, skill) {
+                queue.push_back((ItemKind::Skill, skill.clone()));
             }
         }
         wanted.insert((kind, parent.clone()), found);
@@ -366,6 +392,7 @@ fn record(wanted: BTreeMap<Node, Wanted>, state: &mut DesiredState) {
 /// with the tools it lands on; the findings on the parent; and the tools
 /// the parent itself is withheld from, with why, because a hook whose
 /// companion will not be written there is not written there either.
+#[derive(Default)]
 struct Wanted {
     deps: Vec<Dep>,
     findings: Vec<ItemWarning>,
@@ -388,6 +415,10 @@ struct Wanted {
     /// companion and the pass judges pins: each asked again with the pin
     /// dropped ([`withheld_past_pin`]).
     left_out: Vec<HarnessId>,
+    /// For an agent, the assigned skills the scope already holds
+    /// ([`held_elsewhere`]): its edge brings none of them, and [`walk`]
+    /// only switches each on while the agent is on.
+    loads_held: Vec<String>,
 }
 
 impl Wanted {
@@ -553,13 +584,8 @@ fn withhold_kept_retired(
             let found = wanted
                 .entry((kind, name.clone()))
                 .or_insert_with(|| Wanted {
-                    deps: Vec::new(),
-                    findings: Vec::new(),
-                    answered: Vec::new(),
-                    withheld: BTreeMap::new(),
-                    retired_companions: BTreeMap::new(),
                     armed: true,
-                    left_out: Vec::new(),
+                    ..Wanted::default()
                 });
             let companion = (dep_kind, dep.clone());
             found.withhold_for(tools.iter().copied(), Withholding::Retired, &companion);
@@ -879,13 +905,8 @@ fn wanted_by(
     let catalog = catalogs.get(&own.0, own.1.as_deref(), state)?;
     let sealed = &catalog.sealed;
     let mut wanted = Wanted {
-        deps: Vec::new(),
-        findings: Vec::new(),
-        answered: Vec::new(),
-        withheld: BTreeMap::new(),
-        retired_companions: BTreeMap::new(),
         armed: parent_decl.enabled,
-        left_out: Vec::new(),
+        ..Wanted::default()
     };
     let dir = match catalog.offer(kind, parent) {
         Offer::Item(_, dir) => dir,
@@ -898,9 +919,15 @@ fn wanted_by(
         }
         Offer::NotOffered | Offer::Silent => return Some(wanted),
     };
-    let Ok(declared) = declared_dependencies(sealed, kind, &dir) else {
+    let Some(mut declared) = declared_by(catalog, manifest, kind, parent, &dir) else {
         return Some(wanted);
     };
+    if kind == ItemKind::Agent {
+        (wanted.loads_held, declared.required_skills) = declared
+            .required_skills
+            .into_iter()
+            .partition(|skill| held_elsewhere(expansion, parent, skill));
+    }
     let header = hook_header(sealed, kind, &dir);
     if let Ok(Some(own)) = &header
         && state.judge_pins
@@ -970,6 +997,7 @@ fn wanted_by(
     if kind == ItemKind::Hook && wanted.armed {
         wanted.withhold(unresolved, Withholding::Requires);
     }
+    let resolved = wanted.findings.len();
     derive(
         kind,
         parent,
@@ -981,7 +1009,98 @@ fn wanted_by(
         state,
         &mut wanted,
     );
+    // An agent's assignment edge is soft ([`held_elsewhere`]): a skill
+    // it brings that will not install, kept removed or out of reach of
+    // the tool, leaves the declarations complete, and the agent pass
+    // warns for it (`agent_skills::warn_uninstalled`). Its names are this
+    // catalog's own, so `resolve` misses none of them.
+    if kind == ItemKind::Agent {
+        wanted.findings.truncate(resolved);
+    }
     Some(wanted)
+}
+
+/// What `parent`, offered at `dir`, declares it needs: an agent's
+/// assignment ([`agent_assignment`]), every other kind's own frontmatter.
+/// `None` where that frontmatter will not read, which the renderer
+/// reports.
+fn declared_by(
+    catalog: &OpenCatalog,
+    manifest: &Manifest,
+    kind: ItemKind,
+    parent: &str,
+    dir: &std::path::Path,
+) -> Option<Dependencies> {
+    match kind {
+        ItemKind::Agent => Some(agent_assignment(catalog, manifest, parent, dir)),
+        ItemKind::Skill
+        | ItemKind::Hook
+        | ItemKind::Command
+        | ItemKind::McpServer
+        | ItemKind::Plugin
+        | ItemKind::PiExtension
+        | ItemKind::OutputStyle => declared_dependencies(&catalog.sealed, kind, dir).ok(),
+    }
+}
+
+/// The skills an agent a skill requires loads, as its required skills: the
+/// consumer's `[agent-skills]` row where it has one, which replaces the
+/// catalog's assignment for the rendering too, and the catalog's own
+/// (`mapping::upstream_skills`) otherwise. Only names this catalog offers:
+/// a row may name a skill another source carries, and one nothing installs
+/// is the agent pass's warning (`agent_skills::warn_uninstalled`). An
+/// agent that will not read or parse needs nothing; the renderer reports it.
+/// [`wanted_by`] makes the edge's required skills only those
+/// [`held_elsewhere`] finds the scope does not hold; the rest follow only
+/// the agent's switch.
+fn agent_assignment(
+    catalog: &OpenCatalog,
+    manifest: &Manifest,
+    agent: &str,
+    path: &std::path::Path,
+) -> Dependencies {
+    let available = list_items(&catalog.sealed, &catalog.config, ItemKind::Skill);
+    let required_skills = match crate::mapping::declared_skills(manifest, agent) {
+        Some((declared, _)) => declared
+            .iter()
+            .filter(|skill| available.contains(skill))
+            .cloned()
+            .collect(),
+        None => {
+            let Ok(Some(text)) = catalog.sealed.read_if_exists(path) else {
+                return Dependencies::default();
+            };
+            let Ok(parsed) = crate::render::agent::parse_source_agent(&text) else {
+                return Dependencies::default();
+            };
+            crate::mapping::upstream_skills(agent, parsed.role, &catalog.config, &available)
+        }
+    };
+    Dependencies {
+        required_skills,
+        ..Dependencies::default()
+    }
+}
+
+/// Whether the scope holds `skill`, which `agent`'s assignment names, for
+/// any reason but this agent's edge. The assignment is what the agent
+/// loads, not what it needs to install, so its edge is soft: it brings
+/// only a skill the scope does not already hold, and a skill held for any
+/// other reason — declared, a set's, required by another item or brought
+/// by another agent, the skill that requires this agent among them —
+/// keeps its own declaration, revision and reasons, with no revision
+/// disagreement, finding or reason from this edge. Only its switch
+/// follows the agent: one brought in parked is switched on while the
+/// agent is on ([`walk`]), never one the person declared off. [`walk`]
+/// reads every agent after the hard edges, so which skills are held does
+/// not turn on walk order; [`wanted_by`] drops the findings on the skills
+/// this edge does bring.
+fn held_elsewhere(expansion: &Expansion, agent: &str, skill: &str) -> bool {
+    match expansion.derived_from(ItemKind::Skill, skill) {
+        Some(Reason::RequiredBy { by }) => by.kind != ItemKind::Agent || by.name != agent,
+        Some(Reason::Requested | Reason::MemberOf { .. }) => true,
+        None => expansion.contains(ItemKind::Skill, skill),
+    }
 }
 
 /// Of `harnesses`, the tools the plan writes the hook's position on
