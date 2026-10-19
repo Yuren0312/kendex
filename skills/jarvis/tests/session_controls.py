@@ -34,7 +34,7 @@ CONTROLS = [
     ("brief taken", "orch/scripts/lib/controller-session.py", 'and taken:', 'and False:', "test_turn_end_takes_the_brief"),
     ("Copilot text-only resume", "orch/scripts/lib/session-rows.sh", 'own:own | turn:own) stamp=brief_taken ;;', 'own:own | turn:own) [ "$due:$4" != turn:copilot ] || exit 0; stamp=brief_taken ;;', "test_resume_after_text_only_brief"),
     ("Codex text-only resume", "orch/scripts/lib/session-rows.sh", 'own:own | turn:own) stamp=brief_taken ;;', 'own:own | turn:own) [ "$due:$4" != turn:codex ] || exit 0; stamp=brief_taken ;;', "test_resume_after_text_only_brief"),
-    ("text-only delivery ordering", "jarvis/tests/fixtures/harness.py", 'while not json.loads(record_path.read_text()).get("brief_delivered"):', 'while False and not json.loads(record_path.read_text()).get("brief_delivered"):', "test_resume_after_text_only_brief"),
+    ("text-only delivery ordering", "jarvis/tests/fixtures/harness.py", 'while not session.read().get("brief_delivered"):', 'while False and not session.read().get("brief_delivered"):', "test_resume_after_text_only_brief"),
     ("Pi tool call takes the brief", "orch/scripts/lib/controller-session.py", 'and taken:', 'and False:', "test_pi_contract"),
     ("Pi text-only brief on main", "orch/scripts/lib/session-rows.sh", 'Stop:pi) due=completed ;;', 'Stop:pi) return 0 ;;', "test_pi_text_only_brief"),
     ("Pi errored brief", "orch/scripts/lib/session-rows.sh", 'select($due != "completed" or .pi_run_outcome == "completed")', 'select(true)', "test_pi_text_only_brief"),

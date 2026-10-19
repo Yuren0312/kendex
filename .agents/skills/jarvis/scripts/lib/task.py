@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import runpy
 from pathlib import Path
 import shlex
 import shutil
@@ -12,7 +13,8 @@ import tempfile
 import time
 import uuid
 
-from session import BASH, CALL_SECONDS, Refusal, Session
+CONTROLLER = runpy.run_path(str(Path(__file__).resolve().parents[3] / "orch/scripts/lib/controller-session.py"))
+BASH, CALL_SECONDS, Refusal, Session = (CONTROLLER[key] for key in ("BASH", "CALL_SECONDS", "Refusal", "Session"))
 
 
 def native(line, receipt):
@@ -35,10 +37,26 @@ def native(line, receipt):
     return child.wait()
 
 
-class Task(Session):
+class Task:
     def __init__(self, home, identifier):
-        super().__init__(home)
-        self.path = self.path.parent / "tasks" / (str(uuid.UUID(identifier)) + ".json")
+        self.controller = Session(home)
+        self.home = self.controller.home
+        # Task records keep their independent lifetime and existing location.
+        self.path = self.controller.legacy.parent / "tasks" / (str(uuid.UUID(identifier)) + ".json")
+
+    def write(self, record):
+        # The caller holds this task record lock, never the controller writer.
+        fd, name = tempfile.mkstemp(dir=self.path.parent, prefix=".task-")
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(record, stream, separators=(",", ":"))
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(name, self.path)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
 
     def read(self):
         # Callers hold this task's lock: an ended controller is recorded here,
@@ -49,7 +67,7 @@ class Task(Session):
             raise Refusal("record-unreadable")
         terminal = record["terminal"]
         if record["completion"] is None and terminal:
-            live = self.backend("task-live", terminal["server"], record["server_pid"], record["server_started_at"],
+            live = self.controller.backend("task-live", terminal["server"], record["server_pid"], record["server_started_at"],
                                 terminal["pane"], check=False)
             if live.returncode == 1:
                 # The task ran in that window. Its controller's session or
@@ -63,8 +81,8 @@ class Task(Session):
         return record
 
     def launch(self, args):
-        parent = Session(self.home)
-        with parent.locked():
+        parent = self.controller
+        with parent.locked(parent.path):
             controller = parent.read()
             terminal = parent.terminal(controller)
             if not controller or controller["state"] != "running" or not terminal:
@@ -97,7 +115,7 @@ class Task(Session):
                     json.dump(record, stream)
                 if profile:
                     profile.mkdir(mode=0o700)
-                with self.locked():
+                with self.controller.locked(self.path):
                     brief = ("Read the task file " + json.dumps(task_file) + ". Write the requested Output to "
                              + json.dumps(str(result)) + ". Your absolute scratch directory is "
                              + json.dumps(str(scratch)) + ". "
@@ -107,13 +125,13 @@ class Task(Session):
                              + shlex.join([str(Path(__file__).resolve().parents[1] / "task"), "complete",
                                            "--home", self.home, "--id", self.path.stem,
                                            "--outcome", "succeeded"]) + ".")
-                    prepared = json.loads(self.backend("task-prepare", args.harness, args.model, args.effort,
+                    prepared = json.loads(self.controller.backend("task-prepare", args.harness, args.model, args.effort,
                                                        args.account or "", self.home, brief).stdout)
                     record.update(harness=prepared["harness"], model=prepared["model"],
                                   account=prepared["account"], effort=prepared["effort"])
-                    if not shutil.which(prepared["harness"], path=self.env["PATH"]):
+                    if not shutil.which(prepared["harness"], path=self.controller.env["PATH"]):
                         raise Refusal("app-missing", prepared["harness"])
-                    created = self.tmux("new-window", "-d", "-t", "=jarvis", "-n", args.name,
+                    created = self.controller.tmux("new-window", "-d", "-t", "=jarvis", "-n", args.name,
                                         "-c", self.home, "-P", "-F", "#{window_id}\t#{pane_id}",
                                         BASH, "--noprofile", "--norc", socket=terminal["server"])
                     window, pane = created.stdout.strip().split("\t")
@@ -121,11 +139,11 @@ class Task(Session):
                                 "window": window, "pane": pane, "marked": False}
                     record["terminal"] = acquired
                     self.write(record)
-                    self.tmux("set-option", "-p", "-t", pane, "@jarvis-task", record["id"],
+                    self.controller.tmux("set-option", "-p", "-t", pane, "@jarvis-task", record["id"],
                               socket=terminal["server"])
                     acquired["marked"] = True
                     self.write(record)
-                    self.tmux("set-option", "-w", "-t", window, "remain-on-exit", "on",
+                    self.controller.tmux("set-option", "-w", "-t", window, "remain-on-exit", "on",
                               socket=terminal["server"])
                     child_env = ["env", "JARVIS_TASK_ID=" + record["id"],
                                  "JARVIS_BASH=" + BASH,
@@ -134,18 +152,18 @@ class Task(Session):
                     if profile:
                         child_env.append("JARVIS_BROWSER_PORT=0")
                     receipt = scratch / "startup.json"
-                    self.tmux("respawn-pane", "-k", "-t", pane, "-c", self.home,
+                    self.controller.tmux("respawn-pane", "-k", "-t", pane, "-c", self.home,
                               *child_env, sys.executable, "-B", "-c",
                               "import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.exit(runpy.run_path(sys.argv[1]+'/task.py',run_name='task_native')['native'](sys.argv[2],sys.argv[3]))",
                               str(Path(__file__).resolve().parent), prepared["line"], str(receipt),
                               socket=terminal["server"])
                     while not receipt.exists():
-                        if time.monotonic() >= self.deadline:
+                        if time.monotonic() >= self.controller.deadline:
                             raise subprocess.TimeoutExpired("task-startup", CALL_SECONDS)
                         time.sleep(0.02)
                     startup = json.loads(receipt.read_text())
                     if startup["state"] != "started":
-                        screen = self.tmux("capture-pane", "-p", "-t", pane, socket=terminal["server"]).stdout
+                        screen = self.controller.tmux("capture-pane", "-p", "-t", pane, socket=terminal["server"]).stdout
                         raise Refusal("native-exited", "exit=" + str(startup["exit"]) + "\n" + screen.strip())
                     record.update(state="running", launched_at=time.time())
                     self.write(record)
@@ -159,7 +177,7 @@ class Task(Session):
                     record["failure"]["exit"] = startup["exit"]
                 # Rollback owns a separate cleanup budget. Unknown ownership
                 # keeps scratch.
-                self.deadline = time.monotonic() + 3
+                self.controller.deadline = time.monotonic() + 3
                 try:
                     if recorded:
                         self.write(record)
@@ -180,11 +198,11 @@ class Task(Session):
     def close_window(self, record, *, allow_unmarked=False):
         terminal = record["terminal"]
         allow_unmarked = allow_unmarked or not terminal.get("marked", True)
-        self.backend("task-close", terminal["server"], record["server_pid"], record["server_started_at"],
+        self.controller.backend("task-close", terminal["server"], record["server_pid"], record["server_started_at"],
                      terminal["pane"], terminal["window"], self.path.stem, str(allow_unmarked).lower())
 
     def complete(self, outcome):
-        with self.locked():
+        with self.controller.locked(self.path):
             record = self.read()
             if record["completion"] is None:
                 if outcome == "succeeded" and not Path(record["result_path"]).is_file():
@@ -194,7 +212,7 @@ class Task(Session):
             return record
 
     def cleanup(self):
-        with self.locked():
+        with self.controller.locked(self.path):
             record = self.read()
             if record["completion"] is None:
                 raise Refusal("task-not-completed")
@@ -239,7 +257,7 @@ def main():
         elif args.verb == "cleanup":
             record = task.cleanup()
         else:
-            with task.locked():
+            with task.controller.locked(task.path):
                 record = task.read()
         print(json.dumps(record, separators=(",", ":")))
         return 0

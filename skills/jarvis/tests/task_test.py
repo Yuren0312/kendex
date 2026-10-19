@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import runpy
 import shlex
 import shutil
 import signal
@@ -11,8 +12,10 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from fixtures.harness import native_launcher
+from session_test import LifecycleRecord
 
 ROOT = Path(__file__).resolve().parents[3]
 SKILLS = Path(os.environ.get("JARVIS_TEST_SKILLS", ROOT / "skills"))
@@ -64,9 +67,9 @@ class TaskContract(unittest.TestCase):
                         PI_SUBAGENT_PARENT_SESSION_ID="parent", JARVIS_RECORD="parent",
                         JARVIS_GENERATION="999", JARVIS_BROWSER_PROFILE="/parent/browser",
                         JARVIS_BROWSER_PORT="9222",
+                        ORCH_STATE_DIR=str(self.root / "orch-state"),
                         JARVIS_TEST_REAL_KENDEX=REAL_KENDEX or "")
         key = hashlib.sha256(os.fsencode(str(self.home))).hexdigest()
-        self.record_path = self.root / "state/kendex/jarvis" / key / "jarvis-session.json"
         self.label = "jarvis-" + key[:32]
         created = self.tmux("new-session", "-d", "-s", "jarvis", "-P", "-F",
                             "#{socket_path}\t#{pid}\t#{start_time}\t#{window_id}\t#{pane_id}",
@@ -74,10 +77,18 @@ class TaskContract(unittest.TestCase):
         socket, server, started, window, pane = created.stdout.strip().split("\t")
         self.terminal = dict(server=socket, session="jarvis", window=window, pane=pane)
         self.tmux("set-option", "-p", "-t", pane, "@jarvis-generation", "1")
-        self.record_path.parent.mkdir(parents=True)
-        self.record_path.write_text(json.dumps(dict(v=1, home=str(self.home), harness="claude",
-            account=str(self.account), generation=1, state="running", reason="existing", detail="",
-            terminal=self.terminal, server_pid=int(server), server_started_at=int(started), process=True)))
+        with patch.dict(os.environ, self.env | {"JARVIS_BASH": self.env["JARVIS_TEST_BASH"]}, clear=True):
+            self.controller = runpy.run_path(str(self.skills / "orch/scripts/lib/controller-session.py"))["Session"](self.home)
+            self.record_path = LifecycleRecord(self.controller.path)
+            self.task_root = self.root / "state/kendex/jarvis" / key / "tasks"
+            pid = self.tmux("display-message", "-p", "-t", pane, "#{pane_pid}").stdout.strip()
+            process = json.loads(self.controller.backend("process", pid).stdout)
+            with self.controller.locked():
+                self.controller.write(dict(v=1, home=str(self.home), harness="claude",
+                    account=str(self.account), generation=1, state="running", reason="existing", detail="",
+                    terminal=self.terminal, server_pid=int(server), server_started_at=int(started),
+                    process=process, native_process=process,
+                    pending={"generation": 1, "native_session_id": "fixture-controller"}))
         self.task_file = self.home / "task brief.md"
         self.task_file.write_text("Inspect the selected site. Write the Output section.\n")
 
@@ -103,7 +114,7 @@ class TaskContract(unittest.TestCase):
                          "--input", self.task_file, "--account", self.account, "--browser", success=success)
 
     def saved_tasks(self):
-        return [json.loads(path.read_text()) for path in self.record_path.parent.joinpath("tasks").glob("*.json")]
+        return [json.loads(path.read_text()) for path in self.task_root.glob("*.json")]
 
     def acknowledgement(self, record, stage=None):
         path = self.home / ("ack-" + record["id"] + ".json")
@@ -118,6 +129,38 @@ class TaskContract(unittest.TestCase):
                     pass
             time.sleep(0.02)
         self.fail("native launch did not acknowledge: " + json.dumps(record))
+
+    def test_tasks_never_write_or_initialize_controller(self):
+        owner = self.skills / "orch/scripts/lib/controller-session.py"
+        source = owner.read_text()
+        markers = [self.root / "controller-write", self.root / "controller-init"]
+        rows = (
+            ('    def write(self, record):\n',
+             '    def write(self, record):\n        Path(' + repr(str(markers[0])) + ').touch()\n'),
+            ('    def backend(self, verb, *args, check=True):\n',
+             '    def backend(self, verb, *args, check=True):\n'
+             + '        if verb == "state-init": Path(' + repr(str(markers[1])) + ').touch()\n'),
+        )
+        self.assertFalse(owner.is_symlink())
+        for old, replacement in rows:
+            self.assertEqual(source.count(old), 1)
+            changed = source.replace(old, replacement)
+            self.assertNotEqual(changed, source)
+            source = changed
+        owner.write_text(source)
+        before = self.record_path.read_bytes()
+        record = self.launch("codex", model="gpt-5")
+        self.acknowledgement(record)
+        self.assertEqual(self.call("status", "--id", record["id"])["state"], "running")
+        self.call("complete", "--id", record["id"], "--outcome", "failed")
+        self.call("cleanup", "--id", record["id"])
+        self.assertEqual(self.record_path.read_bytes(), before)
+        self.assertEqual([path.exists() for path in markers], [False, False])
+        # A task with no parent must refuse without creating controller state.
+        self.record_path.unlink()
+        self.launch("codex", "no-parent", model="gpt-5", success=False)
+        self.assertFalse(self.record_path.exists())
+        self.assertEqual([path.exists() for path in markers], [False, False])
 
     def test_launch_contract(self):
         profiles = set()
@@ -155,7 +198,7 @@ class TaskContract(unittest.TestCase):
                 profiles.add(profile)
         # Keep all four tasks live while proving profile isolation, then
         # preserve their results while closing only their owned windows.
-        for path in sorted(self.record_path.parent.joinpath("tasks").glob("*.json")):
+        for path in sorted(self.task_root.glob("*.json")):
             record = json.loads(path.read_text())
             self.call("cleanup", "--id", record["id"], success=False)
             self.assertTrue(Path(record["scratch"]).is_dir())
@@ -176,7 +219,7 @@ class TaskContract(unittest.TestCase):
     def test_failed_pick_releases_task_scratch(self):
         self.home.joinpath("refuse-pick").touch()
         self.launch("codex", success=False)
-        paths = list(self.record_path.parent.joinpath("tasks").glob("*.json"))
+        paths = list(self.task_root.glob("*.json"))
         self.assertEqual(len(paths), 1)
         record = json.loads(paths[0].read_text())
         self.assertEqual(record["state"], "failed")
@@ -235,14 +278,14 @@ from pathlib import Path
 sys.path.insert(0,sys.argv[1])
 import task
 unread=sys.argv[2]=='True'
-original=task.Task.tmux
+original=task.Session.tmux
 def expire(self,*args,**kwargs):
     answer=original(self,*args,**kwargs)
     if args[0]=='new-window':
         self.deadline=time.monotonic()-1
         if unread: Path(self.home,'refuse-close').touch()
     return answer
-task.Task.tmux=expire
+task.Session.tmux=expire
 sys.argv=[sys.argv[0],*sys.argv[3:]]
 sys.exit(task.main())
 """
@@ -350,7 +393,7 @@ sys.exit(task.main())
                 with self.subTest(record=name):
                     task = self.launch("codex", name, model="gpt-5")
                     self.acknowledgement(task)
-                    path = self.record_path.parent / "tasks" / (task["id"] + ".json")
+                    path = self.task_root / (task["id"] + ".json")
                     saved = json.loads(path.read_text())
                     saved.update(identity, terminal=dict(saved["terminal"], **identity.get("terminal", {})))
                     path.write_text(json.dumps(saved))
@@ -590,23 +633,29 @@ while True: signal.pause()
 
     def test_regression_controls(self):
         rows = (
+            ("controller-init", "task.py", (('self.controller = Session(home)',
+                'self.controller = Session(home)\n        self.controller.backend("state-init")'),),
+             "test_tasks_never_write_or_initialize_controller"),
+            ("controller-write", "task.py", (('self.controller = Session(home)',
+                'self.controller = Session(home)\n        self.controller.write(self.controller.read())'),),
+             "test_tasks_never_write_or_initialize_controller"),
             ("startup", "task.py", (
-                ('if not shutil.which(prepared["harness"], path=self.env["PATH"]):',
-                 'if False and not shutil.which(prepared["harness"], path=self.env["PATH"]):'),
+                ('if not shutil.which(prepared["harness"], path=self.controller.env["PATH"]):',
+                 'if False and not shutil.which(prepared["harness"], path=self.controller.env["PATH"]):'),
                 ('if startup["state"] != "started":', 'if False and startup["state"] != "started":')),
              "test_native_start_failure_is_recoverable"),
-            ("rollback", "task.py", (("self.deadline = time.monotonic() + 3",
-                "self.deadline = time.monotonic() + 3 if False else self.deadline"),),
+            ("rollback", "task.py", (("self.controller.deadline = time.monotonic() + 3",
+                "self.controller.deadline = time.monotonic() + 3 if False else self.controller.deadline"),),
              "test_expired_launch_retains_rollback_ownership"),
             ("picker", "session-backend.sh", (('pick_args+=(--native-model "$model")',
                 'pick_args+=(--model "$model")'),), "test_model_classes_use_production_picker"),
-            ("controller", "session.py", (("        elif not window:\n            self.end_task_session()\n",
+            ("controller", "controller-session.py", (("        elif not window:\n            self.end_task_session()\n",
                 "        elif False:\n            self.end_task_session()\n"),),
              "test_controller_exit_recovers_task_windows"),
-            ("succession", "session.py", (("                    self.end_task_session()\n                    if verb ==",
-                "                    pass\n                    if verb =="),),
+            ("succession", "controller-session.py", (("                else:\n                    self.end_task_session()\n                    record.update(state=failure.state",
+                "                else:\n                    pass\n                    record.update(state=failure.state"),),
              "test_failed_succession_ends_task_windows"),
-            ("foreign-session", "session.py", (('"#{==:" + unmarked + ",}"', '"1"'),),
+            ("foreign-session", "controller-session.py", (('"#{==:" + unmarked + ",}"', '"1"'),),
              "test_foreign_jarvis_session_survives"),
             ("task-ended", "task.py", (("            if live.returncode == 1:", "            if False:"),),
              "test_task_records_leave_controller_lifecycle_open"),
@@ -627,7 +676,7 @@ while True: signal.pause()
                     root = Path(allocation).resolve()
                     for package in ("jarvis", "orch", "mailbox"):
                         shutil.copytree(SKILLS / package / "scripts", root / package / "scripts")
-                    path = root / "jarvis/scripts/lib" / filename
+                    path = root / ("jarvis/scripts/lib" if filename == "task.py" else "orch/scripts/lib") / filename
                     self.assertFalse(path.is_symlink())
                     source = path.read_text()
                     env = dict(self.env, JARVIS_TEST_SKILLS=str(root))
