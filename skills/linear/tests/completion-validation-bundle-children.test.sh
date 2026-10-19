@@ -94,9 +94,12 @@ bundle_child() {
 # comma-joined children.nodes array body. State defaults to the single-PR
 # bundle's pre-merge In Review; container scenarios pass Todo/unstarted.
 bundle_parent() {
-  local id="$1" children="$2" sname="${3:-In Review}" stype="${4:-started}" branch
+  local id="$1" children="$2" sname="${3:-In Review}" stype="${4:-started}" branch description=null
   branch="$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')"
-  emit "{\"data\":{\"issue\":{\"id\":\"uuid-$id\",\"identifier\":\"$id\",\"title\":\"$id\",\"description\":null,\"state\":{\"name\":\"$sname\",\"type\":\"$stype\"},\"assignee\":null,\"project\":null,\"projectMilestone\":null,\"cycle\":null,\"team\":{\"name\":\"Claude\"},\"labels\":{\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null},\"nodes\":[]},\"priority\":3,\"estimate\":null,\"sortOrder\":1.0,\"url\":\"https://linear.app/test/issue/$id\",\"branchName\":\"$branch\",\"createdAt\":\"2026-07-14T00:00:00Z\",\"updatedAt\":\"2026-07-14T00:00:00Z\",\"archivedAt\":null,\"trashed\":null,\"parent\":null,\"relations\":{\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null},\"nodes\":[]},\"inverseRelations\":{\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null},\"nodes\":[]},\"children\":{\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null},\"nodes\":[$children]}}}}"
+  if [[ "$id" == CC-930 && -n "${CONTAINER_CHECKLIST_FILE:-}" ]]; then
+    description="$(jq -Rs . "$CONTAINER_CHECKLIST_FILE")"
+  fi
+  emit "{\"data\":{\"issue\":{\"id\":\"uuid-$id\",\"identifier\":\"$id\",\"title\":\"$id\",\"description\":$description,\"state\":{\"name\":\"$sname\",\"type\":\"$stype\"},\"assignee\":null,\"project\":null,\"projectMilestone\":null,\"cycle\":null,\"team\":{\"name\":\"Claude\"},\"labels\":{\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null},\"nodes\":[]},\"priority\":3,\"estimate\":null,\"sortOrder\":1.0,\"url\":\"https://linear.app/test/issue/$id\",\"branchName\":\"$branch\",\"createdAt\":\"2026-07-14T00:00:00Z\",\"updatedAt\":\"2026-07-14T00:00:00Z\",\"archivedAt\":null,\"trashed\":null,\"parent\":null,\"relations\":{\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null},\"nodes\":[]},\"inverseRelations\":{\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null},\"nodes\":[]},\"children\":{\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null},\"nodes\":[$children]}}}}"
 }
 
 comments_with_summary() {
@@ -124,7 +127,9 @@ if [[ "$query" == *"GetIssueWithBundle"* ]]; then
   CC-930)
     # The parent-checklist matrix needs one Done child to reach --container.
     # The earlier multi-child scenario retains both children.
-    if [[ -n "${CONTAINER_CHECKLIST_FILE:-}" ]]; then
+    if [[ -n "${CONTAINER_ALL_CANCELED:-}" ]]; then
+      bundle_parent CC-930 "$(bundle_child CC-931 Canceled canceled CC-930)" Todo unstarted
+    elif [[ -n "${CONTAINER_CHECKLIST_FILE:-}" ]]; then
       bundle_parent CC-930 "$(bundle_child CC-931 Done completed CC-930)" Todo unstarted
     else
       bundle_parent CC-930 "$(bundle_child CC-931 Done completed CC-930),$(bundle_child CC-932 Done completed CC-930)" Todo unstarted
@@ -233,7 +238,7 @@ check "D: child CC-931 passes as Done" "$outD" \
   '.results[] | select(.id == "CC-931") | .ok == true'
 check "D: child CC-932 passes as Done" "$outD" \
   '.results[] | select(.id == "CC-932") | .ok == true'
-check "D: all_ok true — container may complete" "$outD" '.all_ok == true'
+check "D: all_ok true — every row validated" "$outD" '.all_ok == true'
 
 # --- Scenario E: container with a still-pending child must not complete ----
 outE="$(run_validate CC-940 --include-children-of CC-940 --container 2>/dev/null)"
@@ -244,9 +249,9 @@ check "E: pending child CC-942 fails" "$outE" \
 check "E: all_ok false while a child is open" "$outE" '.all_ok == false'
 
 # --- Scenario F: --container fails closed on misuse ------------------------
-# The flag asserts "this bundle may complete now", so it must name exactly one
+# The flag reports the facts a container's close reads, so it must name exactly one
 # target, pair with --include-children-of for that same target, and expand to
-# at least one non-canceled child. A leaf or mismatched invocation is a caller
+# at least one child. A leaf or mismatched invocation is a caller
 # error (nonzero exit), never a passing validation.
 run_status rcF1 run_validate CC-901 --include-children-of CC-901 --container >/dev/null 2>&1
 run_status rcF2 run_validate CC-930 --container >/dev/null 2>&1
@@ -267,20 +272,44 @@ for summary_issue in CC-950 CC-951; do
     '.all_ok == true and (.results | length) == 1 and .results[0].has_summary == true'
 done
 
-# Container outcomes pass through the production parser with no merge input.
+# The container's row reports its child box, which the closer ticks, and
+# every other open box; container-close decides the close and its remedy on
+# them, so they leave the row's ok to its state.
 export CONTAINER_CHECKLIST_FILE="$TMP_ROOT/container-outcome.md"
-while IFS='|' read -r name description expected branch missing absent; do
+while IFS='|' read -r name description child open; do
   printf '%b' "$description" >"$CONTAINER_CHECKLIST_FILE"
   out="$(run_validate CC-930 --include-children-of CC-930 --container 2>"$TMP_ROOT/outcome.err")"
-  check "$name container outcome controls completion" "$out" ".all_ok == $expected and (.results[] | select(.id == \"CC-930\") | .unmet_branch_boxes == $branch and .missing_evidence_boxes == $missing and .missing_outcome_box == $absent)"
+  check "$name container outcome controls completion" "$out" ".all_ok == true and (.results[] | select(.id == \"CC-930\") | .ok == true and .child_box == $child and .container_open_boxes == $open)"
 done <<'ROWS'
-absent|No checklist|false|[]|[]|true
-empty|## Done when|false|[]|[]|true
-post-only|## Done when\n- [x] Post-merge: Read health; Where: service; Why after merge: deployment; Deadline: 2026-10-04T00:00:00Z\n  Evidence: holder read passed|false|[]|[]|true
-open|## Done when\n- [ ] Shared outcome at source|false|[1]|[]|false
-missing-evidence|## Done when\n- [x] Shared outcome at source|false|[]|[1]|false
-proved|## Done when\n- [x] Shared outcome at source\n  Evidence: holder read passed|true|[]|[]|false
+absent|No checklist|null|[]
+empty|## Done when|null|[]
+child-open|## Done when\n- [ ] Every child Done or cancelled|1|[]
+child-proved|## Done when\n- [x] every child done or canceled.\n  Evidence: container-close read every child Done|1|[]
+post-only|## Done when\n- [x] Post-merge: Read health; Where: service; Why after merge: deployment; Deadline: 2026-10-04T00:00:00Z\n  Evidence: holder read passed|null|[]
+child-open-is|## Done when\n- [ ] Every child is Done or cancelled.|1|[]
+child-words-continue|## Done when\n- [ ] Every child Done or cancelled and docs published|null|[1]
+open|## Done when\n- [ ] Every child Done or cancelled\n- [ ] Shared outcome at source|1|[2]
+missing-evidence|## Done when\n- [x] Shared outcome at source|null|[1]
+proved|## Done when\n- [x] Shared outcome at source\n  Evidence: holder read passed|null|[]
 ROWS
+
+# Every child canceled leaves the container's own row, so its closer reads
+# an outcome box beside the child box before it sets the parent Canceled.
+while IFS='|' read -r name description open; do
+  printf '%b' "$description" >"$CONTAINER_CHECKLIST_FILE"
+  out="$(CONTAINER_ALL_CANCELED=1 run_validate CC-930 --include-children-of CC-930 --container 2>"$TMP_ROOT/all-canceled.err")"
+  check "$name all-canceled container returns its own row" "$out" "(.results | length) == 1 and .results[0].id == \"CC-930\" and .results[0].container_open_boxes == $open"
+done <<'ROWS'
+child-open|## Done when\n- [ ] Every child Done or cancelled|[]
+open|## Done when\n- [ ] Every child Done or cancelled\n- [ ] Shared outcome at source|[2]
+ROWS
+
+# The review audit's in-PR bundle root is one work item: --container refuses
+# it from the safe read's in_pr_bundle, which its Filing record line sets.
+printf '%b' '**In-PR bundle**: yes\n\n## Done when\n- [ ] Every child Done or cancelled' >"$CONTAINER_CHECKLIST_FILE"
+run_status rcF4 run_validate CC-930 --include-children-of CC-930 --container >/dev/null 2>"$TMP_ROOT/in-pr.err"
+assert_ne "F: --container on an in-PR bundle root exits nonzero" "$rcF4" 0
+assert_jq "F: the in-PR refusal is the container fail-closed error" "$(cat "$TMP_ROOT/in-pr.err")" '.error | startswith("--container fail-closed:")'
 
 # A template-produced child can finish its branch work before its shared PR
 # merges. The parent accepts only qualified started children at that phase.

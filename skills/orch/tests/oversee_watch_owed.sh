@@ -370,7 +370,8 @@ EVENT verifying-deadline KEN-1 box=3 trigger="merge" status=due deadline=2026-10
 EVENT verifying-deadline KEN-4 box=2 trigger="merge" status=overdue deadline=2026-10-02T00:00:00Z
 EVENT verifying-deadline KEN-4 box=3 trigger="merge" status=due deadline=2026-10-03T00:00:00Z'
 if [[ "$PART" == all || "$PART" == membership ]]; then
-# An unmerged Triage container with complete children reaches the same reader.
+# An unmerged Triage container with complete children reaches the same
+# reader; a box beside its child box is an outcome still to move into a child.
 world verifying_container
 jq '. + [{id:"KEN-P", title:"Shared outcome", state:"Triage", state_type:"triage", parent_id:"", description:"## Done when\n- [ ] Read shared outcome at source"},
          {id:"KEN-C", title:"Done child", state:"Done", state_type:"completed", parent_id:"KEN-P"}]' "$STUB_DIR/tracker.out" >"$STUB_DIR/container.json"
@@ -386,33 +387,35 @@ ln -s "$REPO_ROOT/skills/linear" "$MUTANT_DIR/linear"
 mutate_file "$MUTANT_WATCH" 'containers="$(verifying_containers "$out")"' 'containers=""'
 WATCH_BIN="$MUTANT_WATCH" watch_pass -- --state "$STUB_DIR/state.json"
 assert_not_contains "$(verification_lines)" 'verifying KEN-P box=1' "control loses the outcome when the caller omits its container" "$ERR"
-# Expected delta distinguishes the parent's own branch work from outcome reads.
-while IFS='|' read -r state delta outcome owed_line; do
-  world "verifying_parent_${state// /_}_$outcome"
-  jq --arg state "$state" --arg delta "$delta" '. +
-    [{id:"KEN-P", title:"Parent work", state:$state,
+# The in-PR bundle root is the one parent that is a work item: its safe read
+# reports in_pr_bundle, and its boxes stay branch work. A title marks nothing.
+while IFS='|' read -r state title in_pr outcome owed_line; do
+  world "verifying_parent_${state// /_}_${in_pr}_$outcome"
+  jq --arg state "$state" --arg title "$title" --argjson in_pr "$in_pr" '. +
+    [{id:"KEN-P", title:$title, state:$state, in_pr_bundle:$in_pr,
       state_type:(if $state == "In Progress" then "started" else "backlog" end), parent_id:"",
-      description: ($delta + "\n## Done when\n- [ ] Build attention\n- [ ] Build choice\n- [ ] Wire commands\n- [ ] Test behavior")}]
+      description: "## Done when\n- [ ] Build attention\n- [ ] Build choice\n- [ ] Wire commands\n- [ ] Test behavior"}]
     + [range(1;5) | {id:("KEN-C" + tostring), state:"Done", state_type:"completed", parent_id:"KEN-P"}]' \
     "$STUB_DIR/tracker.out" >"$STUB_DIR/parent.json"
   mv -- "$STUB_DIR/parent.json" "$STUB_DIR/tracker.out"
   watch_pass -- --state "$STUB_DIR/state.json"
-  assert_eq "rc=$RC $(verification_lines | grep -c '^verifying KEN-P .*trigger="outcome"' || true)" "rc=0 $outcome" "$state declared delta [$delta] selects outcome reads" "$ERR"
-  assert_eq "$(owed KEN-P)" "$owed_line" "$state declared delta [$delta] selects owed development" "$ERR"
+  assert_eq "rc=$RC $(verification_lines | grep -c '^verifying KEN-P .*trigger="outcome"' || true)" "rc=0 $outcome" "$state [$title] in_pr_bundle=$in_pr selects outcome reads" "$ERR"
+  assert_eq "$(owed KEN-P)" "$owed_line" "$state [$title] in_pr_bundle=$in_pr selects owed development" "$ERR"
 done <<'ROWS'
-Backlog||4|-
-Backlog|**Expected delta**: 0 lines|4|-
-Backlog|**Expected delta**: 300 lines, 200 test lines|0|-
-In Progress|**Expected delta**: 300 lines, 200 test lines|0|owed KEN-P state=in-progress priority=- lane=none verdict=queue
+Backlog|Parent work|false|4|-
+Backlog|Bundle (one PR)|false|4|-
+Backlog|Parent work|true|0|-
+In Progress|Parent work|true|0|owed KEN-P state=in-progress priority=- lane=none verdict=queue
 ROWS
-MUTANT_DIR="$TMP_ROOT/parent-production"
-MUTANT_WATCH="$(mutant_scripts parent-production/orch oversee-watch)/oversee-watch" || exit 1
+MUTANT_DIR="$TMP_ROOT/parent-in-pr"
+MUTANT_WATCH="$(mutant_scripts parent-in-pr/orch oversee-watch)/oversee-watch" || exit 1
 ln -s "$REPO_ROOT/skills/github" "$MUTANT_DIR/github"
 ln -s "$REPO_ROOT/skills/linear" "$MUTANT_DIR/linear"
-mutate_verifying "$MUTANT_WATCH" '[[ -z "$EXPECTED_DELTA_PRODUCTION" || "$EXPECTED_DELTA_PRODUCTION" == 0 ]] || continue' ':'
+mutate_verifying "$MUTANT_WATCH" '    | select(.in_pr_bundle != true)' ''
+mutate_file "$MUTANT_WATCH" "select(.in_pr_bundle != true) | .id" ".id"
 WATCH_BIN="$MUTANT_WATCH" watch_pass -- --state "$STUB_DIR/state.json"
-assert_contains "$(verification_lines)" 'verifying KEN-P box=1 trigger="outcome"' "control misreads unbuilt branch work as an outcome" "$ERR"
-assert_eq "$(owed KEN-P)" '-' "control loses the parent's owed development" "$ERR"
+assert_contains "$(verification_lines)" 'verifying KEN-P box=1 trigger="outcome"' "control misreads the in-PR bundle root's branch work as an outcome" "$ERR"
+assert_eq "$(owed KEN-P)" '-' "control loses the in-PR bundle root's owed development" "$ERR"
 world verifying_container
 jq '. + [{id:"KEN-P", title:"Shared outcome", state:"Triage", state_type:"triage", parent_id:"", description:"## Done when\n- [ ] Read shared outcome at source"},
          {id:"KEN-C", title:"Done child", state:"Done", state_type:"completed", parent_id:"KEN-P"}]' "$STUB_DIR/tracker.out" >"$STUB_DIR/container.json"
@@ -421,36 +424,26 @@ watch_pass -- --state "$STUB_DIR/state.json"
 # Completed history is absent from the parent list, but direct child facts
 # still make a Triage container due. No child read visits closed history.
 assert_not_contains "$(cat "$STUB_DIR/tracker.bulk-stdin")" 'KEN-C' "closed child history is not scanned as a candidate" "$ERR"
-for outcome in missing-proof absent empty proved; do
-  case "$outcome" in
-    missing-proof) description='## Done when
-- [x] Read shared outcome at source'; expected='box=1 trigger="outcome"' ;;
-    absent) description='Old acceptance criteria'; expected='box=0 trigger="outcome"' ;;
-    empty) description='## Done when'; expected='box=0 trigger="outcome"' ;;
-    proved) description='## Done when
-- [x] Read shared outcome at source
-  Evidence: holder read passed'; expected='boxes=0' ;;
-  esac
-  jq --arg d "$description" 'map(if .id == "KEN-P" then .description = $d else . end)' "$STUB_DIR/tracker.out" >"$STUB_DIR/outcome.json"
+# A container holding only its child box, or no box, reads boxes=0 and goes
+# to container-close; any other unproved box stays an outcome line.
+while IFS='|' read -r outcome description child_type expected event; do
+  jq --arg d "$(printf '%b' "$description")" --arg type "$child_type" \
+    'map(if .id == "KEN-P" then .description = $d elif .id == "KEN-C" then .state_type = $type else . end)' \
+    "$STUB_DIR/tracker.out" >"$STUB_DIR/outcome.json"
   mv -- "$STUB_DIR/outcome.json" "$STUB_DIR/tracker.out"
   watch_pass -- --state "$STUB_DIR/state.json"
-  assert_contains "$(verification_lines)" "verifying KEN-P $expected" "$outcome outcome stays visible with its completion duty" "$ERR"
-  if [[ "$outcome" == absent || "$outcome" == empty ]]; then
-    assert_not_contains "$(verification_events)" 'KEN-P boxes=0' "$outcome outcome never requests completion" "$ERR"
-  fi
-  if [[ "$outcome" == absent ]]; then
-    assert_contains "$(verification_events)" 'KEN-P box=0 trigger="outcome"' "$outcome outcome uses the existing deadline event" "$ERR"
-  fi
-  if [[ "$outcome" == missing-proof ]]; then
-    MUTANT_DIR="$TMP_ROOT/container-evidence"
-    MUTANT_WATCH="$(mutant_scripts container-evidence/orch oversee-watch)/oversee-watch" || exit 1
-    ln -s "$REPO_ROOT/skills/github" "$MUTANT_DIR/github"
-    ln -s "$REPO_ROOT/skills/linear" "$MUTANT_DIR/linear"
-    mutate_verifying "$MUTANT_WATCH" ' or ((.number as $n | $missing | index($n)) != null)' ''
-    WATCH_BIN="$MUTANT_WATCH" watch_pass -- --state "$STUB_DIR/state.json"
-    assert_not_contains "$(verification_lines)" 'verifying KEN-P box=1' "control loses a checked outcome without Evidence" "$ERR"
-  fi
-done
+  assert_contains "$(verification_lines)" "verifying KEN-P $expected" "$outcome container reads its duty" "$ERR"
+  [[ -z "$event" ]] || assert_contains "$(verification_events)" "EVENT verifying-deadline KEN-P $event" "$outcome container raises its event" "$ERR"
+done <<'ROWS'
+missing-proof|## Done when\n- [x] Read shared outcome at source|completed|box=1 trigger="outcome"|
+child-box|## Done when\n- [ ] Every child Done or cancelled|completed|boxes=0|boxes=0
+absent|Old acceptance criteria|completed|boxes=0|
+empty|## Done when|completed|boxes=0|
+proved|## Done when\n- [x] Read shared outcome at source\n  Evidence: holder read passed|completed|boxes=0|
+all-canceled|## Done when\n- [ ] Every child Done or cancelled|canceled|boxes=0|
+ROWS
+jq 'map(if .id == "KEN-C" then .state_type = "completed" else . end)' "$STUB_DIR/tracker.out" >"$STUB_DIR/outcome.json"
+mv -- "$STUB_DIR/outcome.json" "$STUB_DIR/tracker.out"
 jq 'map(if .id == "KEN-P" then .description = "## Done when\n- [ ] Read shared outcome at source" else . end)' "$STUB_DIR/tracker.out" >"$STUB_DIR/outcome.json"
 mv -- "$STUB_DIR/outcome.json" "$STUB_DIR/tracker.out"
 
@@ -498,7 +491,7 @@ while IFS='|' read -r child_type due; do
     {id:"KEN-P",title:"Shared outcome",state:"Backlog",state_type:"backlog",
       description:"## Done when\n- [ ] Read shared outcome at source"},
     {id:"KEN-A",title:"Queued work",state:"In Progress",state_type:"started"},
-    {id:"KEN-Q",title:"Bundle (ONE PR)",state:"Todo",state_type:"unstarted"},
+    {id:"KEN-Q",title:"In-PR bundle root",state:"Todo",state_type:"unstarted",in_pr_bundle:true},
     {id:"KEN-C",title:"Closed child",state:"Done",state_type:"completed",parent_id:"KEN-P"},
     {id:"KEN-D",title:"Other child",state:"Custom",state_type:$type,parent_id:"KEN-P"}
   ]' >"$STUB_DIR/tracker.out"
@@ -536,7 +529,7 @@ while IFS='|' read -r name reply; do
   assert_not_contains "$(cat "$STUB_DIR/tracker.args.all")" 'issues bulk-get ' "$name candidate set makes no bulk request" "$ERR"
 done <<'ROWS'
 empty|[]
-bundle|[{"id":"KEN-Q","title":"Bundle (one PR)","state":"Backlog","state_type":"backlog"}]
+bundle|[{"id":"KEN-Q","title":"In-PR bundle root","state":"Backlog","state_type":"backlog","in_pr_bundle":true}]
 ROWS
 
 # Restore the outcome case after the separate API refusal cases.

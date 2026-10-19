@@ -13,14 +13,16 @@ control_replace scripts/commands/issues.sh 1 \
     '        has_summary=$(echo "$comments" | jq '\''any(.[]; .body | (contains("Completion Summary") or contains("Bundle Complete")))'\'')'
 
 control_expect "open container outcome controls completion"
-control_replace scripts/commands/issues.sh 1 \
-    '        if [ "$role" = "container" ]; then' \
-    '        if false; then'
-
-control_expect "absent container outcome controls completion"
 control_replace scripts/lib/issue-validation.sh 1 \
-    '        | .missing_outcome_box = ($role == "container" and all(.boxes[]; .post_merge))' \
-    '        | .missing_outcome_box = false'
+    $'\t\t''| if $role == "container" then' \
+    $'\t\t''| if false then'
+
+# Main's rule: a container closes only once every box, the child box among
+# them, carries a holder's Evidence, so finished children alone never close it.
+control_expect "child-open container outcome controls completion"
+control_replace scripts/lib/issue-validation.sh 1 \
+    '        | .container_open_boxes = [.boxes[] | select(.number != $child)' \
+    '        | .container_open_boxes = [.boxes[] | select(true)'
 
 # Restore child acceptance without the qualified started phase.
 control_expect "qualified child controls bundle acceptance"
