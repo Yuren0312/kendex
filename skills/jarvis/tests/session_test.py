@@ -1,6 +1,6 @@
 """Contract rows use real tmux and the real identity carrier, with CLI fixtures."""
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import contextmanager, nullcontext, redirect_stdout, redirect_stderr
 import io
 import errno
 import runpy
@@ -275,17 +275,23 @@ class SessionContract(unittest.TestCase):
         wrapper.chmod(0o755)
         return events
 
+    @contextmanager
     def refuse_teardown(self):
         # tmux's nonzero owned if-shell result is the failure producer.
         flag = self.root / "refuse-teardown"
         flag.touch()
-        real = shutil.which("tmux")
-        wrapper = self.root / "bin/tmux"
-        wrapper.write_text("#!" + self.env["JARVIS_TEST_BASH"] + "\nset -euo pipefail\n"
-            + "for arg in \"$@\"; do if [[ $arg == if-shell && -f " + shlex.quote(str(flag))
-            + " ]]; then exit 1; fi; done\nexec " + shlex.quote(real) + ' \"$@\"\n')
-        wrapper.chmod(0o755)
-        return flag
+        try:
+            real = shutil.which("tmux")
+            wrapper = self.root / "bin/tmux"
+            wrapper.write_text("#!" + self.env["JARVIS_TEST_BASH"] + "\nset -euo pipefail\n"
+                + "for arg in \"$@\"; do if [[ $arg == if-shell && -f " + shlex.quote(str(flag))
+                + " ]]; then now=$(date +%s); printf 'if-shell epoch=%s pid=%s\\n' \"$now\" \"$$\" >> "
+                + shlex.quote(str(self.root / "refuse-teardown.log"))
+                + "; exit 1; fi; done\nexec " + shlex.quote(real) + ' \"$@\"\n')
+            wrapper.chmod(0o755)
+            yield flag
+        finally:
+            flag.unlink(missing_ok=True)
 
     def hold_inspection_until_taken(self):
         # A barrier, not a clock: once the brief is delivered, every pane read
@@ -316,6 +322,7 @@ class SessionContract(unittest.TestCase):
     def await_worker_result(self):
         deadline = time.monotonic() + 10
         identity = None
+        original = json.loads(self.record.read_text())
         while time.monotonic() < deadline:
             record = json.loads(self.record.read_text())
             identity = record.get("worker") or identity
@@ -323,7 +330,49 @@ class SessionContract(unittest.TestCase):
                 self.await_worker_ended(identity)
                 return record
             time.sleep(0.05)
-        self.fail("the worker did not publish its final record")
+        diagnostic_identity = original.get("worker") or identity
+        diagnostic = {"generation": original.get("generation"), "worker": diagnostic_identity}
+        # Preserve the failed observation before subTest or teardown advances
+        # the controller. Diagnostics never turn the unchanged deadline green.
+        try:
+            diagnostic["raw_state"] = Path(self.record).read_text()
+            diagnostic["session_log"] = self.session_log()
+            refusals = self.root / "refuse-teardown.log"
+            diagnostic["refusals"] = refusals.read_text() if refusals.exists() else "absent"
+            if diagnostic_identity:
+                probe = subprocess.run([self.env["JARVIS_TEST_BASH"], str(session_backend(SKILLS)),
+                                        "worker-live", str(diagnostic_identity["pid"]), diagnostic_identity["started_at"]],
+                                       env=self.env, capture_output=True, text=True, timeout=10)
+                diagnostic["worker_live"] = {"returncode": probe.returncode,
+                                             "stdout": probe.stdout, "stderr": probe.stderr}
+                if probe.returncode == 0:
+                    processes = subprocess.run(["ps", "-eo", "pid=,ppid=,stat=,wchan=,args="],
+                                               env=self.env, capture_output=True, text=True, timeout=10)
+                    diagnostic["process_read"] = {"returncode": processes.returncode,
+                                                  "stderr": processes.stderr}
+                    if processes.returncode == 0:
+                        rows = [line.split(None, 4) for line in processes.stdout.splitlines()]
+                        owned = {str(diagnostic_identity["pid"])}
+                        while True:
+                            children = {row[0] for row in rows if len(row) == 5 and row[1] in owned}
+                            if children <= owned:
+                                break
+                            owned.update(children)
+                        diagnostic["processes"] = [row for row in rows if row[0] in owned]
+                        locks = {}
+                        for pid in owned:
+                            descriptors = Path("/proc") / pid / "fd"
+                            if not descriptors.is_dir():
+                                locks[pid] = "proc-fd-unavailable"
+                                continue
+                            try:
+                                locks[pid] = [os.readlink(fd) for fd in descriptors.iterdir()]
+                            except OSError as failure:
+                                locks[pid] = str(failure)
+                        diagnostic["open_files"] = locks
+        except Exception as failure:
+            diagnostic["diagnostic_error"] = type(failure).__name__ + ": " + str(failure)
+        self.fail("the worker did not publish its final record\n" + json.dumps(diagnostic, sort_keys=True))
 
     def await_worker_ended(self, identity):
         if not identity:
@@ -787,26 +836,25 @@ class SessionContract(unittest.TestCase):
             for auth_mode, teardown in (("stale", "allowed"), ("current", "allowed"), ("current", "refused")):
                 with self.subTest(harness=harness, auth_mode=auth_mode, teardown=teardown):
                     fixture.write_text(json.dumps(json.loads(fixture.read_text()) | {"auth_mode": auth_mode}))
-                    flag = self.refuse_teardown() if teardown == "refused" else None
-                    self.call("start", harness)
-                    if auth_mode == "stale":
-                        answer = self.wait(reason="resumed")
-                        self.assertIsNotNone(answer["terminal"])
-                        self.assertEqual(self.started()[-1]["id"], confirmed)
-                        self.assertEqual(json.loads(self.record.read_text())["pending"]["native_session_id"], confirmed)
-                    else:
-                        record = self.await_worker_result()
-                        answer, _ = self.call("status")
-                        if flag:
-                            self.assertEqual((answer["state"], answer["reason"]), ("starting", "launching"))
+                    with self.refuse_teardown() if teardown == "refused" else nullcontext() as flag:
+                        self.call("start", harness)
+                        if auth_mode == "stale":
+                            answer = self.wait(reason="resumed")
                             self.assertIsNotNone(answer["terminal"])
-                            self.assertEqual(answer["detail"], "")
-                            self.assertTrue(record["history"]["pending"]["started_at"])
-                            flag.unlink()
+                            self.assertEqual(self.started()[-1]["id"], confirmed)
+                            self.assertEqual(json.loads(self.record.read_text())["pending"]["native_session_id"], confirmed)
                         else:
-                            self.assertEqual((answer["state"], answer["reason"]), ("blocked", "sign-in-required"))
-                            self.assertIsNone(answer["terminal"])
-                            self.assertTrue(answer["detail"])
+                            record = self.await_worker_result()
+                            answer, _ = self.call("status")
+                            if flag:
+                                self.assertEqual((answer["state"], answer["reason"]), ("starting", "launching"))
+                                self.assertIsNotNone(answer["terminal"])
+                                self.assertEqual(answer["detail"], "")
+                                self.assertTrue(record["history"]["pending"]["started_at"])
+                            else:
+                                self.assertEqual((answer["state"], answer["reason"]), ("blocked", "sign-in-required"))
+                                self.assertIsNone(answer["terminal"])
+                                self.assertTrue(answer["detail"])
                     self.call("stop")
                     self.wait("stopped")
 
@@ -944,63 +992,63 @@ class SessionContract(unittest.TestCase):
                     self.wait("failed", "launch-failed")
                     config.unlink()
                     request = json.loads(self.record.read_text())
-                    retained = self.refuse_teardown() if failure == "first-write-retained" else None
-                    replace = os.replace
-                    injected = []
-                    def refuse_first_ownership(source, destination):
-                        data = json.loads(Path(source).read_text())
-                        data = data.get("overseer", {}).get("lifecycle", data)
-                        if data.get("terminal") and not injected:
-                            injected.append(True)
-                            raise OSError(errno.EIO, "fixture ownership write refused")
-                        return replace(source, destination)
-                    open_file = Path.open
-                    class RefusedBrief:
-                        def __init__(self, stream):
-                            self.stream = stream
-                        def __enter__(self):
-                            return self
-                        def __exit__(self, *arguments):
-                            self.stream.close()
-                        def write(self, content):
-                            injected.append(True)
-                            raise OSError(errno.EIO, "fixture brief write refused")
-                    def refuse_brief(path, *arguments, **options):
-                        stream = open_file(path, *arguments, **options)
-                        if path.name == "start-" + str(request["generation"]) + ".txt" and arguments == ("x",):
-                            return RefusedBrief(stream)
-                        return stream
-                    errors = io.StringIO()
-                    # CI reads these structured fields. Capture intentional
-                    # failures so its log exposes only unexpected failures.
-                    with patch.dict(os.environ, self.env | {"JARVIS_BASH": self.env["JARVIS_TEST_BASH"]}, clear=True), redirect_stderr(errors):
-                        runtime = runpy.run_path(str(SKILLS / "orch/scripts/lib/controller-session.py"))
-                        owner = runtime["Session"](self.home)
-                        with owner.locked():
-                            owned = owner.read()
-                            owned.update(state="starting", reason="launching", detail="",
-                                         worker=json.loads(owner.backend("process", os.getpid()).stdout))
-                            owner.write(owned)
-                        if failure == "brief-write":
-                            with patch.object(Path, "open", refuse_brief), self.assertRaises(OSError):
-                                owner.worker("start", request["generation"])
-                        else:
-                            with patch.object(os, "replace", refuse_first_ownership), self.assertRaises(OSError):
-                                owner.worker("start", request["generation"])
-                    diagnostic = re.search(r'jarvis-session: worker-failed operation=("(?:[^"\\]|\\.)*") cause=OSError errno=EIO message=("(?:[^"\\]|\\.)*")', errors.getvalue())
-                    self.assertIsNotNone(diagnostic, errors.getvalue())
-                    self.assertEqual(json.loads(diagnostic[1]), 'stream.write(launch["brief"])' if failure == "brief-write" else "os.replace(name, self.path)")
-                    message = json.loads(diagnostic[2])
-                    self.assertIn("fixture brief write refused" if failure == "brief-write" else "fixture ownership write refused", message)
-                    self.assertEqual(injected, [True])
-                    self.assertEqual(list(self.record.parent.glob("start-*.txt")), [])
+                    with self.refuse_teardown() if failure == "first-write-retained" else nullcontext() as retained:
+                        replace = os.replace
+                        injected = []
+                        def refuse_first_ownership(source, destination):
+                            data = json.loads(Path(source).read_text())
+                            data = data.get("overseer", {}).get("lifecycle", data)
+                            if data.get("terminal") and not injected:
+                                injected.append(True)
+                                raise OSError(errno.EIO, "fixture ownership write refused")
+                            return replace(source, destination)
+                        open_file = Path.open
+                        class RefusedBrief:
+                            def __init__(self, stream):
+                                self.stream = stream
+                            def __enter__(self):
+                                return self
+                            def __exit__(self, *arguments):
+                                self.stream.close()
+                            def write(self, content):
+                                injected.append(True)
+                                raise OSError(errno.EIO, "fixture brief write refused")
+                        def refuse_brief(path, *arguments, **options):
+                            stream = open_file(path, *arguments, **options)
+                            if path.name == "start-" + str(request["generation"]) + ".txt" and arguments == ("x",):
+                                return RefusedBrief(stream)
+                            return stream
+                        errors = io.StringIO()
+                        # CI reads these structured fields. Capture intentional
+                        # failures so its log exposes only unexpected failures.
+                        with patch.dict(os.environ, self.env | {"JARVIS_BASH": self.env["JARVIS_TEST_BASH"]}, clear=True), redirect_stderr(errors):
+                            runtime = runpy.run_path(str(SKILLS / "orch/scripts/lib/controller-session.py"))
+                            owner = runtime["Session"](self.home)
+                            with owner.locked():
+                                owned = owner.read()
+                                owned.update(state="starting", reason="launching", detail="",
+                                             worker=json.loads(owner.backend("process", os.getpid()).stdout))
+                                owner.write(owned)
+                            if failure == "brief-write":
+                                with patch.object(Path, "open", refuse_brief), self.assertRaises(OSError):
+                                    owner.worker("start", request["generation"])
+                            else:
+                                with patch.object(os, "replace", refuse_first_ownership), self.assertRaises(OSError):
+                                    owner.worker("start", request["generation"])
+                        diagnostic = re.search(r'jarvis-session: worker-failed operation=("(?:[^"\\]|\\.)*") cause=OSError errno=EIO message=("(?:[^"\\]|\\.)*")', errors.getvalue())
+                        self.assertIsNotNone(diagnostic, errors.getvalue())
+                        self.assertEqual(json.loads(diagnostic[1]), 'stream.write(launch["brief"])' if failure == "brief-write" else "os.replace(name, self.path)")
+                        message = json.loads(diagnostic[2])
+                        self.assertIn("fixture brief write refused" if failure == "brief-write" else "fixture ownership write refused", message)
+                        self.assertEqual(injected, [True])
+                        self.assertEqual(list(self.record.parent.glob("start-*.txt")), [])
+                        if retained:
+                            saved = json.loads(self.record.read_text())
+                            self.assertEqual((saved["state"], saved["reason"]), ("starting", "launching"))
+                            self.assertIsNotNone(self.call("status")[0]["terminal"])
+                            self.assertEqual(saved["pending"]["generation"], request["generation"])
+                            self.assertNotIn("worker", saved)
                     if retained:
-                        saved = json.loads(self.record.read_text())
-                        self.assertEqual((saved["state"], saved["reason"]), ("starting", "launching"))
-                        self.assertIsNotNone(self.call("status")[0]["terminal"])
-                        self.assertEqual(saved["pending"]["generation"], request["generation"])
-                        self.assertNotIn("worker", saved)
-                        retained.unlink()
                         (self.root / "bin/tmux").unlink()
                         self.call("stop")
                         self.wait("stopped", persisted_stop=True)
@@ -1040,12 +1088,11 @@ class SessionContract(unittest.TestCase):
         handle.terminate()
         self.assertEqual(handle.wait(timeout=10), -signal.SIGTERM)
         terminal = self.call("status")[0]["terminal"]
-        flag = self.refuse_teardown()
-        retained, _ = self.call("start")
-        self.assertEqual((retained["state"], retained["reason"], retained["terminal"]),
-                         ("starting", "launching", terminal))
-        self.assertNotIn("worker", self.await_worker_result())
-        flag.unlink()
+        with self.refuse_teardown():
+            retained, _ = self.call("start")
+            self.assertEqual((retained["state"], retained["reason"], retained["terminal"]),
+                             ("starting", "launching", terminal))
+            self.assertNotIn("worker", self.await_worker_result())
         self.assertEqual(self.call("start")[0]["state"], "starting")
         self.await_launches(2)
         old_native = original_record["native_process"]
@@ -1060,15 +1107,14 @@ class SessionContract(unittest.TestCase):
         self.assertEqual(replacement_terminal, replacement_record["terminal"])
         self.assertEqual(replacement_record["pending"]["generation"], replacement_record["generation"])
         self.assertNotEqual(replacement_record["pending"]["generation"], original_record["pending"]["generation"])
-        flag.touch()
-        self.assertEqual(self.call("stop", origin="app-off")[0]["state"], "stopping")
-        result = self.await_worker_result()
-        answer, _ = self.call("status")
-        self.assertEqual((answer["state"], answer["reason"], answer["terminal"]),
-                         ("starting", "launching", replacement_terminal))
-        self.assertTrue(result["app_off"])
-        self.assertEqual(self.call("start")[0]["reason"], "app-off")
-        flag.unlink()
+        with self.refuse_teardown():
+            self.assertEqual(self.call("stop", origin="app-off")[0]["state"], "stopping")
+            result = self.await_worker_result()
+            answer, _ = self.call("status")
+            self.assertEqual((answer["state"], answer["reason"], answer["terminal"]),
+                             ("starting", "launching", replacement_terminal))
+            self.assertTrue(result["app_off"])
+            self.assertEqual(self.call("start")[0]["reason"], "app-off")
         self.call("stop")
         self.wait("off")
 
@@ -1219,22 +1265,21 @@ class SessionContract(unittest.TestCase):
                                  ("running", str(self.account), first["terminal"]))
                 self.assertEqual(record["generation"], generation + 2)
                 self.assertEqual(len(self.started()), launches + 1)
-                flag = self.refuse_teardown()
-                before_stop = json.loads(self.record.read_text())
-                origins = ("manual", "app-off")
-                with ThreadPoolExecutor() as executor:
-                    answers = list(executor.map(lambda origin: self.call("stop", origin=origin), origins))
-                self.assertTrue(all(code == 0 and answer["state"] == "stopping" for answer, code in answers))
-                record = self.await_worker_result()
-                self.assertEqual(record["generation"], before_stop["generation"] + len(origins))
-                self.assertEqual(record["pending"]["generation"], before_stop["pending"]["generation"])
-                answer, _ = self.call("status")
-                self.assertEqual((answer["state"], answer["reason"], answer["terminal"]),
-                                 ("running", "existing", first["terminal"]))
-                self.assertTrue(record["app_off"])
-                self.assertEqual(record["history"]["pending"]["native_session_id"], original["pending"]["native_session_id"])
-                self.assertEqual(self.call("start")[0]["reason"], "app-off")
-                flag.unlink()
+                with self.refuse_teardown() as flag:
+                    before_stop = json.loads(self.record.read_text())
+                    origins = ("manual", "app-off")
+                    with ThreadPoolExecutor() as executor:
+                        answers = list(executor.map(lambda origin: self.call("stop", origin=origin), origins))
+                    self.assertTrue(all(code == 0 and answer["state"] == "stopping" for answer, code in answers))
+                    record = self.await_worker_result()
+                    self.assertEqual(record["generation"], before_stop["generation"] + len(origins))
+                    self.assertEqual(record["pending"]["generation"], before_stop["pending"]["generation"])
+                    answer, _ = self.call("status")
+                    self.assertEqual((answer["state"], answer["reason"], answer["terminal"]),
+                                     ("running", "existing", first["terminal"]))
+                    self.assertTrue(record["app_off"])
+                    self.assertEqual(record["history"]["pending"]["native_session_id"], original["pending"]["native_session_id"])
+                    self.assertEqual(self.call("start")[0]["reason"], "app-off")
                 self.call("stop")
                 self.wait("off")
                 self.assertEqual(json.loads(self.record.read_text())["generation"], record["generation"] + 1)

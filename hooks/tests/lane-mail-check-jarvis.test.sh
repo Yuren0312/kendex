@@ -122,6 +122,9 @@ PYTHON
       ;;
     transcript) TRANSCRIPT="$ACCOUNT/projects/missing/s1.jsonl" ;;
     copilot*)
+      env -i PATH="$PATH" HOME="$OFFLINE_HOME" "$BASH" -euo pipefail -c \
+        '. "$1/lib/lane-context.sh" && copilot_context_install "$2"' \
+        _ "$REPO_ROOT/skills/orch/scripts" "$ACCOUNT"
       install_hook "$HOOK" "$LANE/.github/hooks/lane-mail-check.sh"
       TRANSCRIPT="$ACCOUNT/session-state/s1/events.jsonl"
       mkdir -p "${TRANSCRIPT%/*}"
@@ -161,6 +164,7 @@ PYTHON
   case "$key" in
     SCRIPT_KEY) key="lane-mail-check: script=$LANE/.agents/skills/orch/scripts/orch-env" ;;
     READING_KEY) key=lane-mail-check:\ reading-unrecorded ;;
+    NATIVE_KEY) key="lane-mail-check: session-unbound=s2 harness=claude home=$ACCOUNT remedy=oversee register" ;;
   esac
   case "$shape" in
     copilot*)
@@ -182,6 +186,9 @@ PYTHON
       ;;
     *)
       jarvis_mark "$tokens" "$active" "$session" "$agent"
+      if [ "$session" = s2 ]; then
+        assert_eq "$(grep -c '^lane-mail-check: context=' "$ERR_FILE" || :)" 0 "$label: no succession mark"
+      fi
       if [ "$key" = NO_MARK ]; then
         assert_eq "RC=$RC marks=$(grep -c '^lane-mail-check: context=' "$ERR_FILE" || :)" \
           "RC=$expected marks=0" "$label"
@@ -207,7 +214,7 @@ plain|at the percentage mark|180000|false|s1||0|-
 plain|past the percentage mark|180001|false|s1||2|lane-mail-check: context=@TOKENS@
 plain|at the absolute context mark|400000|false|s1||2|lane-mail-check: context=@TOKENS@
 plain|a continued turn retains its succession mark|400000|true|s1||2|lane-mail-check: context=@TOKENS@
-plain|another native session gets no Jarvis mark|400000|false|s2||0|-
+plain|another native session gets no Jarvis mark|400000|false|s2||0|NATIVE_KEY
 plain|a subagent gets no Jarvis mark|400000|false|s1|child|0|-
 absent|the same session with no record gets no mark|400000|false|s1||0|NO_MARK
 plain|the restored record restores the Jarvis succession mark|400000|false|s1||2|lane-mail-check: context=@TOKENS@
