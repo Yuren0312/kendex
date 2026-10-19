@@ -687,21 +687,23 @@ class SessionContract(unittest.TestCase):
                     + "    with rows.open('a') as stream:\n"
                     + "        stream.write(json.dumps({'delivery_hold': time.monotonic() - started}) + '\\n')\n"
                     + "sys.exit(result.returncode)\n")
-                wrapper.chmod(0o755)
-                self.call("start", harness, mode="resume")
-                answer = self.wait(reason="resumed", seconds=70)
-                self.assertIsNotNone(answer["terminal"])
-                record = json.loads(self.record.read_text())
-                self.assertEqual(self.started()[-1]["id"], identity)
-                self.assertEqual(record["pending"]["native_session_id"], identity)
-                self.assertIs(record["pending"].get("brief_taken"), True)
-                self.assertIs(record["pending"].get("kickoff_ended"), True)
-                holds = [json.loads(line)["delivery_hold"] for line in self.rows.read_text().splitlines()
-                         if "delivery_hold" in json.loads(line)]
-                self.assertGreaterEqual(holds[-1], 3)
-                self.call("stop")
-                self.wait("stopped")
-                wrapper.unlink()
+                try:
+                    wrapper.chmod(0o755)
+                    self.call("start", harness, mode="resume")
+                    answer = self.wait(reason="resumed", seconds=70)
+                    self.assertIsNotNone(answer["terminal"])
+                    record = json.loads(self.record.read_text())
+                    self.assertEqual(self.started()[-1]["id"], identity)
+                    self.assertEqual(record["pending"]["native_session_id"], identity)
+                    self.assertIs(record["pending"].get("brief_taken"), True)
+                    self.assertIs(record["pending"].get("kickoff_ended"), True)
+                    holds = [json.loads(line)["delivery_hold"] for line in self.rows.read_text().splitlines()
+                             if "delivery_hold" in json.loads(line)]
+                    self.assertGreaterEqual(holds[-1], 3)
+                    self.call("stop")
+                    self.wait("stopped")
+                finally:
+                    wrapper.unlink()
 
     def test_pi_text_only_brief(self):
         fixture = self.home / ".fixture.json"
@@ -967,11 +969,13 @@ class SessionContract(unittest.TestCase):
                         + 'for arg in "$@"; do if [[ $arg == set-option && -f ' + shlex.quote(str(flag))
                         + ' ]]; then rm -- ' + shlex.quote(str(flag)) + '; exit 1; fi; done\nexec '
                         + shlex.quote(real) + ' "$@"\n')
-                    wrapper.chmod(0o755)
-                    self.call("start", mode="new" if mode == "new" else "resume")
-                    self.wait("failed", "launch-failed")
-                    self.await_worker_result()
-                    wrapper.unlink()
+                    try:
+                        wrapper.chmod(0o755)
+                        self.call("start", mode="new" if mode == "new" else "resume")
+                        self.wait("failed", "launch-failed")
+                        self.await_worker_result()
+                    finally:
+                        wrapper.unlink()
                 elif failure == "worker-write":
                     replace = os.replace
                     injected = []

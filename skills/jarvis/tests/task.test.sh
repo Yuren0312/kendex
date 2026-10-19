@@ -2,6 +2,7 @@
 # bash-runtime: 3.2
 # Surface: task launch, completion and cleanup in the managed session.
 # Inputs: skills/jarvis/scripts/, skills/jarvis/tests/task_test.py,
+# skills/jarvis/tests/session_test.py,
 # skills/orch/scripts/, skills/mailbox/scripts/,
 # skills/orch/tests/fixtures/tier-model/, skills/jarvis/tests/fixtures/.
 set -euo pipefail

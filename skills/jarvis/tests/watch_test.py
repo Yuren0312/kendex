@@ -590,10 +590,10 @@ class Producer(unittest.TestCase):
                         shlex.quote(str(github_calls)) + '\nexit 71\n')
         with patch.dict(os.environ, self.env | {"JARVIS_BASH": BASH}, clear=True), \
                 contextlib.redirect_stdout(io.StringIO()):
-            session = load(self.scripts / "lib/session.py").Session(self.home)
-            session.path.parent.mkdir(parents=True)
-            session.write(dict(v=1, home=str(self.home), harness="claude", account=str(self.root),
-                               state="running", reason="existing", report_started_at=1000))
+            session = load(self.packages / "orch/scripts/lib/controller-session.py").Session(self.home)
+            with session.locked():
+                session.write(dict(v=1, home=str(self.home), harness="claude", account=str(self.root),
+                                   state="stopped", reason="stopped", report_started_at=1000))
             watch = self.watch()
             watch.next_presence["local"] = 1000000
             pending = Future()

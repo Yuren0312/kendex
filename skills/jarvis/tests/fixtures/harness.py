@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import select
 import socket
@@ -196,8 +197,9 @@ def main():
         sys.stdin.read()
         return
     record_path = Path(os.environ["JARVIS_RECORD"])
-    owner = json.loads(record_path.read_text())
-    record = owner.get("overseer", {}).get("lifecycle", owner)
+    runtime = runpy.run_path(str(session_backend(fixture["skills"]).with_name("controller-session.py")))
+    session = runtime["Session"](os.getcwd())
+    record = session.read()
     identity = record["pending"].get("native_session_id")
     if harness == "codex":
         identity = args[args.index("resume") + 1] if "resume" in args else "codex-native-" + os.environ["JARVIS_GENERATION"]
@@ -351,7 +353,7 @@ def main():
         # This instantaneous answer must follow the worker's delivery write:
         # before it, Stop still belongs to the already-ended kickoff turn.
         deadline = time.monotonic() + 10
-        while not json.loads(record_path.read_text()).get("brief_delivered"):
+        while not session.read().get("brief_delivered"):
             assert time.monotonic() < deadline, "the worker did not publish the brief delivery"
             time.sleep(0.05)
         brief_taken(fixture, harness, identity, "Stop")
