@@ -569,7 +569,7 @@ environment_rows() {
 [2,"sh LAUNCH.sh WAIT env VAR=1 TOOL --test \"env -u $NAME bash test.sh\"","waiter-expanded-command-retains-refusal"]
 [2,"sh LAUNCH.sh WAIT env VAR=1 TOOL --test 'bash -c \"env\"'","waiter-quoted-nested-shell-dump"]
 [0,"cat > tmp/podman-acceptance.sh <<'EOF'\nset -euo pipefail\nexport ACCEPTANCE=1\npodman run --rm -e ACCEPTANCE --env DISPLAY_SCALE=1 localhost/acceptance:latest\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","heredoc-then-waiter-unset-launch"]
-[0,"true; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","list-stage-waiter-unset-launch"]
+[2,"true; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","list-stage-waiter-unset-launch"]
 [2,"cat > tmp/podman-acceptance.sh <<'EOF'\nenv\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","heredoc-env-body-then-waiter"]
 [2,"cat > tmp/podman-acceptance.sh <<'EOF'\nprintenv\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","heredoc-printenv-body-then-waiter"]
 [2,"cat > tmp/podman-acceptance.sh <<'EOF'\nset\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","heredoc-set-body-then-waiter"]
@@ -583,12 +583,13 @@ environment_rows() {
 [2,"true &&\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash -s","and-newline-waiter-unset-launch"]
 [2,"(cat <<'EOF'\nenv\nEOF\n) | sh","paren-heredoc-piped-shell"]
 [2,"(cat <<'EOF') \u007c& sh\nenv\nEOF","paren-heredoc-stderr-piped-shell"]
+[2,"cat <<'EOF' |\nimport os; print(os.environ)\nEOF\npython3","heredoc-pipe-newline-interpreter"]
 [2,"cat > tmp/podman-acceptance.sh <<'EOF'\ntimeout 5 env\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","heredoc-timeout-env-body-then-waiter"]
 [2,"cat > tmp/podman-acceptance.sh <<'EOF'\ntimeout 5 printenv\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","heredoc-timeout-printenv-body-then-waiter"]
 [2,"cat > tmp/podman-acceptance.sh <<'EOF'\ngrep -a . /proc/self/environ\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","heredoc-proc-environ-body-then-waiter"]
 [2,"cat > tmp/podman-acceptance.sh <<<'env';\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","herestring-env-then-waiter"]
 [2,"cat <<<'printenv' > tmp/podman-acceptance.sh\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","herestring-printenv-redirect-then-waiter"]
-[0,"cat > tmp/podman-acceptance.sh <<<'set -euo pipefail';\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","herestring-setup-then-waiter"]
+[2,"cat > tmp/podman-acceptance.sh <<<'set -euo pipefail';\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","herestring-setup-then-waiter"]
 [2,"cat > tmp/podman-acceptance.sh <<'EOF'\npython3 <<'PY'\nimport os; print(dict(os.environ))\nPY\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","heredoc-python-nested-body-then-waiter"]
 [2,"cat > tmp/podman-acceptance.sh <<'EOF'\nnode <<'JS'\nconsole.log(process.env)\nJS\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","heredoc-node-nested-body-then-waiter"]
 [0,"cat > tmp/podman-acceptance.sh <<'EOF'\npython3 <<'PY'\nprint(1)\nPY\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","heredoc-python-benign-nested-body-then-waiter"]
@@ -597,12 +598,13 @@ environment_rows() {
 [2,"echo printenv > tmp/podman-acceptance.sh\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","echo-written-then-waiter"]
 [2,"echo 'import os; print(os.environ)' > tmp/acceptance.py; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE python3 tmp/acceptance.py","echo-written-python-then-waiter"]
 [2,"echo 'console.log(process.env)' | tee tmp/acceptance.js\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE node tmp/acceptance.js","tee-written-node-then-waiter"]
-[0,"echo 'print(1)' > tmp/acceptance.py; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE python3 tmp/acceptance.py","echo-written-benign-python-then-waiter"]
+[2,"echo 'print(1)' > tmp/acceptance.py; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE python3 tmp/acceptance.py","echo-written-benign-python-then-waiter"]
 [2,"sh A/launch.sh A/wait bash -c \"echo 'import os; print(os.environ)' > tmp/a.py\"; sh B/launch.sh B/wait env -u DISPLAY python3 tmp/a.py","forwarded-bash-writer-then-waiter"]
 [2,"sh A/launch.sh A/wait node -e \"require('fs').writeFileSync('tmp/a.py', 'import os; print(os.environ)')\"; sh B/launch.sh B/wait env -u DISPLAY python3 tmp/a.py","forwarded-node-writer-then-waiter"]
 [0,"bash tools/search.sh process.env","script-search-interpreter-word"]
 [0,"sh tmp/waiter.X/launch.sh tmp/waiter.X/wait rg -n 'os.environ' src/","waiter-search-interpreter-word"]
-[0,"sh A/launch.sh A/wait bash -c \"echo 'print(1)' > tmp/a.py\"; sh B/launch.sh B/wait env -u DISPLAY python3 tmp/a.py","forwarded-benign-writer-then-waiter"]
+[0,"cd src; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait rg -n 'os.environ' .","cd-then-waiter-search-main-parity"]
+[2,"sh A/launch.sh A/wait bash -c \"echo 'print(1)' > tmp/a.py\"; sh B/launch.sh B/wait env -u DISPLAY python3 tmp/a.py","forwarded-benign-writer-then-waiter"]
 [2,"echo printenv | tee tmp/podman-acceptance.sh\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","tee-written-then-waiter"]
 [2,"echo '<<<' printenv > tmp/podman-acceptance.sh; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","quoted-herestring-word-then-waiter"]
 [2,"bash wrap.sh step cat \"/proc/self/environ\"","waiter-forwarded-cat-quoted-path"]
@@ -1509,18 +1511,11 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "receiver-line-boundary" { swap("if [[ $remaining =~ ^[A-Za-z0-9_]+ ]]; then", "if [[ $remaining =~ ^[[:space:]]*[A-Za-z0-9_]+ ]]; then") }
       defect == "receiver-body-forwarding" { swap("body_decisions[doc]=fallback", ":") }
       defect == "heredoc-list-forwarding" { swap("[ \"$compound\" = heredoc ]", "false") }
-      defect == "forwarded-body-cut" { swap("if [ \"${#forwarded_stages[@]}\" -gt 0 ]; then", "if false; then") }
+      defect == "forwarded-body-cut" { swap("if [ -n \"$forwarded_operand\" ]; then", "if false; then") }
+      defect == "written-list-cut" { swap("         environment_written_list &&", "         true &&") }
       defect == "adjacent-stage-join" { swap("joins[stage]=$join", "joins[stage]=$join; [ \"$stage\" -eq 0 ] || joins[stage]=${separators[$((stage - 1))]}") }
       defect == "forwarded-body-context" { swap("environment_dump shell forwarded; then", "environment_dump shell conservative; then") }
-      defect == "heredoc-only-inputs" { swap("for ((doc=0; doc<${#literal_inputs[@]}; doc++)); do", "for ((doc=0; doc<${#heredocs[@]}; doc++)); do") }
       defect == "shell-only-body" { swap("if environment_interpreter_evidence \"$command_text\"; then return 0; fi", ":") }
-      defect == "other-stage-unjudged" { swap("if [ -z \"${forwarded_stages[$stage]:-}\" ] && environment_main_evidence \"${tokens[$j]}\"; then return 0; fi", ":") }
-      defect == "forwarded-stage-shell-words" { swap("if [ -z \"${forwarded_stages[$stage]:-}\" ] && environment_main_evidence", "if environment_main_evidence") }
-      defect == "herestring-operand-scanned" { swap("[ \"${tokens[$((j - 1))]}\" = \047<<<\047 ] &&", "false &&") }
-      defect == "herestring-word-kind" { swap("[[ ${kinds[$((j - 1))]} == operator* ]]", "true") }
-      defect == "stage-words-shell-only" { swap("if environment_interpreter_evidence \"${tokens[$j]}\"; then return 0; fi", ":") }
-      defect == "forwarded-stage-exempt" { swap("if environment_interpreter_evidence \"${tokens[$j]}\"; then", "if [ -z \"${forwarded_stages[$stage]:-}\" ] && environment_interpreter_evidence \"${tokens[$j]}\"; then") }
-      defect == "lone-stage-scanned" { swap("commands>1 && ", "") }
       { print }
       END { if (changed != 1) exit 1 }
     ' "$hook_source" >"$mutant" || exit 1
@@ -1557,17 +1552,10 @@ receiver-classification|FAIL environment: receiver-python-key-inventory: exit=2 
 receiver-evidence|FAIL environment: receiver-python-heredoc-whole-0: exit=0 expected=2
 heredoc-list-forwarding|FAIL environment: heredoc-then-waiter-unset-launch: exit=2 expected=0
 forwarded-body-cut|FAIL environment: heredoc-env-body-then-waiter: exit=0 expected=2
-adjacent-stage-join|FAIL environment: piped-newline-waiter-unset-launch: exit=0 expected=2
+written-list-cut|FAIL environment: list-stage-waiter-unset-launch: exit=0 expected=2
+adjacent-stage-join|FAIL environment: heredoc-pipe-newline-interpreter: exit=0 expected=2
 forwarded-body-context|FAIL environment: heredoc-timeout-env-body-then-waiter: exit=0 expected=2
-heredoc-only-inputs|FAIL environment: herestring-env-then-waiter: exit=0 expected=2
 shell-only-body|FAIL environment: heredoc-python-file-then-waiter: exit=0 expected=2
-other-stage-unjudged|FAIL environment: echo-written-then-waiter: exit=0 expected=2
-stage-words-shell-only|FAIL environment: echo-written-python-then-waiter: exit=0 expected=2
-forwarded-stage-exempt|FAIL environment: forwarded-bash-writer-then-waiter: exit=0 expected=2
-lone-stage-scanned|FAIL environment: script-search-interpreter-word: exit=2 expected=0
-forwarded-stage-shell-words|FAIL environment: heredoc-then-waiter-unset-launch: exit=2 expected=0
-herestring-operand-scanned|FAIL environment: herestring-setup-then-waiter: exit=2 expected=0
-herestring-word-kind|FAIL environment: quoted-herestring-word-then-waiter: exit=0 expected=2
 receiver-evidence|FAIL environment: receiver-python-heredoc-whole-1: exit=0 expected=2
 receiver-evidence|FAIL environment: receiver-python3-heredoc-whole-0: exit=0 expected=2
 receiver-evidence|FAIL environment: receiver-node-heredoc-whole-0: exit=0 expected=2

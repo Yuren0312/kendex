@@ -5,7 +5,7 @@
 # matcher: Bash
 # description: On harnesses that execute hooks, refuse recognized whole-environment reads unless a proven direct pipe filters named variables. This fixed check runs outside Git and before project policy. Nested dumps and unsupported routing can refuse conservatively. It reads submitted text, not unseen programs, aliases or runtime-built commands. COMMAND_SAFETY_DENY_PATTERN replaces only the default systemd-run memory-cap pattern; `^$` disables only that project-pattern check.
 # summary: Refuses recognized whole-environment command text and gives a filter that names a variable. Also applies the project deny pattern or the default systemd-run memory-cap rule. Unreadable payloads warn and allow the call; unreadable policy support affects only the pattern check.
-# safety: Classify literal command producers and the program receiving inline code or registered heredoc input. Shells retain shell parsing, known interpreters use language-specific whole-environment evidence, literal cat bodies retain their data contract unless a forwarding launcher in a `;` or newline list can run them, where every literal input is judged as forwarded shell source and as interpreter input and every stage keeps interpreter word detection and other list stages keep conservative word detection, and unknown receivers retain conservative shell-word detection. Unquoted body expansions are checked independently, and unsupported forwarded contexts retain conservative refusal. Only proven direct named-variable filters grant dump permission; project-pattern matching remains independent and reads the submitted text. Unseen programs and runtime-built names are outside this text check; unreadable payloads or policy support warn and allow their affected check. Every diagnostic starts with command-safety: <key>=<value>.
+# safety: Classify literal command producers and the program receiving inline code or registered heredoc input. Shells retain shell parsing, known interpreters use language-specific whole-environment evidence, literal cat bodies retain their data contract unless a forwarding launcher after only literal cat heredoc writes in a `;` or newline list can run them, where each body is judged as forwarded shell source and as interpreter input, and unknown receivers retain conservative shell-word detection. Unquoted body expansions are checked independently, and unsupported forwarded contexts retain conservative refusal. Only proven direct named-variable filters grant dump permission; project-pattern matching remains independent and reads the submitted text. Unseen programs and runtime-built names are outside this text check; unreadable payloads or policy support warn and allow their affected check. Every diagnostic starts with command-safety: <key>=<value>.
 # timeout: 10
 # requires-skills: [commit-guards]
 # ---
@@ -806,12 +806,26 @@ environment_program_text() {
   fi
 }
 
+# A forwarding stage keeps its argv alone, or as the last command of a list
+# whose earlier commands are literal cat heredoc writes joined by `;` or a
+# newline. Every other list keeps the conservative scan.
+environment_written_list() {
+  local k
+  for ((k=0; k<stage; k++)); do
+    [ "${separators[$k]}" = ';' ] || return 1
+    [ "${starts[$k]}" -eq "${ends[$k]}" ] || [ -n "${body_writes[$k]:-}" ] || return 1
+  done
+  for ((k=stage+1; k<${#starts[@]}; k++)); do
+    [ "${starts[$k]}" -eq "${ends[$k]}" ] || return 1
+  done
+}
+
 environment_dump() { # command kind; arguments are already decoded data
   local LC_ALL=C i=0 c next quote="" word="" active="" kind=literal compound="" bare=1 quoted=""
   local j start=0 end n fd redirection_kind target proc output input_redirect input_escaped pos program value named flags
   local mode pattern_count pattern filter_ok stage=0 text text_length span span_re comment_span options_ended null_output syntax_head program_pos stdin_program source_pos data_source piped_source="" pipeline="" heredoc_input=${heredoc_input:-}
   local receiver receiver_pattern receiver_option receiver_named
-  local unsupported="" scan candidate limit producer_end code incoming_sources="" file_output file_body redirect_evidence head_start main_start script_pos forwarded_argument="" forwarded_stages=()
+  local unsupported="" scan candidate limit producer_end code incoming_sources="" file_output file_body redirect_evidence head_start main_start script_pos forwarded_argument="" forwarded_operand=""
   local heredoc_op="" heredoc_origin delimiter line remaining doc body found math_depth=0 needs_target="" main_text main_required="" body_start body_end
   local name_re='^[A-Za-z_][A-Za-z0-9_]*(=.*)?$'
   local filter_re='^([A-Za-z_][A-Za-z0-9_]*=?|\^[A-Za-z_][A-Za-z0-9_]*=|\^\([A-Za-z_][A-Za-z0-9_]*(\|[A-Za-z_][A-Za-z0-9_]*)+\)=)$'
@@ -819,7 +833,7 @@ environment_dump() { # command kind; arguments are already decoded data
   local single_span_re="^[^']+" ansi_span_re="^[^'\\\\]+" double_span_re='^[^"\\$`]+' comment_span_re=$'^[^\n]+'
   local tokens=() kinds=() unquoted_words=() saved_quotes=() closers=() args=() arg_kinds=() arg_unquoted=() arg_roles=() stage_roles=() stage_args=() stage_kinds=() stage_unquoted=() heredocs=() heredoc_tabs=() heredoc_expand=() heredoc_bodies=() heredoc_starts=() body_ids=() stage_sources=() stage_stdin=() executable_texts=() executable_stages=()
   local body_decisions=()
-  local starts=() ends=() separators=() joins=() join="" decisions=() literal_inputs=() input_bodies=() file_outputs=() executable_contexts=()
+  local starts=() ends=() separators=() joins=() join="" decisions=() literal_inputs=() input_bodies=() file_outputs=() body_writes=() executable_contexts=()
   if [ "${2:-}" = forwarded ]; then
     forwarded_argument=1
     set -- "$1" conservative "${@:3}"
@@ -1126,6 +1140,7 @@ environment_dump() { # command kind; arguments are already decoded data
          [ "$data_source" = " $doc" ]; then
         body=${heredoc_bodies[$doc]}; body_start=${heredoc_starts[$doc]}; body_end=$((body_start + ${#body}))
         main_text=${main_text:0:body_start}${body//[!$'\n']/ }${main_text:body_end}
+        body_writes[stage]=1
         continue
       fi
       # Input can execute downstream. A later fallback needs the original
@@ -1157,12 +1172,10 @@ environment_dump() { # command kind; arguments are already decoded data
       stage_unquoted=(${arg_unquoted[@]+"${arg_unquoted[@]}"})
       stage_roles=(${arg_roles[@]+"${arg_roles[@]}"})
       script_pos=""
-      # A `;` or newline list keeps this stage's argv and streams exact; a
-      # pipe, `&`, `&&` or `||` neighbour keeps the conservative scan.
       if [ "$1" = shell ] && [ -z "${2:-}$incoming_sources" ] &&
          { [ -z "$compound" ] || [ "$compound" = heredoc ]; } &&
          [[ $program =~ ^(bash|sh|dash|zsh|ksh)$ ]] && [ -z "$source_pos$syntax_head" ] &&
-         { [ -z "${joins[$stage]}" ] || [ "${joins[$stage]}" = ';' ]; } &&
+         environment_written_list &&
          { [ "${separators[$stage]}" = ';' ] || [ "${separators[$stage]}" = end ]; } &&
          [ -z "$input_redirect" ] &&
          [ "${stage_kinds[$pos]:-}" = literal ] && [[ ${stage_args[$pos]:-} != [-+]* ]] &&
@@ -1195,7 +1208,7 @@ environment_dump() { # command kind; arguments are already decoded data
         fi
         # Waiter launchers execute forwarded argv. Keep each selected program
         # beside its operands before considering a quoted command string.
-        forwarded_stages[stage]=1
+        forwarded_operand=1
         limit=${#stage_args[@]}
         args=("${stage_args[@]:candidate:limit-candidate}")
         arg_kinds=("${stage_kinds[@]:candidate:limit-candidate}")
@@ -1226,34 +1239,15 @@ environment_dump() { # command kind; arguments are already decoded data
     # An empty stage writes no output; the pipe still carries the last command's.
     [ "$start" -eq "$end" ] || piped_source=$data_source
   done
-  # A forwarded program can run a file another list stage wrote, in any
-  # language. Each literal input gets the judgement it would get alone: as
-  # forwarded shell source, and as any interpreter's input, which also covers
-  # an interpreter heredoc nested in a shell body.
-  # This text check cannot see which program writes a file, so every stage's
-  # words get the same interpreter evidence, a forwarding stage's included.
-  # Only main's conservative shell-word evidence skips a forwarding stage,
-  # whose argv already had the forwarded classification. A lone stage writes
-  # nothing another stage runs; a later submission running its file is
-  # outside this text check, so a single stage keeps main's classification.
-  if [ "${#forwarded_stages[@]}" -gt 0 ]; then
-    for ((doc=0; doc<${#literal_inputs[@]}; doc++)); do
-      local command_text=${literal_inputs[doc]}
+  # A forwarded program can run a file an admitted list wrote, in any
+  # language. Each body gets the judgement it would get alone: as forwarded shell
+  # source, and as any interpreter's input, which also covers an
+  # interpreter heredoc nested in a shell body.
+  if [ -n "$forwarded_operand" ]; then
+    for ((doc=0; doc<${#heredocs[@]}; doc++)); do
+      local command_text=${heredoc_bodies[$doc]}
       if environment_dump shell forwarded; then return 0; fi
       if environment_interpreter_evidence "$command_text"; then return 0; fi
-    done
-    local commands=0
-    for ((stage=0; stage<${#starts[@]}; stage++)); do
-      [ "${starts[$stage]}" -eq "${ends[$stage]}" ] || commands=$((commands + 1))
-    done
-    for ((stage=0; commands>1 && stage<${#starts[@]}; stage++)); do
-      for ((j=${starts[$stage]}; j<${ends[$stage]}; j++)); do
-        # A here-string operand is a literal input judged above.
-        if [ "$j" -gt "${starts[$stage]}" ] && [ "${tokens[$((j - 1))]}" = '<<<' ] &&
-           [[ ${kinds[$((j - 1))]} == operator* ]]; then continue; fi
-        if [ -z "${forwarded_stages[$stage]:-}" ] && environment_main_evidence "${tokens[$j]}"; then return 0; fi
-        if environment_interpreter_evidence "${tokens[$j]}"; then return 0; fi
-      done
     done
   fi
   if [ -n "$main_required" ]; then
