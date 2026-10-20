@@ -1233,14 +1233,20 @@ environment_dump() { # command kind; arguments are already decoded data
   # This text check cannot see which program writes a file, so every stage's
   # words get the same interpreter evidence, a forwarding stage's included.
   # Only main's conservative shell-word evidence skips a forwarding stage,
-  # whose argv already had the forwarded classification.
+  # whose argv already had the forwarded classification. A lone stage writes
+  # nothing another stage runs; a later submission running its file is
+  # outside this text check, so a single stage keeps main's classification.
   if [ "${#forwarded_stages[@]}" -gt 0 ]; then
     for ((doc=0; doc<${#literal_inputs[@]}; doc++)); do
       local command_text=${literal_inputs[doc]}
       if environment_dump shell forwarded; then return 0; fi
       if environment_interpreter_evidence "$command_text"; then return 0; fi
     done
+    local commands=0
     for ((stage=0; stage<${#starts[@]}; stage++)); do
+      [ "${starts[$stage]}" -eq "${ends[$stage]}" ] || commands=$((commands + 1))
+    done
+    for ((stage=0; commands>1 && stage<${#starts[@]}; stage++)); do
       for ((j=${starts[$stage]}; j<${ends[$stage]}; j++)); do
         # A here-string operand is a literal input judged above.
         if [ "$j" -gt "${starts[$stage]}" ] && [ "${tokens[$((j - 1))]}" = '<<<' ] &&

@@ -600,7 +600,8 @@ environment_rows() {
 [0,"echo 'print(1)' > tmp/acceptance.py; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE python3 tmp/acceptance.py","echo-written-benign-python-then-waiter"]
 [2,"sh A/launch.sh A/wait bash -c \"echo 'import os; print(os.environ)' > tmp/a.py\"; sh B/launch.sh B/wait env -u DISPLAY python3 tmp/a.py","forwarded-bash-writer-then-waiter"]
 [2,"sh A/launch.sh A/wait node -e \"require('fs').writeFileSync('tmp/a.py', 'import os; print(os.environ)')\"; sh B/launch.sh B/wait env -u DISPLAY python3 tmp/a.py","forwarded-node-writer-then-waiter"]
-[2,"sh A/launch.sh A/wait bash -c \"echo 'import os; print(os.environ)' > tmp/a.py\"","forwarded-bash-interpreter-writer-alone"]
+[0,"bash tools/search.sh process.env","script-search-interpreter-word"]
+[0,"sh tmp/waiter.X/launch.sh tmp/waiter.X/wait rg -n 'os.environ' src/","waiter-search-interpreter-word"]
 [0,"sh A/launch.sh A/wait bash -c \"echo 'print(1)' > tmp/a.py\"; sh B/launch.sh B/wait env -u DISPLAY python3 tmp/a.py","forwarded-benign-writer-then-waiter"]
 [2,"echo printenv | tee tmp/podman-acceptance.sh\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","tee-written-then-waiter"]
 [2,"echo '<<<' printenv > tmp/podman-acceptance.sh; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","quoted-herestring-word-then-waiter"]
@@ -1519,6 +1520,7 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "herestring-word-kind" { swap("[[ ${kinds[$((j - 1))]} == operator* ]]", "true") }
       defect == "stage-words-shell-only" { swap("if environment_interpreter_evidence \"${tokens[$j]}\"; then return 0; fi", ":") }
       defect == "forwarded-stage-exempt" { swap("if environment_interpreter_evidence \"${tokens[$j]}\"; then", "if [ -z \"${forwarded_stages[$stage]:-}\" ] && environment_interpreter_evidence \"${tokens[$j]}\"; then") }
+      defect == "lone-stage-scanned" { swap("commands>1 && ", "") }
       { print }
       END { if (changed != 1) exit 1 }
     ' "$hook_source" >"$mutant" || exit 1
@@ -1562,6 +1564,7 @@ shell-only-body|FAIL environment: heredoc-python-file-then-waiter: exit=0 expect
 other-stage-unjudged|FAIL environment: echo-written-then-waiter: exit=0 expected=2
 stage-words-shell-only|FAIL environment: echo-written-python-then-waiter: exit=0 expected=2
 forwarded-stage-exempt|FAIL environment: forwarded-bash-writer-then-waiter: exit=0 expected=2
+lone-stage-scanned|FAIL environment: script-search-interpreter-word: exit=2 expected=0
 forwarded-stage-shell-words|FAIL environment: heredoc-then-waiter-unset-launch: exit=2 expected=0
 herestring-operand-scanned|FAIL environment: herestring-setup-then-waiter: exit=2 expected=0
 herestring-word-kind|FAIL environment: quoted-herestring-word-then-waiter: exit=0 expected=2
