@@ -1313,7 +1313,8 @@ lane_handoff_standing() { # DIR ERR_FILE COMMAND...
 # ---------------------------------------------------------------------------
 
 # lane_key_tracker ITEM — prints the tracker the item key alone names: `linear`
-# for a tracker-identifier key, nothing for an issue-N key. open-terminal
+# for a tracker-identifier key, nothing for issue-*, local-* or pr-* keys.
+# workflow-state's local-* and pr-* keys name no issue. open-terminal
 # canonicalizes a tracker-identifier key under its default tracker, Linear. An
 # issue-N key names no tracker: it is the spelling open-terminal writes for a
 # GitHub item AND the spelling a Linear item is keyed by wherever
@@ -1323,7 +1324,7 @@ lane_handoff_standing() { # DIR ERR_FILE COMMAND...
 # own `repo`, so nothing here supplies one.
 lane_key_tracker() {
   case "$1" in
-    issue-*) ;;
+    issue-*|local-*|pr-*) ;;
     *) printf 'linear' ;;
   esac
 }

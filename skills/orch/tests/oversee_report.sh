@@ -430,6 +430,56 @@ assert_eq "$RC|$(awk 'NR <= 4' <<<"$OUT")" "0|Landed:
 | Outcome 1 \\| kept | KEN-1 (#11, abcdef1) |" "a custom column list renders those columns in its order"
 
 echo "=== render: the tracker is the record's, else the key's, and never a guess ==="
+tracker_key_report() (
+  local suffix="$1" item tracker title why calls
+  local initial_fail="$FAIL"
+  unset LINEAR_APP_TOKEN LINEAR_CLIENT_ID LINEAR_CLIENT_SECRET LINEAR_API_KEY
+  # The local direct-push producer supplies both the landing event and the
+  # stored cycle. The tracker stand-in records every lookup without loading
+  # credentials, so an empty query log proves more than a successful render.
+  while IFS='|' read -r item tracker title why calls; do
+    new_case "tracker-key-$suffix-$item-${tracker:-none}"
+    report -3600
+    fleet '+ {fleet_log: [{at: "'"$(at -60)"'", kind: "cycle", item: "'"$item"'",
+      text: "cycle item='"$item"' commit=abcdef1234 class=small"}]}' \
+      "$(lane "$item" done -86400 '' "$tracker" owner/repo | jq -c '.cycle = {class: "small", lane_secs: 600, open: 900}')"
+    issue "$item" 'Tracker task' 'Tracker outcome'
+    cat > "$CASE/linear-reader" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -z ${LINEAR_APP_TOKEN+set}${LINEAR_CLIENT_ID+set}${LINEAR_CLIENT_SECRET+set}${LINEAR_API_KEY+set} ]] || exit 91
+printf '%s\n' "$*" >> "$CASE/linear.calls"
+exec "${0%/*}/../.."/bin/linear "$@"
+STUB
+    chmod +x "$CASE/linear-reader"
+    run "OVERSEE_REPORT_TRACKER=$CASE/linear-reader" -- render --state "$CASE/state.json" --repo owner/repo
+    [[ "$RC" -eq 0 ]] || cat "$CASE/err"
+    assert_eq "$RC|$(awk '/^\| .*direct push/ || /^Cycles:/' <<<"$OUT")" \
+      "0|| $item (direct push, abcdef1) | $title | $why |
+Cycles: class=small lane_median=600 open_median=900 miss_share=0/1" \
+      "tracker key $item/$tracker retains the direct-push landing and recorded cycle"
+    assert_eq "$(cat "$CASE/linear.calls" 2>/dev/null || true)|$(awk '/^issue view /' "$CASE/gh.calls")" \
+      "$calls|" "tracker key $item/$tracker makes only its selected issue lookup"
+  done <<'ROWS'
+local-1792037080-551249-7751||(tracker unknown)|-|
+pr-7||(tracker unknown)|-|
+issue-7||(tracker unknown)|-|
+KEN-7||Tracker task|Tracker outcome|issues get KEN-7 --format=safe
+local-1792037080-551249-7751|linear|Tracker task|Tracker outcome|issues get local-1792037080-551249-7751 --format=safe
+ROWS
+  [[ "$FAIL" -eq "$initial_fail" ]]
+)
+tracker_key_report shipped || fail 'the direct-push tracker key report contract failed'
+KEY_REPORT="$(mutant_scripts tracker-key/orch lib/lane-state.sh)/oversee-report" || exit 1
+ln -s "$(cd "$TEST_DIR/../../github" && pwd)" "$TMP_ROOT/tracker-key/github"
+mutate_file "${KEY_REPORT%/*}/lib/lane-state.sh" 'issue-*|local-*|pr-*)' 'issue-*)'
+if (FAIL=0; REPORT_UNDER_TEST="$KEY_REPORT" tracker_key_report old-classifier) > "$TMP_ROOT/tracker-key.out"; then
+  fail 'the old classifier did not redden the real report boundary'
+else
+  assert_file_contains "$TMP_ROOT/tracker-key.out" '  FAIL  tracker key local-1792037080-551249-7751/ retains' \
+    'the local direct-push row rejects the old classifier'
+fi
+
 # Rows: tracker | repo | the issue-7 row it renders.
 while IFS='|' read -r tracker repo want; do
   new_case "identity_${tracker:-none}_${repo:-none}"

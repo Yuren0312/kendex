@@ -54,6 +54,25 @@ SCRIPT_DIR="$SCRIPTS_DIR"
 # shellcheck source=../scripts/lib/lane-state.sh
 source "$SCRIPTS_DIR/lib/lane-state.sh"
 
+echo "=== key tracker: documented nonissue namespaces and identifier fallback ==="
+# workflow-state emits lowercase local-* keys; review-pr-comments uses pr-N
+# without an issue. open-terminal canonicalizes configured identifiers, which
+# can include uppercase LOCAL-N or PR-N Linear team keys.
+while IFS='|' read -r item tracker; do
+  key_rc=0
+  key_tracker="$(lane_key_tracker "$item")" || key_rc=$?
+  assert_eq "$key_rc|$key_tracker" "0|$tracker" "the key alone selects the tracker for $item"
+done <<'ROWS'
+local-1792037080-551249-7751|
+pr-7|
+issue-7|
+KEN-7|linear
+LOCAL-7|linear
+PR-7|linear
+CC-7|linear
+configured_identifier|linear
+ROWS
+
 COMPOSER=$'\xe2\x9d\xaf\xc2\xa0'
 
 # One case's stub directory serves every direct call below: the harness's pgrep
