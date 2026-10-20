@@ -5,7 +5,7 @@
 # matcher: Bash
 # description: On harnesses that execute hooks, refuse recognized whole-environment reads unless a proven direct pipe filters named variables. This fixed check runs outside Git and before project policy. Nested dumps and unsupported routing can refuse conservatively. It reads submitted text, not unseen programs, aliases or runtime-built commands. COMMAND_SAFETY_DENY_PATTERN replaces only the default systemd-run memory-cap pattern; `^$` disables only that project-pattern check.
 # summary: Refuses recognized whole-environment command text and gives a filter that names a variable. Also applies the project deny pattern or the default systemd-run memory-cap rule. Unreadable payloads warn and allow the call; unreadable policy support affects only the pattern check.
-# safety: Classify literal command producers and the program receiving inline code or registered heredoc input. Shells retain shell parsing, known interpreters use language-specific whole-environment evidence, literal cat bodies retain their data contract unless a forwarding launcher in a `;` or newline list can run them, where every literal input is judged as forwarded shell source and as interpreter input and other list stages keep conservative and interpreter word detection, and unknown receivers retain conservative shell-word detection. Unquoted body expansions are checked independently, and unsupported forwarded contexts retain conservative refusal. Only proven direct named-variable filters grant dump permission; project-pattern matching remains independent and reads the submitted text. Unseen programs and runtime-built names are outside this text check; unreadable payloads or policy support warn and allow their affected check. Every diagnostic starts with command-safety: <key>=<value>.
+# safety: Classify literal command producers and the program receiving inline code or registered heredoc input. Shells retain shell parsing, known interpreters use language-specific whole-environment evidence, literal cat bodies retain their data contract unless a forwarding launcher in a `;` or newline list can run them, where every literal input is judged as forwarded shell source and as interpreter input and every stage keeps interpreter word detection and other list stages keep conservative word detection, and unknown receivers retain conservative shell-word detection. Unquoted body expansions are checked independently, and unsupported forwarded contexts retain conservative refusal. Only proven direct named-variable filters grant dump permission; project-pattern matching remains independent and reads the submitted text. Unseen programs and runtime-built names are outside this text check; unreadable payloads or policy support warn and allow their affected check. Every diagnostic starts with command-safety: <key>=<value>.
 # timeout: 10
 # requires-skills: [commit-guards]
 # ---
@@ -1230,9 +1230,10 @@ environment_dump() { # command kind; arguments are already decoded data
   # language. Each literal input gets the judgement it would get alone: as
   # forwarded shell source, and as any interpreter's input, which also covers
   # an interpreter heredoc nested in a shell body.
-  # This text check cannot see which program writes a file, so every other
-  # stage's words keep main's conservative evidence and the same interpreter
-  # evidence.
+  # This text check cannot see which program writes a file, so every stage's
+  # words get the same interpreter evidence, a forwarding stage's included.
+  # Only main's conservative shell-word evidence skips a forwarding stage,
+  # whose argv already had the forwarded classification.
   if [ "${#forwarded_stages[@]}" -gt 0 ]; then
     for ((doc=0; doc<${#literal_inputs[@]}; doc++)); do
       local command_text=${literal_inputs[doc]}
@@ -1240,12 +1241,11 @@ environment_dump() { # command kind; arguments are already decoded data
       if environment_interpreter_evidence "$command_text"; then return 0; fi
     done
     for ((stage=0; stage<${#starts[@]}; stage++)); do
-      [ -z "${forwarded_stages[$stage]:-}" ] || continue
       for ((j=${starts[$stage]}; j<${ends[$stage]}; j++)); do
         # A here-string operand is a literal input judged above.
         if [ "$j" -gt "${starts[$stage]}" ] && [ "${tokens[$((j - 1))]}" = '<<<' ] &&
            [[ ${kinds[$((j - 1))]} == operator* ]]; then continue; fi
-        if environment_main_evidence "${tokens[$j]}"; then return 0; fi
+        if [ -z "${forwarded_stages[$stage]:-}" ] && environment_main_evidence "${tokens[$j]}"; then return 0; fi
         if environment_interpreter_evidence "${tokens[$j]}"; then return 0; fi
       done
     done

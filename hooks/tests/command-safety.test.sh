@@ -598,6 +598,10 @@ environment_rows() {
 [2,"echo 'import os; print(os.environ)' > tmp/acceptance.py; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE python3 tmp/acceptance.py","echo-written-python-then-waiter"]
 [2,"echo 'console.log(process.env)' | tee tmp/acceptance.js\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE node tmp/acceptance.js","tee-written-node-then-waiter"]
 [0,"echo 'print(1)' > tmp/acceptance.py; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE python3 tmp/acceptance.py","echo-written-benign-python-then-waiter"]
+[2,"sh A/launch.sh A/wait bash -c \"echo 'import os; print(os.environ)' > tmp/a.py\"; sh B/launch.sh B/wait env -u DISPLAY python3 tmp/a.py","forwarded-bash-writer-then-waiter"]
+[2,"sh A/launch.sh A/wait node -e \"require('fs').writeFileSync('tmp/a.py', 'import os; print(os.environ)')\"; sh B/launch.sh B/wait env -u DISPLAY python3 tmp/a.py","forwarded-node-writer-then-waiter"]
+[2,"sh A/launch.sh A/wait bash -c \"echo 'import os; print(os.environ)' > tmp/a.py\"","forwarded-bash-interpreter-writer-alone"]
+[0,"sh A/launch.sh A/wait bash -c \"echo 'print(1)' > tmp/a.py\"; sh B/launch.sh B/wait env -u DISPLAY python3 tmp/a.py","forwarded-benign-writer-then-waiter"]
 [2,"echo printenv | tee tmp/podman-acceptance.sh\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","tee-written-then-waiter"]
 [2,"echo '<<<' printenv > tmp/podman-acceptance.sh; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","quoted-herestring-word-then-waiter"]
 [2,"bash wrap.sh step cat \"/proc/self/environ\"","waiter-forwarded-cat-quoted-path"]
@@ -1509,10 +1513,12 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "forwarded-body-context" { swap("environment_dump shell forwarded; then", "environment_dump shell conservative; then") }
       defect == "heredoc-only-inputs" { swap("for ((doc=0; doc<${#literal_inputs[@]}; doc++)); do", "for ((doc=0; doc<${#heredocs[@]}; doc++)); do") }
       defect == "shell-only-body" { swap("if environment_interpreter_evidence \"$command_text\"; then return 0; fi", ":") }
-      defect == "other-stage-unjudged" { swap("if environment_main_evidence \"${tokens[$j]}\"; then return 0; fi", ":") }
+      defect == "other-stage-unjudged" { swap("if [ -z \"${forwarded_stages[$stage]:-}\" ] && environment_main_evidence \"${tokens[$j]}\"; then return 0; fi", ":") }
+      defect == "forwarded-stage-shell-words" { swap("if [ -z \"${forwarded_stages[$stage]:-}\" ] && environment_main_evidence", "if environment_main_evidence") }
       defect == "herestring-operand-scanned" { swap("[ \"${tokens[$((j - 1))]}\" = \047<<<\047 ] &&", "false &&") }
       defect == "herestring-word-kind" { swap("[[ ${kinds[$((j - 1))]} == operator* ]]", "true") }
       defect == "stage-words-shell-only" { swap("if environment_interpreter_evidence \"${tokens[$j]}\"; then return 0; fi", ":") }
+      defect == "forwarded-stage-exempt" { swap("if environment_interpreter_evidence \"${tokens[$j]}\"; then", "if [ -z \"${forwarded_stages[$stage]:-}\" ] && environment_interpreter_evidence \"${tokens[$j]}\"; then") }
       { print }
       END { if (changed != 1) exit 1 }
     ' "$hook_source" >"$mutant" || exit 1
@@ -1555,6 +1561,8 @@ heredoc-only-inputs|FAIL environment: herestring-env-then-waiter: exit=0 expecte
 shell-only-body|FAIL environment: heredoc-python-file-then-waiter: exit=0 expected=2
 other-stage-unjudged|FAIL environment: echo-written-then-waiter: exit=0 expected=2
 stage-words-shell-only|FAIL environment: echo-written-python-then-waiter: exit=0 expected=2
+forwarded-stage-exempt|FAIL environment: forwarded-bash-writer-then-waiter: exit=0 expected=2
+forwarded-stage-shell-words|FAIL environment: heredoc-then-waiter-unset-launch: exit=2 expected=0
 herestring-operand-scanned|FAIL environment: herestring-setup-then-waiter: exit=2 expected=0
 herestring-word-kind|FAIL environment: quoted-herestring-word-then-waiter: exit=0 expected=2
 receiver-evidence|FAIL environment: receiver-python-heredoc-whole-1: exit=0 expected=2
