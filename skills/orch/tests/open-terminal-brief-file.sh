@@ -67,10 +67,11 @@ printf '{"pi":{"extensions":["./extensions/hooks.ts","./extensions/lane-mail-wak
 # brief, to RECEIVED byte for byte.
 RECEIVED="$TMP_ROOT/received"
 RECEIVED_EVIDENCE="$TMP_ROOT/received-evidence"
+RECEIVED_ARGV="$TMP_ROOT/received-argv"
 HARNESS_STUB="$TMP_ROOT/harness"
-printf '#!/usr/bin/env bash\nprintf %%s "${!#}" > %q\nprintf %%s "${ORCH_COMPACTION_OVERRIDES:-}" > %q\n' "$RECEIVED" "$RECEIVED_EVIDENCE" > "$HARNESS_STUB"
+printf '#!/usr/bin/env bash\nprintf %%s "${!#}" > %q\nprintf %%s "${ORCH_COMPACTION_OVERRIDES:-}" > %q\nprintf "%%s\\0" "$@" > %q\n' "$RECEIVED" "$RECEIVED_EVIDENCE" "$RECEIVED_ARGV" > "$HARNESS_STUB"
 chmod +x "$HARNESS_STUB"
-cp "$HARNESS_STUB" "$OT_STUB_BIN/codex"
+for harness in claude codex pi copilot opencode; do cp "$HARNESS_STUB" "$OT_STUB_BIN/$harness"; done
 
 # The brief: an apostrophe, double quotes, a dollar sign, backticks, an
 # ampersand, a backslash, a printf directive and a placeholder word, each of
@@ -84,6 +85,8 @@ BRIEF
 BRIEF_WANT="$TMP_ROOT/brief.want"
 printf '%s' "$(cat "$BRIEF_FILE")" > "$BRIEF_WANT"
 CMD="$HARNESS_STUB --model opus --effort high $QUESTION_OFF_ALL {brief}"
+launch_choice_template claude opus "$CMD"
+assert_eq "$LAUNCH_CHOICE_TEMPLATE" "$CMD" 'a complete opaque custom command keeps its original shell text'
 
 # The directory a hosted lane's remote shell opens in, and the provider's disk
 # the stub serves under it: the launch reads the lane's `.git` there for the
@@ -146,7 +149,7 @@ typed_line() {
 # harness received, or `unrun` when it received nothing. `clear` is a no-op
 # here: the pane line opens on it and the suite has no terminal to clear.
 received() {
-  rm -f -- "$RECEIVED" "$RECEIVED_EVIDENCE"
+  rm -f -- "${RECEIVED:?}" "${RECEIVED_EVIDENCE:?}" "${RECEIVED_ARGV:?}"
   env HOME="$TMP_ROOT/home" PATH="$OT_STUB_BIN:$PATH" ORCH_COMPACTION_OVERRIDES=stale-parent-value \
     "$BASH" -c "clear() { :; }; $1" >/dev/null 2>&1
   if [[ -f "$RECEIVED" ]]; then cmp -s "$RECEIVED" "$BRIEF_WANT" && echo verbatim || echo altered; else echo unrun; fi
@@ -172,7 +175,7 @@ printf '{"team":{"key":"KEN"}}\n'
 STUB
 chmod +x "$FOREIGN_ROOT/.agents/skills/linear/scripts/linear.sh"
 run_ot "$FOREIGN_SCRIPTS/open-terminal" "TMUX=;LINEAR_TEAM=Checkout team" --ghostty --harness claude \
-  --cmd "$HARNESS_STUB --model opus --effort high $QUESTION_OFF_ALL '{brief}'" --brief-file "$BRIEF_FILE" CC-5
+  --cmd "$HARNESS_STUB --model opus --effort high $QUESTION_OFF_ALL {brief}" --brief-file "$BRIEF_FILE" CC-5
 assert_eq "rc=$RC first=$(sed -n 1p <<<"$OUT") creates=$(grep -c '^create ' "$RUN/worktree.log")" \
   "rc=1 first=open-terminal: item-foreign repo=CC route=peer-mail creates=0" \
   "a foreign item refuses before brief rendering and creates no worktree" "$OUT"
@@ -209,10 +212,11 @@ codex_brief_row() { # OT SURFACE ROUTE
   else env_words+=";TMUX="; fi
   run_ot "$ot" "$env_words" "--$surface" ${args[@]+"${args[@]}"} \
     --state-dir "$TMP_ROOT/fleet-$RUN_SEQ" --harness codex \
-    --cmd "codex -m gpt-6-astra -c model_reasoning_effort=high $QUESTION_OFF_ALL $COMPACTION_OFF_ALL {brief}" \
+    --cmd "codex -m gpt-6-astra -c model_reasoning_effort=high {brief}" \
     --brief-file "$BRIEF_FILE" KEN-2
   if [[ "$surface" == tmux ]]; then line="$(typed_line 'clear; source ')" || line=""
   else line="$(gui_line)" || line=""; fi
+  printf '%s\n\n%s' "$(cat "$BRIEF_FILE")" "$LAUNCH_UNATTENDED_TEXT" > "$BRIEF_WANT"
   CODEX_BRIEF_GOT="rc=$RC harness=$(received "$line") evidence=$(jq -c '[.harness,.settings.model_auto_compact_token_limit,.settings.model_auto_compact_token_limit_scope,.settings.model_post_turn_compact_threshold_percent]' "$RECEIVED_EVIDENCE" 2>/dev/null)"
 }
 assert_codex_brief() {
@@ -229,10 +233,95 @@ tmux|fresh
 tmux|relaunch
 ROWS
 
-EVIDENCE_OT="$(mutant_scripts brief-codex-evidence lib/lane-launch.sh)/open-terminal" || exit 1
+printf '%s' "$(cat "$BRIEF_FILE")" > "$BRIEF_WANT"
+
+# Omitted requirements reach the actual child. The caller tail includes an
+# empty argument, an embedded newline, a literal dollar sign and a delimiter.
+# NUL records prove argument values independently of shell-text readers.
+supplied_row() { # OT SURFACE HARNESS FLAGS REQUIRED
+  local ot="$1" surface="$2" harness="$3" flags="$4" required="$5" line="" route=()
+  local env_words="TMUX=" template brief_want
+  if [[ "$surface" == tmux || "$surface" == hosted ]]; then env_words='TMUX=stub,1,0;ORCH_TMUX_SESSION=stub'; fi
+  if [[ "$surface" == hosted ]]; then
+    env_words+=";ORCH_LANE_ALIASES=eclaude=work;LANE_HOST_STUB_CREATE_LINE=ssh-target=lane.example"$'\t'"path=$REMOTE_LANE"$'\t'"remote-prefix=exec bash -c"
+    route=(--host "$HOST_STUB" --lane work --repo o/r)
+  fi
+  template="$harness $flags '' 'multi"$'\n'"line' 'literal \$HOME' -- {brief}"
+  [[ "$harness" != opencode ]] || template="${template%\{brief\}}--prompt={brief}"
+  run_ot "$ot" "$env_words" "--${surface/hosted/tmux}" --harness "$harness" ${route[@]+"${route[@]}"} \
+    --cmd "$template" --brief-file "$BRIEF_FILE" KEN-2
+  if [[ "$surface" == hosted ]]; then
+    # The hosted transport quotes the brief inline. Read the complete logged
+    # buffer, including newlines, up to its paste acknowledgement.
+    line="$(awk '
+      /^exec bash -c / { copying=1 }
+      copying && /^paste-buffer / { exit }
+      copying { print }' "$RUN/tmux.log")"
+  elif [[ "$surface" == tmux ]]; then line="$(typed_line 'clear; source ')" || line=""
+  else line="$(gui_line)" || line=""; fi
+  if [[ "$harness" == opencode ]]; then printf '%s' --prompt= > "$BRIEF_WANT"; else : > "$BRIEF_WANT"; fi
+  printf '%s\n\n%s' "$(cat "$BRIEF_FILE")" "$LAUNCH_UNATTENDED_TEXT" >> "$BRIEF_WANT"
+  brief_want="$(received "$line")"
+  SUPPLIED_GOT="rc=$RC brief=$brief_want"
+  if [[ -f "$RECEIVED_ARGV" ]]; then
+    if perl -e '
+      use strict; use warnings; local $/;
+      open my $a,"<",$ARGV[0] or die $!; my @a=split /\0/,<$a>,-1; pop @a;
+      open my $b,"<",$ARGV[1] or die $!;
+      my @want=("", "multi\nline", q(literal $HOME), "--", scalar <$b>);
+      my $tail=join("\0",splice @a,-5);
+      exit 1 unless $tail eq join("\0",@want);
+      my @required=split /\n/,$ARGV[2];
+      for my $word (@required) { exit 1 unless grep { $_ eq $word } @a; }
+    ' "$RECEIVED_ARGV" "$BRIEF_WANT" "$required"; then SUPPLIED_GOT+=' argv=preserved'; else SUPPLIED_GOT+=' argv=altered'; fi
+  else SUPPLIED_GOT+=' argv=missing'; fi
+  cmp -s "$BRIEF_FILE" "$TMP_ROOT/brief.original" && SUPPLIED_GOT+=' caller=unchanged' || SUPPLIED_GOT+=' caller=altered'
+}
+assert_supplied() {
+  assert_eq "$SUPPLIED_GOT" 'rc=0 brief=verbatim argv=preserved caller=unchanged' \
+    "the $SUPPLIED_HARNESS $SUPPLIED_SURFACE child receives omitted requirements and the original argument tail" "$OUT"
+}
+cp "$BRIEF_FILE" "$TMP_ROOT/brief.original"
+while IFS='|' read -r SUPPLIED_HARNESS SUPPLIED_FLAGS SUPPLIED_REQUIRED; do
+  SUPPLIED_REQUIRED="${SUPPLIED_REQUIRED//;/$'\n'}"
+  SUPPLIED_SURFACE=ghostty
+  supplied_row "$OT" "$SUPPLIED_SURFACE" "$SUPPLIED_HARNESS" "$SUPPLIED_FLAGS" "$SUPPLIED_REQUIRED"
+  assert_supplied
+done <<'ROWS'
+claude|--model opus --effort high --permission-mode dontAsk|--disallowedTools=AskUserQuestion,EnterPlanMode;opus;high;--permission-mode;dontAsk
+codex|-m gpt-6.1-sol -c model_reasoning_effort=high --ask-for-approval=on-request|features.default_mode_request_user_input=false;model_auto_compact_token_limit=9223372036854775807;model_auto_compact_token_limit_scope=body_after_prefix;model_post_turn_compact_threshold_percent=0;gpt-6.1-sol;model_reasoning_effort=high;--ask-for-approval=on-request
+pi|--model github-copilot/gpt-6.1-sol --thinking high|--exclude-tools;question;github-copilot/gpt-6.1-sol;high
+copilot|--model gpt-6.1-sol --reasoning-effort high|--no-ask-user;--context;long_context;gpt-6.1-sol;high
+opencode|--model example/model|example/model
+ROWS
+SUPPLIED_HARNESS=codex SUPPLIED_FLAGS='-m gpt-6.1-sol -c model_reasoning_effort=high'
+SUPPLIED_REQUIRED=$'features.default_mode_request_user_input=false\nmodel_post_turn_compact_threshold_percent=0'
+for SUPPLIED_SURFACE in tmux hosted; do
+  supplied_row "$OT" "$SUPPLIED_SURFACE" "$SUPPLIED_HARNESS" "$SUPPLIED_FLAGS" "$SUPPLIED_REQUIRED"
+  assert_supplied
+done
+
+# Removing insertion or the suffix must fail the same actual-child assertion.
+for SUPPLIED_CONTROL in prefix suffix; do
+  CONTROL_OT="$(mutant_scripts "brief-supply-$SUPPLIED_CONTROL" open-terminal)/open-terminal" || exit 1
+  orch_fixture_shared_libs "$TMP_ROOT/brief-supply-$SUPPLIED_CONTROL"
+  if [[ "$SUPPLIED_CONTROL" == prefix ]]; then
+    mutate_file "$CONTROL_OT" 'CMD_TEMPLATE="$LAUNCH_CHOICE_TEMPLATE"' 'CMD_TEMPLATE="$CMD_TEMPLATE"'
+  else
+    mutate_file "$CONTROL_OT" 'BRIEF_TEXT+=$'"'"'\n\n'"'"'"$LAUNCH_UNATTENDED_TEXT"' 'BRIEF_TEXT+=""'
+  fi
+  SUPPLIED_SURFACE=ghostty
+  supplied_row "$CONTROL_OT" "$SUPPLIED_SURFACE" codex "$SUPPLIED_FLAGS" "$SUPPLIED_REQUIRED"
+  CONTROL_RC=0
+  ( FAIL=0; assert_supplied; [[ "$FAIL" -eq 0 ]] ) > "$RUN/supplied-assertion" 2>&1 || CONTROL_RC=$?
+  assert_eq "$CONTROL_RC" 1 "control: removing $SUPPLIED_CONTROL fails the actual-child requirement assertion" "$RUN/supplied-assertion"
+done
+printf '%s' "$(cat "$BRIEF_FILE")" > "$BRIEF_WANT"
+
+EVIDENCE_OT="$(mutant_scripts brief-codex-evidence open-terminal)/open-terminal" || exit 1
 orch_fixture_shared_libs "$TMP_ROOT/brief-codex-evidence"
-mutate_file "${EVIDENCE_OT%/open-terminal}/lib/lane-launch.sh" 'then launch_env="$8"' \
-  'then launch_env=$(lane_launch_compaction_env "$cmd" "$harness") || return 1'
+mutate_file "$EVIDENCE_OT" 'compaction_cmd="$(cmd_template_text "$item" "$repo")"' \
+  'compaction_cmd="$CMD_INPUT"'
 CODEX_SURFACE=ghostty CODEX_ROUTE=fresh
 codex_brief_row "$EVIDENCE_OT" "$CODEX_SURFACE" "$CODEX_ROUTE"
 CONTROL_RC=0
@@ -241,7 +330,9 @@ CONTROL_RC=0
   assert_codex_brief
   [[ "$FAIL" -eq 0 ]]
 ) > "$RUN/evidence-assertion.out" 2>&1 || CONTROL_RC=$?
-assert_eq "$CONTROL_RC" 1 "control: reading the execution-only file expansion fails the same Codex evidence assertion" "$RUN/evidence-assertion.out"
+assert_eq "$CONTROL_RC" 1 "control: reading the original command fails the same normalized Codex evidence assertion" "$RUN/evidence-assertion.out"
+
+printf '%s' "$(cat "$BRIEF_FILE")" > "$BRIEF_WANT"
 
 # The tmux command is caller shell text. A startup function must remain
 # callable, and a later command in that pane must inherit the launch origin.

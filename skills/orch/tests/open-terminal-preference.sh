@@ -59,7 +59,7 @@ jq -cn --arg d "$d" '{config_dir: $d}'
 STUB
 chmod +x "$BIN/lanes"
 source "$SCRIPTS_DIR/lib/lane-launch.sh"
-printf '%s\n' "$LAUNCH_UNATTENDED_TEXT" > "$TMP_ROOT/brief"
+printf '%s\n' 'Execute the selected item.' > "$TMP_ROOT/brief"
 PREF='pi:github-copilot/gpt-6.1-sol:high,codex:gpt-6.1-sol:high'
 assert_eq "$(cd -- "$REPO" && env -i GIT_CEILING_DIRECTORIES="$GIT_CEILING_DIRECTORIES" PATH="$PATH" HOME="$TMP_ROOT/home" scripts/orch-env ORCH_LANE_PREFERENCE '')" '' 'orch-env leaves the lane preference unset'
 printf '[env]\nORCH_LANE_PREFERENCE = "%s"\n' "$PREF" > "$REPO/kendex.settings.toml"
@@ -134,6 +134,9 @@ observe() { # PREFERENCE WALL MODE TEXT
       launch_choice_words_present '-c model_auto_compact_token_limit=9223372036854775807 -c model_auto_compact_token_limit_scope=body_after_prefix -c model_post_turn_compact_threshold_percent=0' "$cmd" &&
       ! launch_choice_words_present '--exclude-tools question' "$cmd" || written=no
   fi
+  if [[ "$mode" == cmd && "$rc" -eq 0 ]]; then
+    launch_choice_phrase_present "$LAUNCH_UNATTENDED_TEXT" "$cmd" || written=no
+  fi
   OBS_CMD="$cmd"
   OBS="$rc|$key|$record|$written|$(paste -sd, - < "$RUN/picks")"
   [[ -s "$RUN/picks" ]] || OBS+=none
@@ -143,7 +146,7 @@ observe() { # PREFERENCE WALL MODE TEXT
 # launcher, including what its emitted command actually passes to the harness.
 while IFS='|' read -r label pref wall mode text want; do
   [[ "$pref" != default ]] || pref="$PREF"
-  [[ "$text" != template ]] || text='pi --exclude-tools question {brief}'
+  [[ "$text" != template ]] || text='pi {brief}'
   observe "$pref" "$wall" "$mode" "$text"
   assert_eq "$OBS" "$want" "$label" "$RUN/err"
 done <<'ROWS'
@@ -161,6 +164,16 @@ unset preserves the missing-model gate||none|flags||1|launch-model-missing|none|
 explicit flags bypass even an invalid preference|invalid|none|flags|--model github-copilot/gpt-6.1-sol --thinking high|0|none|pi|github-copilot/gpt-6.1-sol|none|yes|pi:github-copilot/gpt-6.1-sol
 explicit command bypasses even an invalid preference|invalid|none|cmd|pi --model github-copilot/gpt-6.1-sol --thinking high --exclude-tools question {brief}|0|none|pi|github-copilot/gpt-6.1-sol|none|yes|pi:github-copilot/gpt-6.1-sol
 ROWS
+# The preference owner must keep arbitrary argument values out of the shared
+# lead builder's newline encoding. The NUL child record proves the tail.
+observe "$PREF" none cmd "pi '' 'multi"$'\n'"line' -- {brief}"
+TAIL_RC=0
+perl -e 'local $/; open my $a,"<",$ARGV[0] or die $!; my @a=split /\0/,<$a>,-1; pop @a;
+  my @tail=splice @a,-4; exit 1 unless $tail[0] eq "" && $tail[1] eq "multi\nline" && $tail[2] eq "--";
+  open my $b,"<",$ARGV[1] or die $!; my $brief=<$b>; $brief =~ s/\n+$//;
+  exit($tail[3] eq "$brief\n\n$ARGV[2]" ? 0 : 1)' "$RUN/argv" "$TMP_ROOT/brief" "$LAUNCH_UNATTENDED_TEXT" || TAIL_RC=$?
+assert_eq "$TAIL_RC" 0 'the preference-selected child retains empty and multiline arguments and receives unattended instructions'
+
 # The refusal names the whole walk, not just the final model.
 observe "$PREF" all flags ''
 assert_file_contains "$RUN/err" "walk=$PREF" 'no-room refusal names the preference walk'
@@ -243,7 +256,6 @@ rm -f -- "${BIN:?}/kendex"
 # keeps the tested call or comparison, but removes its effect in a private copy.
 for control in routing model settings grammar command permission snapshot; do
   mutant_file=open-terminal
-  [[ "$control" != settings ]] || mutant_file=lib/overseer-launch.sh
   MUTANT="$(mutant_scripts "mutant-$control" "$mutant_file")/open-terminal"
   orch_fixture_shared_libs "$TMP_ROOT/mutant-$control"
   git -C "$TMP_ROOT/mutant-$control" init -q
@@ -260,7 +272,7 @@ for control in routing model settings grammar command permission snapshot; do
       observe "$PREF" none flags ''
       assert_eq "$OBS" '0|none|pi|github-copilot/gpt-6.1-sol|pi:github-copilot/gpt-6.1-sol:high|yes|pi:' 'control: the first-entry row turns red when its pick loses the model' ;;
     settings)
-      mutate_file "${OT%/*}/lib/overseer-launch.sh" 'launch_choice_lead_settings ${question[@]+"${question[@]}"}' 'true ${question[@]+"${question[@]}"}'
+      mutate_file "$OT" 'CMD_TEMPLATE="$LAUNCH_CHOICE_TEMPLATE"' 'CMD_TEMPLATE="$CMD_TEMPLATE"'
       observe 'codex:gpt-6.1-sol:high' none cmd 'claude --dangerously-skip-permissions {brief}' claude
       assert_eq "$OBS" '1|launch-question-tool-missing|none|none|none|no|codex:gpt-6.1-sol' 'control: the model-free fallback row turns red without harness settings' ;;
     grammar)

@@ -198,7 +198,7 @@ for row in \
   "pi|true $PI_Q $UNATTENDED_TEXT|-|CC-24|1|open-terminal: launch-unattended-missing harness=pi|yes|no|the words the shell splits into several arguments are not the words" \
   "pi|true $PI_Q '/skill:orch start CC-23 $UNATTENDED_TEXT'|-|CC-23|0|-|no|yes|the words whole inside one argument of the template launch" \
   "pi|true $PI_Q {brief}|Lead CC-28. $UNATTENDED_TEXT|CC-28|0|-|no|yes|the words in the brief file launch" \
-  "pi|true $PI_Q {brief}|Lead CC-29.|CC-29|1|open-terminal: launch-unattended-missing harness=pi|yes|no|a brief file without the words is refused" \
+  "pi|true $PI_Q {brief}|Lead CC-29.|CC-29|0|-|no|yes|a brief file receives the unattended words" \
   "claude|true --disallowedTools=AskUserQuestion,EnterPlanMode|-|CC-25|1|open-terminal: launch-unattended-missing harness=claude|yes|no|a claude template without the words is refused as a pi one is" \
   "claude|true --disallowedTools=AskUserQuestion,EnterPlanMode '$UNATTENDED_TEXT'|-|CC-30|0|-|no|yes|a claude template carrying the words launches" \
   "opencode|true|-|CC-31|1|open-terminal: launch-unattended-missing harness=opencode|yes|no|an opencode template, which has no question-tool words, is still asked for these" \

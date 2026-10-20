@@ -760,9 +760,12 @@ ol_entry_permitted() { # ENTRY
 # launch-choice-failed, or model-window-unknown where the Claude handoff budget
 # could not be read, and its fields in OL_FIELDS.
 OL_FLAGS=()
+# open-terminal's internal --custom-template leaves mandatory insertion to
+# its template owner after the existing model and permission transformation.
 ol_launch_flags() { # [--question-off] HARNESS MODEL EFFORT PICK_MODEL SOURCE [FLAG...]
-  local question=() words lead_model
+  local question=() words lead_model custom_template=false
   if [[ "$1" == --question-off ]]; then question=(--question-off); shift; fi
+  if [[ "$1" == --custom-template ]]; then custom_template=true; shift; fi
   local harness="$1" model="$2" effort="$3" pick_model="$4" source="$5"
   shift 5
   OL_FLAGS=() OL_FIELDS=()
@@ -782,6 +785,12 @@ ol_launch_flags() { # [--question-off] HARNESS MODEL EFFORT PICK_MODEL SOURCE [F
     OL_FLAGS+=(${LAUNCH_CHOICE_ARGV[@]+"${LAUNCH_CHOICE_ARGV[@]}"})
     LAUNCH_CHOICE_KEPT=()
     OL_FIELDS=()
+  fi
+  if [[ "$custom_template" == true ]]; then
+    # open-terminal inserts mandatory settings after template construction.
+    # Its caller arguments must never enter the lead builder's line encoding.
+    OL_FLAGS+=(${LAUNCH_CHOICE_KEPT[@]+"${LAUNCH_CHOICE_KEPT[@]}"})
+    return 0
   fi
   lead_model="$model"
   [[ -n "$lead_model" ]] || lead_model="$(launch_choice_value "$(launch_choice_model_spellings "$harness")" \

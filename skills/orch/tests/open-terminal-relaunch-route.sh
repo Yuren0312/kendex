@@ -223,8 +223,9 @@ replay() {
   local sandbox="$RUN/sandbox" line
   mkdir -p "$sandbox"
   : > "$RUN/claude.log"
+  : > "$RUN/claude-args"
   line="$(remote | sed -e 's/^exec bash -lc /bash -c /' -e "s#cd /srv/lane #cd $sandbox #")"
-  env -i GIT_CEILING_DIRECTORIES="$GIT_CEILING_DIRECTORIES" PATH="$HARNESS_BIN:$PATH" HOME="$RUN" CLAUDE_LOG="$RUN/claude.log" CLAUDE_CONTINUE_RC="$1" bash -c "$line" 2>/dev/null
+  env -i GIT_CEILING_DIRECTORIES="$GIT_CEILING_DIRECTORIES" PATH="$HARNESS_BIN:$PATH" HOME="$RUN" CLAUDE_LOG="$RUN/claude.log" CLAUDE_ARGS_LOG="$RUN/claude-args" CLAUDE_CONTINUE_RC="$1" bash -c "$line" 2>/dev/null
   awk '/ --continue / { r = r s "continue"; s = "," ; next } /^-n KEN-1 .*\/orch start KEN-1 / { r = r s "fresh"; s = "," ; next } { r = r s "other"; s = "," } END { print (r == "" ? "none" : r) }' "$RUN/claude.log"
 }
 
@@ -252,6 +253,11 @@ assert_eq "rc=$RC launched=$(launched) continue=$(remote | grep -c -- "--continu
 for row in '1|continue,fresh' '0|continue' '143|continue'; do
   assert_eq "$(replay "${row%%|*}")" "${row#*|}" \
     "a --continue that exits ${row%%|*} runs: ${row#*|}"
+  runs="$(tr '\0' '\n' < "$RUN/claude-args" | grep -cxF __run__)"
+  for required in '--disallowedTools=AskUserQuestion,EnterPlanMode' '--settings={"env":{"DISABLE_AUTO_COMPACT":"1"}}'; do
+    assert_eq "$(tr '\0' '\n' < "$RUN/claude-args" | grep -cxF -- "$required")" "$runs" \
+      "each executed Claude resume or fresh recovery retains $required"
+  done
 done
 
 echo "=== a pane that shows no harness is no launched lane ==="
@@ -291,6 +297,15 @@ for harness_screen in "codex|$HARNESS_SCREEN" "pi|$PI_SCREEN"; do
         "$harness $kind keeps a healthy harness screen running" "$RUN/launcher.out"
       assert_eq "$(cat "$RUN/inline/replay.out")" "$expected" \
         "$harness $kind executes the host's actual selection before reporting success"
+      if [[ "$harness" == codex ]]; then
+        for required in features.default_mode_request_user_input=false model_auto_compact_token_limit=9223372036854775807 model_auto_compact_token_limit_scope=body_after_prefix model_post_turn_compact_threshold_percent=0; do
+          assert_eq "$(tr '\0' '\n' < "$RUN/inline/harness.log" | grep -cxF -- "$required")" 1 \
+            "the executed Codex $kind recovery retains $required"
+        done
+      else
+        assert_eq "$(tr '\0' '\n' < "$RUN/inline/harness.log" | grep -cxF -- --exclude-tools),$(tr '\0' '\n' < "$RUN/inline/harness.log" | grep -cxF question)" '1,1' \
+          "the executed Pi $kind recovery excludes its question tool"
+      fi
       lineless=0
       [[ "$harness:$kind" != codex:matching ]] || lineless=1
       assert_eq "lineless=$(said '^open-terminal: resume-lineless item=KEN-1 harness=codex$') continuation=$(tr '\0' '\n' < "$RUN/inline/harness.log" | grep -c 'Resume the orch workflow' || true)" \

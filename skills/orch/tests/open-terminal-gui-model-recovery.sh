@@ -93,6 +93,10 @@ recovery_contract() { # STATE ARGUMENTS STARTS
   assert_eq "$(jq -r '.lanes[0] | .status=="running" and .surface=="gui" and .launch.pid!=null and .launch.start!=null' "$1")" true 'the replacement is a recorded GUI launch'
   assert_eq "$(awk -v bypass="$GUI_BYPASS" '/^--model$/{getline;model=$0} /^--effort$/{getline;effort=$0} $0==bypass{permissions="bypass"} END{print model "|" effort "|" permissions}' "$2")" \
     'claude-opus-4-8|high|bypass' 'the real replacement keeps the launched model, effort and permissions'
+  for required in '--disallowedTools=AskUserQuestion,EnterPlanMode' '--settings={"env":{"DISABLE_AUTO_COMPACT":"1"}}'; do
+    assert_eq "$(grep -cxF -- "$required" "$2")" 1 "the real GUI replacement receives $required"
+  done
+  assert_eq "$(grep -cF -- "$LAUNCH_UNATTENDED_TEXT" "$2")" 1 'the real GUI replacement receives unattended instructions once'
   startup_contract "${3%/*}" "$(tail -n 1 "$3")" 'the replacement harness'
 }
 

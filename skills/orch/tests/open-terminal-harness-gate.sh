@@ -99,7 +99,7 @@ pi_carrier() { # sends|old|nowake|none
 
 # The launch-choice refusals that run ahead of the gate are read too, so a row
 # refused before the gate cannot read as one the gate passed.
-GATE_KEYS='unsupported-for-oversee|compaction-on|launch-window-unknown|launch-compaction-missing|pi-settings-unreadable|launch-question-tool-missing|launch-model-missing|launch-effort-missing|launch-unattended-missing|pi-mail-wake-missing'
+GATE_KEYS='launch-option-conflict|unsupported-for-oversee|compaction-on|launch-window-unknown|launch-compaction-missing|pi-settings-unreadable|launch-question-tool-missing|launch-model-missing|launch-effort-missing|launch-unattended-missing|pi-mail-wake-missing'
 # launch NAME ARGS... — the gate's line open-terminal wrote, or `passed` where it
 # wrote none, for a GUI launch of CC-1 under ARGS; OT names another copy, and
 # WT_CLI a worktree CLI other than the one that stops the launch before its
@@ -149,13 +149,22 @@ claude on a new Haiku version passes|passed|${FLEET[*]} --harness claude --launc
 claude naming no model passes the window gate with the default budget|passed|${FLEET[*]} --harness claude
 codex passes, its rollout naming its window|passed|${FLEET[*]} --harness codex --launch-flags '-m gpt-6-astra -c model_reasoning_effort=high'
 a claude --cmd carrying the compaction words passes|passed|${FLEET[*]} --harness claude --cmd "\$CLAUDE_TEMPLATE"
-a claude --cmd without them is refused, naming them|open-terminal: launch-compaction-missing harness=claude word=--settings={"env":{"DISABLE_AUTO_COMPACT":"1"}}|${FLEET[*]} --harness claude --cmd 'claude --model opus --effort high $CLAUDE_QUESTION {item}'
-a claude --cmd whose JSON the shell would strip is refused, the word never reaching claude whole|open-terminal: launch-compaction-missing harness=claude word=--settings={"env":{"DISABLE_AUTO_COMPACT":"1"}}|${FLEET[*]} --harness claude --cmd "claude --model opus --effort high $CLAUDE_QUESTION --settings={\"env\":{\"DISABLE_AUTO_COMPACT\":\"1\"}} {item}"
+a literal claude --cmd receives omitted compaction settings|passed|${FLEET[*]} --harness claude --cmd 'claude --model opus --effort high $CLAUDE_QUESTION {item}'
+a claude --cmd whose explicit JSON is stripped remains refused|open-terminal: launch-option-conflict harness=claude option=--settings|${FLEET[*]} --harness claude --cmd "claude --model opus --effort high $CLAUDE_QUESTION --settings={\"env\":{\"DISABLE_AUTO_COMPACT\":\"1\"}} {item}"
+an opaque command missing Claude compaction keeps its refusal|open-terminal: launch-compaction-missing harness=claude word=--settings={"env":{"DISABLE_AUTO_COMPACT":"1"}}|${FLEET[*]} --harness claude --cmd 'true --model opus --effort high $CLAUDE_QUESTION {item}'
+an opaque command with stripped JSON keeps its refusal|open-terminal: launch-compaction-missing harness=claude word=--settings={"env":{"DISABLE_AUTO_COMPACT":"1"}}|${FLEET[*]} --harness claude --cmd "true --model opus --effort high $CLAUDE_QUESTION --settings={\"env\":{\"DISABLE_AUTO_COMPACT\":\"1\"}} {item}"
 a claude --cmd quoting only the JSON passes|passed|${FLEET[*]} --harness claude --cmd "claude --model opus --effort high $CLAUDE_QUESTION --settings='{\"env\":{\"DISABLE_AUTO_COMPACT\":\"1\"}}' {item}"
-a codex --cmd without them is refused, one word field per word|open-terminal: launch-compaction-missing harness=codex word=-c word=model_auto_compact_token_limit=9223372036854775807 word=-c word=model_auto_compact_token_limit_scope=body_after_prefix word=-c word=model_post_turn_compact_threshold_percent=0|${FLEET[*]} --harness codex --cmd 'codex -m gpt-6-astra -c model_reasoning_effort=high $CODEX_QUESTION {item}'
+a literal codex --cmd receives omitted compaction settings|passed|${FLEET[*]} --harness codex --cmd 'codex -m gpt-6-astra -c model_reasoning_effort=high $CODEX_QUESTION {item}'
 a codex --cmd carrying them passes|passed|${FLEET[*]} --harness codex --cmd 'codex -m gpt-6-astra -c model_reasoning_effort=high $CODEX_QUESTION $CODEX_WORDS {item}'
 a codex --cmd with equivalent config spellings passes|passed|${FLEET[*]} --harness codex --cmd 'codex -m gpt-6-astra -c model_reasoning_effort=high $CODEX_QUESTION --config=model_auto_compact_token_limit=9223372036854775807 --config model_auto_compact_token_limit_scope=body_after_prefix -cmodel_post_turn_compact_threshold_percent=0 {item}'
 a codex --cmd with later conflicting settings is refused|open-terminal: launch-compaction-missing harness=codex word=-c word=model_auto_compact_token_limit=9223372036854775807 word=-c word=model_auto_compact_token_limit_scope=body_after_prefix word=-c word=model_post_turn_compact_threshold_percent=0|${FLEET[*]} --harness codex --cmd 'codex -m gpt-6-astra -c model_reasoning_effort=high $CODEX_QUESTION $CODEX_WORDS -c model_post_turn_compact_threshold_percent=80 {item}'
+a codex --cmd keeps the last explicit compaction assignment|passed|${FLEET[*]} --harness codex --cmd 'codex -m gpt-6-astra -c model_reasoning_effort=high $CODEX_QUESTION -c model_post_turn_compact_threshold_percent=80 $CODEX_WORDS {item}'
+a codex --cmd keeps question removal at its effective final value|passed|${FLEET[*]} --harness codex --cmd 'codex -m gpt-6-astra -c model_reasoning_effort=high -c features.default_mode_request_user_input=true $CODEX_QUESTION {item}'
+a codex --cmd refuses an effective question override|open-terminal: launch-question-tool-missing harness=codex|${FLEET[*]} --harness codex --cmd 'codex -m gpt-6-astra -c model_reasoning_effort=high $CODEX_QUESTION --config=features.default_mode_request_user_input=true {item}'
+a codex delimiter keeps positional config words out of effective settings|passed|${FLEET[*]} --harness codex --cmd 'codex -m gpt-6-astra -c model_reasoning_effort=high $CODEX_QUESTION -- -c model_post_turn_compact_threshold_percent=80 {item}'
+a competing Claude tool list refuses without being merged|open-terminal: launch-option-conflict harness=claude option=--disallowedTools|--harness claude --cmd 'claude --model opus --effort high --disallowedTools=OtherTool {item}'
+a competing Pi tool list refuses without being replaced|open-terminal: launch-option-conflict harness=pi option=--exclude-tools|--harness pi --cmd 'pi --model github-copilot/gpt-6.1-sol --thinking high --exclude-tools other {item}'
+a complete opaque Claude command retains its checks|passed|${FLEET[*]} --harness claude --cmd "env KEEP=1 \$CLAUDE_TEMPLATE"
 a codex --cmd with shell control flow stays unverified|open-terminal: launch-compaction-missing harness=codex word=-c word=model_auto_compact_token_limit=9223372036854775807 word=-c word=model_auto_compact_token_limit_scope=body_after_prefix word=-c word=model_post_turn_compact_threshold_percent=0|${FLEET[*]} --harness codex --cmd 'codex -m gpt-6-astra -c model_reasoning_effort=high $CODEX_QUESTION $CODEX_WORDS {item}; true'
 a fleet --cmd naming no harness is refused|open-terminal: unsupported-for-oversee harness=none|${FLEET[*]} --cmd 'claude --model opus {item}'
 opencode in a fleet is refused|open-terminal: unsupported-for-oversee harness=opencode|${FLEET[*]} --harness opencode --launch-flags '--model m'
@@ -389,8 +398,8 @@ control() { # NAME OLD NEW
 control unsupported-ctrl '*) ot_message unsupported-for-oversee "harness=${LAUNCH_HARNESS:-none}" >&2; return 1 ;;' $'*) : \'ot_message unsupported-for-oversee "harness=${LAUNCH_HARNESS:-none}" >&2; return 1\' ;;'
 assert_eq "$(OT="$CTRL_OT" launch unsupported-ctrl "${FLEET[@]}" --harness opencode --launch-flags '--model m')" passed \
   "control: without its refusal an opencode fleet launch passes the gate"
-control compaction-missing-ctrl 'ot_message launch-compaction-missing "harness=$LAUNCH_HARNESS" "${compaction_fields[@]}" >&2' ': '
-assert_eq "$(OT="$CTRL_OT" launch compaction-missing-ctrl "${FLEET[@]}" --harness claude --cmd "claude --model opus --effort high $CLAUDE_QUESTION {item}")" passed \
+control compaction-missing-ctrl 'if [[ "$compaction_present" != true ]]; then' 'if [[ "$compaction_present" != true ]] && false; then'
+assert_eq "$(OT="$CTRL_OT" launch compaction-missing-ctrl "${FLEET[@]}" --harness claude --cmd "true --model opus --effort high $CLAUDE_QUESTION {item}")" passed \
   "control: without its refusal a --cmd fleet lane keeps its compaction on"
 # The words compared with the command's quoting stripped rather than removed as
 # its shell removes it: the JSON the shell strips reads as the word.
@@ -399,7 +408,7 @@ mutate_file "$TMP_ROOT/strip-ctrl/scripts/lib/lane-launch.sh" \
   '[[ "${LAUNCH_CHOICE_ARGV[i + j]}" == "${want[j]}" ]] || continue 2' \
   '[[ "${LAUNCH_CHOICE_ARGV[i + j]}" == "${want[j]//\"/}" ]] || continue 2'
 assert_eq "$(OT="$TMP_ROOT/strip-ctrl/scripts/open-terminal" launch strip-ctrl "${FLEET[@]}" --harness claude \
-  --cmd "claude --model opus --effort high $CLAUDE_QUESTION --settings={\"env\":{\"DISABLE_AUTO_COMPACT\":\"1\"}} {item}")" passed \
+  --cmd "true --model opus --effort high $CLAUDE_QUESTION --settings={\"env\":{\"DISABLE_AUTO_COMPACT\":\"1\"}} {item}")" passed \
   "control: compared unquoted, a word whose JSON the shell strips passes the gate"
 printf '{"compaction":{"enabled":false}}\n' > "$PI_AGENT/settings.json"
 pi_carrier old

@@ -819,9 +819,11 @@ launch_choice_compaction_off() { # HARNESS
 # quotes and backslashes removed as the shell removes them, and nothing
 # expanded, since TEXT is a caller's command and evaluating it would run it.
 LAUNCH_CHOICE_ARGV=()
+LAUNCH_CHOICE_COMMAND_END=0
 launch_choice_shell_words() { # TEXT [literal]
   local text="$1" literal="${2:-}" i=0 n c next word="" inword=false quote="" braces=0
   LAUNCH_CHOICE_ARGV=()
+  LAUNCH_CHOICE_COMMAND_END=0
   n=${#text}
   while (( i < n )); do
     c="${text:i:1}"
@@ -853,6 +855,7 @@ launch_choice_shell_words() { # TEXT [literal]
       case "$c" in
         ' ' | $'\t' | $'\n')
           if [[ "$inword" == true ]]; then
+            [[ ${#LAUNCH_CHOICE_ARGV[@]} -ne 0 ]] || LAUNCH_CHOICE_COMMAND_END=$i
             LAUNCH_CHOICE_ARGV+=("$word")
             word="" inword=false braces=0
           fi
@@ -865,7 +868,66 @@ launch_choice_shell_words() { # TEXT [literal]
     i=$((i + 1))
   done
   [[ "$literal" != literal || -z "$quote" ]] || return 1
+  [[ ${#LAUNCH_CHOICE_ARGV[@]} -ne 0 || "$inword" != true ]] || LAUNCH_CHOICE_COMMAND_END=$n
   [[ "$inword" != true ]] || LAUNCH_CHOICE_ARGV+=("$word")
+}
+
+# Only a literal harness command declares an insertion point. Keep its shell
+# tail intact: the shared lead builder serializes its own fixed words, never
+# caller arguments that can be empty or contain newlines.
+LAUNCH_CHOICE_TEMPLATE="" LAUNCH_CHOICE_TEMPLATE_REASON="" LAUNCH_CHOICE_TEMPLATE_OPTION=""
+LAUNCH_CHOICE_TEMPLATE_LITERAL=false
+launch_choice_template() { # HARNESS MODEL TEXT
+  local harness="$1" model="$2" text="$3" end i j option candidate value expected span found prefix="" tok
+  local -a tail=() lead=()
+  LAUNCH_CHOICE_TEMPLATE="$text" LAUNCH_CHOICE_TEMPLATE_REASON="" LAUNCH_CHOICE_TEMPLATE_OPTION=""
+  LAUNCH_CHOICE_TEMPLATE_LITERAL=false
+  if ! launch_choice_shell_words "$text" literal || [[ "${LAUNCH_CHOICE_ARGV[0]:-}" != "$harness" ]]; then return 0; fi
+  LAUNCH_CHOICE_TEMPLATE_LITERAL=true
+  end=$LAUNCH_CHOICE_COMMAND_END
+  tail=("${LAUNCH_CHOICE_ARGV[@]}")
+  launch_choice_lead_settings --question-off --model "$model" "$harness" || return 1
+  lead=(${LAUNCH_CHOICE_KEPT[@]+"${LAUNCH_CHOICE_KEPT[@]}"})
+  i=0
+  while (( i < ${#lead[@]} )); do
+    tok="${lead[i]}" option="${lead[i]%%=*}" expected="${lead[i]}" span=1 found=false
+    if [[ "$tok" == -c ]]; then
+      # Codex config assignments use the effective-config reader below.
+      span=2
+    elif [[ "$tok" != *=* && "${lead[i+1]:-}" != -* && -n "${lead[i+1]:-}" ]]; then
+      span=2 expected="${lead[i+1]}"
+    fi
+    if [[ "$tok" != -c ]]; then
+      for ((j = 1; j < ${#tail[@]}; j++)); do
+        candidate="${tail[j]%%=*}"
+        [[ "${tail[j]}" != -- ]] || break
+        # These upstream aliases name the same competing list option. Their
+        # duplicate semantics cannot establish a safe merge with our prefix.
+        case "$harness:$candidate" in
+          claude:--disallowed-tools) candidate=--disallowedTools ;;
+          pi:-xt) candidate=--exclude-tools ;;
+        esac
+        [[ "$candidate" == "$option" ]] || continue
+        found=true value="${tail[j]}"
+        if [[ "$tok" == *=* ]]; then
+          if [[ "$value" != *=* ]]; then value="$option=${tail[j+1]:-}"; fi
+        elif [[ "$span" -eq 2 ]]; then
+          if [[ "$value" == *=* ]]; then value="${value#*=}"; else value="${tail[j+1]:-}"; fi
+        fi
+        if [[ "$value" != "$expected" ]]; then
+          LAUNCH_CHOICE_TEMPLATE_REASON=launch-option-conflict LAUNCH_CHOICE_TEMPLATE_OPTION="$option"
+          return 1
+        fi
+      done
+    fi
+    if [[ "$found" != true ]]; then
+      for ((j = 0; j < span; j++)); do
+        prefix+=" $(lane_single_quote "${lead[i+j]}")"
+      done
+    fi
+    i=$((i + span))
+  done
+  LAUNCH_CHOICE_TEMPLATE="${text:0:end}$prefix${text:end}"
 }
 
 # Whether TEXT, a caller's command, hands its command WORDS as consecutive
@@ -1388,12 +1450,11 @@ lane_launch_form() { # CMD HARNESS LANE_DIR [TEMPLATE]
   fi
 }
 
-# Carry only compaction overrides from the normalized command we execute.
-# The launch check and child environment use this same reader, so accepting a
-# custom command also establishes its evidence. No stored default enters it.
-# Shell text with no literal Codex argv clears inherited evidence.
-lane_launch_compaction_env() { # CMD HARNESS [LITERAL_BRIEF]
-  local cmd="$1" harness="$2" word assignment overrides="" settings='{}' i text rendered
+# Read literal Codex config assignments once, with their effective final
+# values. Admission and child evidence select their own requirement keys.
+# No stored default enters this launch-argument reading.
+lane_launch_config_values() { # CMD HARNESS [LITERAL_BRIEF]
+  local cmd="$1" harness="$2" word assignment settings='{}' i text rendered
   if [[ "$harness" == codex ]] && launch_choice_shell_words "$cmd" literal \
       && [[ "${LAUNCH_CHOICE_ARGV[0]:-}" == codex ]]; then
     # open-terminal quotes a bare {brief} as one literal value. Substitute
@@ -1422,17 +1483,24 @@ lane_launch_compaction_env() { # CMD HARNESS [LITERAL_BRIEF]
       [[ -n "$assignment" ]] || continue
       settings=$(jq -cn --argjson settings "$settings" --arg assignment "$assignment" '
         ($assignment | capture("^\\s*(?<key>[^=]+?)\\s*=(?<value>.*)$")? // {}) as $a
-        | if ($a.key == "model_auto_compact_token_limit"
-              or $a.key == "model_auto_compact_token_limit_scope"
-              or $a.key == "model_post_turn_compact_threshold_percent")
-          then $settings + {($a.key): ($a.value | gsub("^\\s+|\\s+$"; "")
-                | if startswith("\"") and endswith("\"") then .[1:-1] else . end)}
-          else $settings end') || return 1
+        | if $a.key == null then $settings
+          else $settings + {($a.key): ($a.value | gsub("^\\s+|\\s+$"; ""))} end') || return 1
     done
-    if [[ "$settings" != '{}' ]]; then
-      overrides=$(jq -cnS --arg harness "$harness" --argjson settings "$settings" \
-        '{harness:$harness,settings:$settings}') || return 1
-    fi
+  fi
+  printf '%s\n' "$settings"
+}
+
+# Replace inherited evidence, including with empty evidence for opaque shell.
+lane_launch_compaction_env() { # CMD HARNESS [LITERAL_BRIEF]
+  local settings overrides=""
+  settings=$(lane_launch_config_values "$@") || return 1
+  settings=$(jq -c 'with_entries(select(.key == "model_auto_compact_token_limit"
+    or .key == "model_auto_compact_token_limit_scope"
+    or .key == "model_post_turn_compact_threshold_percent"))
+    | map_values(if startswith("\"") and endswith("\"") then .[1:-1] else . end)' <<<"$settings") || return 1
+  if [[ "$settings" != '{}' ]]; then
+    overrides=$(jq -cnS --arg harness "$2" --argjson settings "$settings" \
+      '{harness:$harness,settings:$settings}') || return 1
   fi
   printf 'ORCH_COMPACTION_OVERRIDES=%s' "$(lane_single_quote "$overrides")"
 }

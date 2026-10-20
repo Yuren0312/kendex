@@ -423,7 +423,8 @@ export ORCH_MODEL_LINES_HELD=1
 preference_select() {
   local preference_entry preference_rc preference_word preference_record preference_mode="$TERMINAL_MODE"
   local preference_lane_dir preference_pick_args preference_refused=""
-  local preference_index=0 preference_room="" preference_err
+  local preference_index=0 preference_room="" preference_err preference_part preference_quoted
+  local -a preference_template_mode=()
   if [[ -z "$preference_mode" ]]; then
     if tmux_server_named; then preference_mode=tmux; else preference_mode=gui; fi
   fi
@@ -500,7 +501,8 @@ preference_select() {
   fi
   [[ -n "$PREFERENCE_ENTRY" ]] || { ot_message lane-unavailable "walk=$ORCH_LANE_PREFERENCE" >&2; return 1; }
   ol_model_line "$OL_ENTRY_WARNING"
-  ol_launch_flags --question-off "$OL_ENTRY_HARNESS" "$OL_ENTRY_MODEL" "$OL_ENTRY_EFFORT" \
+  if [[ "$HOST_LAUNCH" != cloud-session && ( -n "$CMD_INPUT" || -n "$BRIEF_FILE" ) ]]; then preference_template_mode=(--custom-template); fi
+  ol_launch_flags --question-off ${preference_template_mode[@]+"${preference_template_mode[@]}"} "$OL_ENTRY_HARNESS" "$OL_ENTRY_MODEL" "$OL_ENTRY_EFFORT" \
     "$OL_ENTRY_MODEL" "$preference_harness" ${preference_input[@]+"${preference_input[@]}"} || {
     ot_message lane-resolution-failed "entry=$PREFERENCE_ENTRY" "step=$OL_REASON" >&2; return 1;
   }
@@ -514,8 +516,17 @@ preference_select() {
   elif [[ -n "$CMD_INPUT" || -n "$BRIEF_FILE" ]]; then
     CMD_TEMPLATE="$OL_ENTRY_HARNESS"
     for preference_word in ${OL_FLAGS[@]+"${OL_FLAGS[@]}"}; do
-      if [[ "$preference_word" == '{brief}' ]]; then CMD_TEMPLATE+=" {brief}"
-      else CMD_TEMPLATE+=" $(printf %q "$preference_word")"; fi
+      preference_quoted=""
+      while [[ "$preference_word" == *"{brief}"* ]]; do
+        preference_part="${preference_word%%\{brief\}*}"
+        [[ -z "$preference_part" ]] || preference_quoted+="$(lane_single_quote "$preference_part")"
+        preference_quoted+="{brief}"
+        preference_word="${preference_word#*\{brief\}}"
+      done
+      if [[ -n "$preference_word" || -z "$preference_quoted" ]]; then
+        preference_quoted+="$(lane_single_quote "$preference_word")"
+      fi
+      CMD_TEMPLATE+=" $preference_quoted"
     done
     if [[ "$CMD_TEMPLATE" != *"{brief}"* && ( -z "$CMD_INPUT" || "$CMD_INPUT" == *"{brief}"* ) ]]; then
       CMD_TEMPLATE+=" {brief}"
@@ -571,6 +582,34 @@ case "$HOST_LAUNCH" in
 esac
 }
 host_launch_judge || exit 1
+# Judges the one text a caller writes as shell, a --cmd template before its
+# {brief} is filled, and prints the key of the refusal it earns, or nothing.
+# A brief given as --brief-file is quoted by start_cmd and never reaches it.
+# GUI launches use Bash, while tmux uses the pane shell. Their common rule is
+# that a backslash cannot escape a quote from inside single quotes.
+#
+#   brief-quoted          a {brief} inside a quote, or behind a backslash:
+#                         start_cmd supplies the brief's own single quotes, so
+#                         a quote around them closes early, word-splits or
+#                         expands the brief, and a backslash escapes the first
+#   cmd-unbalanced-quote  the template ends with a quote still open
+cmd_template_quote_refusal() { # TEXT
+  local text="$1" quote="" char escaped=false i
+  for ((i = 0; i < ${#text}; i++)); do
+    char="${text:i:1}"
+    if [[ "${text:i:7}" == "{brief}" && ( -n "$quote" || "$escaped" == true ) ]]; then
+      printf 'brief-quoted\n'
+      return
+    fi
+    if [[ "$escaped" == true ]]; then escaped=false; continue; fi
+    if [[ "$quote" != "'" && "$char" == \\ ]]; then escaped=true; continue; fi
+    if [[ -z "$quote" && ( "$char" == "'" || "$char" == '"' ) ]]; then quote="$char"
+    elif [[ "$char" == "$quote" ]]; then quote=""
+    fi
+  done
+  [[ -z "$quote" ]] || printf 'cmd-unbalanced-quote\n'
+}
+
 # The brief a --cmd template places as {brief}, read once, here, from the file
 # the caller wrote. The caller never quotes it: start_cmd renders it through
 # a local prompt file or lane_single_quote on the hosted path, so each shell
@@ -589,6 +628,7 @@ elif [[ "$CMD_TEMPLATE" == *"{brief}"* ]]; then
   ot_message brief-file-missing "option=--cmd" >&2
   exit 1
 fi
+BRIEF_INPUT="$BRIEF_TEXT"
 # The launch brief is the declared interface, not a harness status read.
 # The tier is the orch workflow the launched command runs: the template with
 # the brief it places, or with no template open-terminal's own, which runs
@@ -699,6 +739,16 @@ fi
 # most one of the two non-empty, so this is the launch's single text and not a
 # precedence between two.
 launch_judge() {
+local template_refusal question_expected question_actual
+BRIEF_TEXT="$BRIEF_INPUT"
+if [[ -n "$BRIEF_FILE" && "$HOST_LAUNCH" != cloud-session && "$BRIEF_TEXT" != *"$LAUNCH_UNATTENDED_TEXT"* ]] \
+    && ! launch_choice_phrase_present "$LAUNCH_UNATTENDED_TEXT" "$CMD_TEMPLATE"; then
+  BRIEF_TEXT+=$'\n\n'"$LAUNCH_UNATTENDED_TEXT"
+fi
+if [[ -n "$CMD_TEMPLATE" ]]; then
+  template_refusal="$(cmd_template_quote_refusal "$CMD_INPUT")" || return 1
+  [[ -z "$template_refusal" ]] || { ot_message "$template_refusal" "item=${ITEMS[0]}" >&2; return 1; }
+fi
 LAUNCH_TEXT="$CMD_TEMPLATE"
 [[ -n "$LAUNCH_TEXT" ]] || LAUNCH_TEXT="$LAUNCH_FLAGS"
 
@@ -766,12 +816,21 @@ if [[ -n "$LANE" && -n "$(launch_choice_row "$LAUNCH_HARNESS")" ]]; then
   [[ "$launch_choice_missing" != true ]] || return 1
 fi
 
-# Every command start_cmd builds carries the words its harness row names to
-# take the question tool away, and a --cmd template, rendered verbatim, has to
-# carry them itself; a harness whose row names none keeps its tool. Keyed on the same harness as the gate above and
-# asked whether or not a --lane is named, because an item launched here is a
-# lane on any account; a launch naming no harness has no row and is not asked.
-# A reading of the words that fails is refused as their absence, never skipped.
+# Assemble before admission so the checks and execution consume one template.
+# Preference selection rebuilds from CMD_INPUT on every rejudge.
+LAUNCH_CHOICE_TEMPLATE_LITERAL=false
+if [[ -n "$CMD_TEMPLATE" && -n "$LAUNCH_HARNESS" ]]; then
+  if ! launch_choice_template "$LAUNCH_HARNESS" "$LAUNCH_MODEL" "$CMD_TEMPLATE"; then
+    ot_message "${LAUNCH_CHOICE_TEMPLATE_REASON:-launch-assembly-failed}" "harness=$LAUNCH_HARNESS" \
+      "option=$LAUNCH_CHOICE_TEMPLATE_OPTION" >&2
+    return 1
+  fi
+  CMD_TEMPLATE="$LAUNCH_CHOICE_TEMPLATE"
+  LAUNCH_TEXT="$CMD_TEMPLATE"
+fi
+
+# Opaque commands retain their existing checks. A literal Codex command uses
+# the same last-assignment reader as its compaction check and child evidence.
 LAUNCH_QUESTION_OFF=""
 if ! LAUNCH_QUESTION_OFF="$(launch_choice_question_off "$LAUNCH_HARNESS")" \
    || { [[ -n "$CMD_TEMPLATE" && -n "$LAUNCH_QUESTION_OFF" ]] \
@@ -782,6 +841,16 @@ if ! LAUNCH_QUESTION_OFF="$(launch_choice_question_off "$LAUNCH_HARNESS")" \
   for question_word in ${question_words[@]+"${question_words[@]}"}; do question_fields+=("word=$question_word"); done
   ot_message launch-question-tool-missing "harness=$LAUNCH_HARNESS" ${question_fields[@]+"${question_fields[@]}"} >&2
   return 1
+fi
+
+if [[ "$LAUNCH_CHOICE_TEMPLATE_LITERAL" == true && "$LAUNCH_HARNESS" == codex ]]; then
+  question_expected=$(lane_launch_config_values "codex $LAUNCH_QUESTION_OFF" codex) || return 1
+  question_actual=$(lane_launch_config_values "$CMD_TEMPLATE" codex "$BRIEF_TEXT") || return 1
+  if ! jq -en --argjson expected "$question_expected" --argjson actual "$question_actual" \
+      '$expected | to_entries | all(.[]; . as $e | $actual[$e.key] == $e.value)' >/dev/null; then
+    ot_message launch-question-tool-missing "harness=$LAUNCH_HARNESS" >&2
+    return 1
+  fi
 fi
 
 # Every lane is briefed with the unattended words: start_cmd puts them in
@@ -805,8 +874,8 @@ fi
 # session whose window nothing can name would run it into its wall with neither
 # a handoff nor a compaction, so each harness is admitted only where both halves
 # hold:
-#   claude  its words from the launch-choice table, which a --cmd template has
-#           to carry itself as it carries the question-tool words, on a model
+#   claude  its words from the launch-choice table, supplied before admission
+#           for supported literal templates, on a model
 #           whose window the claude adapter names
 #   codex   the same words; its rollout names its own window
 #   pi      its settings file turning compaction off and an installed
@@ -881,7 +950,7 @@ if [[ "$FLEET" == true && "$WAKE" != true ]]; then
       compaction_present=true
       if [[ -n "$CMD_TEMPLATE" ]]; then
         if [[ "$LAUNCH_HARNESS" == codex ]]; then
-          compaction_actual=$(lane_launch_compaction_env "$CMD_TEMPLATE" codex) || return 1
+          compaction_actual=$(lane_launch_compaction_env "$CMD_TEMPLATE" codex "$BRIEF_TEXT") || return 1
           compaction_expected=$(lane_launch_compaction_env "codex $LAUNCH_COMPACTION_OFF" codex) || return 1
           [[ "$compaction_actual" == "$compaction_expected" ]] || compaction_present=false
         else
@@ -1743,8 +1812,7 @@ start_cmd() { # ITEM MAIL_ID REPO [SESSION_ID] [WAKE_DIR] [BRIEF_PATH]
   # Trailing space only when flags are present, so an unflagged launch renders
   # the exact command a human would type rather than a double-spaced one.
   # The harness's launch-only settings and its question-tool words lead once.
-  # A --cmd template returned above with the caller's settings or the ones
-  # the preference builder supplied.
+  # A custom template returned above after its shared pre-admission assembly.
   local flags="" tok
   local -a flag_tokens=()
   # read -a splits on IFS without globbing; a bare `for tok in $LAUNCH_FLAGS`
@@ -1850,8 +1918,8 @@ start_cmd() { # ITEM MAIL_ID REPO [SESSION_ID] [WAKE_DIR] [BRIEF_PATH]
 # read back to confirm it, are lib/lane-launch.sh's one decision, shared with
 # every other launcher. Asked once per item for local account launches:
 # a --host launch runs its command on another machine,
-# where this PATH answers about the wrong one, and a --cmd template is the
-# caller's own command, not ours to rewrite.
+# where this PATH answers about the wrong one. A custom template keeps its
+# executable and account-selection route after mandatory-setting assembly.
 #
 # A HOSTED launch carries no lane env prefix at
 # all: its credential reaches the sandbox through `lane-host create`, which
@@ -1867,34 +1935,6 @@ cmd_template_text() { # ITEM REPO
   local out="${CMD_TEMPLATE//\{issue\}/$1}"
   out="${out//\{item\}/$1}"
   printf '%s\n' "${out//\{repo\}/$2}"
-}
-
-# Judges the one text a caller writes as shell, a --cmd template before its
-# {brief} is filled, and prints the key of the refusal it earns, or nothing.
-# A brief given as --brief-file is quoted by start_cmd and never reaches it.
-# GUI launches use Bash, while tmux uses the pane shell. Their common rule is
-# that a backslash cannot escape a quote from inside single quotes.
-#
-#   brief-quoted          a {brief} inside a quote, or behind a backslash:
-#                         start_cmd supplies the brief's own single quotes, so
-#                         a quote around them closes early, word-splits or
-#                         expands the brief, and a backslash escapes the first
-#   cmd-unbalanced-quote  the template ends with a quote still open
-cmd_template_quote_refusal() { # TEXT
-  local text="$1" quote="" char escaped=false i
-  for ((i = 0; i < ${#text}; i++)); do
-    char="${text:i:1}"
-    if [[ "${text:i:7}" == "{brief}" && ( -n "$quote" || "$escaped" == true ) ]]; then
-      printf 'brief-quoted\n'
-      return
-    fi
-    if [[ "$escaped" == true ]]; then escaped=false; continue; fi
-    if [[ "$quote" != "'" && "$char" == \\ ]]; then escaped=true; continue; fi
-    if [[ -z "$quote" && ( "$char" == "'" || "$char" == '"' ) ]]; then quote="$char"
-    elif [[ "$char" == "$quote" ]]; then quote=""
-    fi
-  done
-  [[ -z "$quote" ]] || printf 'cmd-unbalanced-quote\n'
 }
 
 # The composer of the main TUI, at column 0: the harness's prompt marker
@@ -4187,12 +4227,6 @@ for raw in "${ITEMS[@]}"; do
     continue
   fi
   cmd="$(start_cmd "$item" "$wt_id" "$repo")"
-  if [[ -n "$CMD_TEMPLATE" ]]; then
-    # The classifier only prints, so a failed substitution is the shell's own
-    # failure, which the shell has already reported.
-    if ! quote_refusal="$(cmd_template_quote_refusal "$CMD_INPUT")"; then exit 1; fi
-    [[ -z "$quote_refusal" ]] || { ot_message "$quote_refusal" "item=$item" >&2; exit 1; }
-  fi
   # The worktree create is the ownership claim: exit 75 means another session
   # holds this item, which skips it without touching its siblings. Any other
   # failure is this item's alone — the batch continues so one broken item

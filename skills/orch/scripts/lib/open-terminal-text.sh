@@ -35,7 +35,7 @@ ot_message() { # REASON FIELD=VALUE...
     desktop-harness) text='Use the Codex Desktop thread tools for this harness.' ;;
     unsupported-for-oversee) text='No harness adapter reads this fleet lane'"'"'s context window, so nothing would judge its handoff mark. Nothing was launched. harness=none is a launch naming no harness; reason=no-window-read is a Pi whose installed pi-hooks sends no context_window on its Stop payload, so install the current pi-hooks. harness=copilot is refused where what judges its handoff is not where the lane loads it. reason=no-context-hooks: neither scope field, the .github/hooks of the item'"'"'s worktree and the hooks of the COPILOT_HOME the lane runs under, holds all three of the lane-mail-check, lane-mail-compact and lane-mail-start Copilot hooks, each its .sh beside its .json, so no turn end would judge the lane; lane-mail-start writes the lead record lane-mail-check needs before it takes a context reading or a compaction flag as the lane'"'"'s. The worktree is made from the item'"'"'s base, so the project scope holds only what is committed and pushed on that base, and hooks kendex rendered into the caller'"'"'s checkout alone never reach it: commit them on the base, or install them through kendex in the global scope of that COPILOT_HOME. The item'"'"'s worktree stands, so launch it again with --relaunch after the fix, which rebases a clean worktree onto its base. reason=no-context-reader: that COPILOT_HOME could not be made to run the kendex-lane-context Copilot extension, the reader of the lane'"'"'s context, at the file field, its extensions/kendex-lane-context/extension.mjs or its settings.json, whose enabledFeatureFlags.EXTENSIONS turns extensions on: detail=disabled is an EXTENSIONS flag set false, the operator'"'"'s choice, which open-terminal never overrides, and there the lane is admitted only on the fallback reader, the session record the account'"'"'s statusLine command writes, which failed as cause= names: settings.json must run copilot-statusline as its statusLine command, an executable file refreshed at an interval under 120 seconds, as references/copilot-runtime.md shows, so set EXTENSIONS true, remove it, or set that statusLine; detail=unreadable a file that cannot be read, or settings that are no JSON object or carry an EXTENSIONS flag that is no boolean; detail=unwritable a file that could not be written; detail=pending-unwritable is the directory the file field names, where the extension leaves each session'"'"'s pending marker, the mark that keeps a turn end from judging an earlier reading as room while a newer one is being recorded, which could not be made or written under the HOME this launch runs with. Fix the file and launch again. reason=hosted is a hosted Copilot lane, whose host home nothing here reads. reason=relative-home: the COPILOT_HOME the lane runs under, the home field, is no absolute path, so the launch would configure it and judge its hooks from this checkout while Copilot reads it from the lane'"'"'s worktree. Nothing was made. Set COPILOT_HOME to an absolute path, then launch again. reason=hooks-disabled: disableAllHooks is true in the file field, either one of the Copilot settings files that COPILOT_HOME and the item'"'"'s worktree give the lane, where no file Copilot reads after it sets it false, or the .json document of lane-mail-check, lane-mail-compact or lane-mail-start in the hook scope that holds them, which switches off the hook it registers, so Copilot would not run the lane'"'"'s hooks and no turn end or compaction would judge it. Set it false there, or for a settings file in a later file, then launch again with --relaunch. reason=hooks-unjudged: kendex hooks-off, which reads those files, could not answer, a file among them that it cannot read or parse as commented JSON included, and a kendex too old to take --hook-document, so whether the hooks run is unknown: exit is its exit status, 127 where no kendex is on PATH, answer where its answer could not be read, and scratch where the temporary file for its errors could not be made; its own words follow. Install or repair kendex, then launch again with --relaunch. A hosted lane'"'"'s host keeps the item its create made, so launch it again with --relaunch after the fix. Launch the lane on claude, codex, pi or a local copilot.' ;;
     launch-window-unknown) text='The claude adapter names no context window for this model, so this fleet lane would run with compaction off and no capacity for the shared rule to judge. Nothing was launched. Launch it on a model the window table in scripts/lib/adapters/claude.sh names.' ;;
-    launch-compaction-missing) text='This fleet --cmd command lacks the required compaction policy settings, so the handoff rule cannot rely on the expected capacity. Nothing was launched. Add the words this line names, in that order, inside the command, each quoted so the shell passes it whole: the claude word as --settings='"'"'{"env":{"DISABLE_AUTO_COMPACT":"1"}}'"'"'.' ;;
+    launch-compaction-missing) text='The custom command does not establish the required compaction settings. Nothing was launched. Use the literal harness plus --brief-file/{brief} route without competing mandatory overrides; the launcher supplies its settings.' ;;
     compaction-on) text='Pi would compact this fleet lane on its own before its handoff mark. Nothing was launched. Set compaction.enabled to false in the settings file named, and leave no project .pi/settings.json setting it back to true; the shared context rule controls handoff. A hosted lane'"'"'s host keeps the item its create made, so launch it again with --relaunch after the fix.' ;;
     pi-settings-unreadable) text='The Pi settings file named could not be read, so whether Pi would compact this fleet lane is unknown. Nothing was launched. jq'"'"'s words follow, or for a hosted lane the host'"'"'s. A hosted lane'"'"'s host keeps the item its create made, so launch it again with --relaunch after the fix.' ;;
     pi-carrier-unreadable) text='The pi-hooks carrier file named could not be read from the lane'"'"'s host, so whether its Stop payload sends the context window is unknown. Nothing was launched, but the host keeps the item its create made, so launch it again with --relaunch once the host answers. The host'"'"'s words follow.' ;;
@@ -62,8 +62,9 @@ ot_message() { # REASON FIELD=VALUE...
     lane-refused) text='A lane setting excludes or retires this lane. No window was opened.' ;;
     launch-flags-unreachable) text='These launch flags reach nothing. A --cmd launch runs its template as the whole command and no flag is appended to it, so a model, an effort or a permission word left here would be judged and recorded while the harness ran its own default. Nothing was launched. Name them inside the --cmd command, or drop --cmd and let this launcher build the harness command from --launch-flags.' ;;
     launch-model-missing) text='This lane launch names no model, so the harness would run whatever its own default is, and that default changes without notice. Nothing was launched. Name the model in the --cmd command where the launch carries its own harness argv, and in --launch-flags where it does not; spellings holds the flags this harness takes. A class field is the model class the ORCH_LANE_PREFERENCE entry names, which runs no model on this harness until its model list reaches the launch: name an exact id, or a claude class, in that entry.' ;;
-    launch-question-tool-missing) text='This lane launch leaves the harness question tool on, and a lane that calls it stops at a dialog nobody at the pane answers. Nothing was launched. Put the words this line names, in that order, inside the --cmd command; a launch without --cmd is given them by this launcher. A lane asks its overseer through lane-mail ask.' ;;
-    launch-unattended-missing) text='This lane launch leaves out the unattended words, and a lane with its question tool taken away can still ask the person in chat and end its turn waiting, idle with nobody at the pane. Nothing was launched. Put the text under this line, whole, in the brief file or inside one quoted argument of the --cmd command; a launch without --cmd is briefed with it by this launcher.' ;;
+    launch-option-conflict) text='A competing explicit mandatory option conflicts with the requirement or has unread duplicate semantics. Nothing was launched. Remove that competing override; the literal harness and file-brief route supplies the required setting without replacing caller choices.' ;;
+    launch-question-tool-missing) text='The custom command leaves the question tool on or cannot establish its removal. Nothing was launched. Use the literal harness plus --brief-file/{brief} route without competing mandatory overrides. A lane asks its overseer through lane-mail ask.' ;;
+    launch-unattended-missing) text='The inline custom command lacks unattended instructions and has no declared prompt delivery point. Nothing was launched. Move the brief to --brief-file and place bare {brief} in a literal harness command. The launcher supplies its instructions.' ;;
     launch-effort-missing) text='This lane launch names no reasoning effort, so the harness would run whatever its own default is, and that default changes without notice. Nothing was launched. Name the effort in the --cmd command where the launch carries its own harness argv, and in --launch-flags where it does not; spellings holds the flags this harness takes, one ending in = being a whole token with its value attached.' ;;
     lane-selected) text='The launch account is selected.' ;;
     pi-mail-wake-missing) text='The selected pi-hooks lists no lane mail wake, so mail cannot start a turn in this idle Pi lane. Nothing was launched. root and scope name the deciding install; update names its kendex command. Repair on the lane machine, on the host for location=hosted. For scope=global, set PI_CODING_AGENT_DIR to root before the update; resolve a home-relative host root under that host home. For scope=project, run the update from the project containing root. update-pi refuses project writes in a linked worktree with no manifest of its own and has no --project-path option: have the install owner replace that carrier from its updated declared source instead. A global update does not repair a project carrier. Repeat the original launch after repair; retry=--relaunch is required on a host because create already owns the item.' ;;
@@ -248,6 +249,13 @@ Options:
                     overrides the auto-detected tmux mode and still opens GUI
                     terminals, which receive no TMUX or TMUX_PANE.
   --cmd "..."       Custom command; {issue}, {item}, and {repo} are replaced.
+                    A literal selected-harness command receives mandatory
+                    settings before its original arguments. Complete opaque
+                    shell commands keep their text and existing checks.
+                    Missing requirements on opaque commands use the literal
+                    harness plus --brief-file/{brief} route. Competing explicit
+                    mandatory options with conflicting or unread effects refuse
+                    as launch-option-conflict; caller choices are not replaced.
                     {brief} is replaced by the --brief-file text, quoted so
                     every shell on the way reads it back verbatim, so {brief}
                     stands bare: one inside a quote or behind a backslash is
@@ -268,6 +276,10 @@ Options:
                     brief-file-missing, a path that is not a readable file as
                     brief-file-unreadable, and a file holding only whitespace
                     as brief-file-empty.
+                    Mailbox launches add unattended instructions once in memory
+                    when neither brief nor template already carries them. The
+                    caller's file stays unchanged. Cloud sessions receive their
+                    session instructions and no mailbox paragraph.
   --lane <spec>     Launch under a chosen harness account. `auto` picks the
                     account for --harness under the chooser contract in
                     `lanes --help` (pick); `auto:<h>` picks for
@@ -609,17 +621,16 @@ Options:
                       pi        --exclude-tools question
                       copilot   --no-ask-user
                     An opencode lane keeps its tool: no flag turns it off. A
-                    --cmd launch on a harness with words carries them in its
-                    command, --lane or not, or is refused as
-                    launch-question-tool-missing, one word= field per word.
+                    literal --cmd launch receives these words automatically,
+                    --lane or not. Opaque commands retain their existing checks;
+                    effective conflicting overrides still refuse.
                     Every brief built here, on every harness, and its
                     continuation line, also closes on the unattended words
                     lib/lane-launch.sh holds, which route every question
                     through lane-mail and end no turn waiting on the person.
-                    A --cmd launch naming a harness carries the text whole
-                    in its brief file or in one argument of its command, or
-                    is refused as launch-unattended-missing, printing the
-                    text.
+                    File-brief launches receive the text once in memory.
+                    Inline custom commands missing it use that declared
+                    delivery route instead of transcribing the paragraph.
   --lane-refresh    Launch each item as a refresh lane: one whose brief runs
                     kendex refresh or kendex apply with the CLI's own
                     --lane-refresh. lane-marker writes its refresh record
