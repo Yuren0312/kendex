@@ -17,7 +17,7 @@ use crate::source_read::SealedSource;
 use super::ItemWarning;
 use super::desired::{DesiredState, Withholding};
 use super::desired_kinds::{NotWritten, manifest_refusal, not_written, pin_answers};
-use super::expansion::{CatalogKey, Catalogs, Expansion, Offer, OpenCatalog};
+use super::expansion::{CatalogKey, Catalogs, Dependency, Expansion, Offer, OpenCatalog};
 
 pub(crate) mod commands;
 
@@ -134,7 +134,8 @@ pub(super) fn expand(
     catalogs: &mut Catalogs,
     state: &mut DesiredState,
 ) {
-    let every_item = DECLARING_KINDS
+    let seed = expansion.clone();
+    let every_item: VecDeque<Node> = DECLARING_KINDS
         .into_iter()
         .flat_map(|kind| {
             expansion
@@ -143,9 +144,10 @@ pub(super) fn expand(
                 .map(move |(name, _)| (kind, name.clone()))
         })
         .collect();
-    let left_out = walk(manifest, expansion, catalogs, state, every_item);
+    let left_out = walk(manifest, expansion, catalogs, state, every_item.clone());
     for (hook, tools) in left_out {
-        let withheld = withheld_past_pin(manifest, expansion, catalogs, state, &hook, &tools);
+        let withheld =
+            withheld_past_pin(manifest, &seed, catalogs, state, &every_item, &hook, &tools);
         state.withheld_past_pin.extend(
             withheld
                 .into_iter()
@@ -167,11 +169,9 @@ fn walk(
     state: &mut DesiredState,
     mut queue: VecDeque<Node>,
 ) -> BTreeMap<String, Vec<HarnessId>> {
-    // A hook's withholding is read off the companions below it, so one the
-    // queue did not start with is walked the first time it is required,
-    // grown or not: the walk past a pin starts from an expansion the first
-    // walk already filled, so every item below the hook's direct companions
-    // learns no new reason, and would otherwise go unread.
+    // A hard requirement must walk its companion at least once, even if
+    // its declaration already exists and gains no new reason or switch.
+    // In particular, a declared no-auto-skills agent now brings its skills.
     let mut seen: BTreeSet<Node> = queue.iter().cloned().collect();
     // An item is walked again whenever it learns a reason (another
     // requirer on a tool, or its switch turned on), and what it came to —
@@ -180,10 +180,9 @@ fn walk(
     // item is what stops a pair of items that require each other from
     // reporting everything twice.
     let mut wanted: BTreeMap<Node, Wanted> = BTreeMap::new();
-    // An agent's assignment edge brings only skills nothing else holds
-    // ([`held_elsewhere`]), so every agent waits until no hard edge is
-    // left to walk: a skill some item requires is held by then, however
-    // deep, and keeps its own revision.
+    // Independent hard owners settle before assignments. Assignment
+    // lineage then uses each item's stable independent, recorded or source
+    // default reading, without imposing a revision on a later hard edge.
     let mut agents: VecDeque<Node> = VecDeque::new();
     while let Some((kind, parent)) = queue.pop_front().or_else(|| agents.pop_front()) {
         // A declaration no tool here can hold installs nothing, so it needs
@@ -204,25 +203,9 @@ fn walk(
         ) else {
             continue;
         };
-        let decl = derived_decl(&parent_decl);
-        for Dep {
-            kind: dep_kind,
-            name: dep,
-            on: harnesses,
-            ..
-        } in &found.deps
-        {
-            let mut grew = false;
-            for harness in harnesses {
-                let by = InstallRef {
-                    source: decl.source.clone(),
-                    kind,
-                    name: parent.clone(),
-                    harness: *harness,
-                };
-                grew |= expansion.add(*dep_kind, dep, &decl, *harness, Reason::RequiredBy { by });
-            }
-            let node = (*dep_kind, dep.clone());
+        for dep in &found.deps {
+            let grew = add_required_dependency(expansion, kind, &parent, &parent_decl, dep);
+            let node = (dep.kind, dep.name.clone());
             if seen.insert(node.clone()) || grew {
                 match node.0 {
                     ItemKind::Agent => agents.push_back(node),
@@ -290,20 +273,46 @@ fn walk(
     left_out
 }
 
+fn add_required_dependency(
+    expansion: &mut Expansion,
+    parent_kind: ItemKind,
+    parent: &str,
+    parent_decl: &ItemDecl,
+    dep: &Dep,
+) -> bool {
+    let mut grew = false;
+    for harness in &dep.on {
+        let by = InstallRef {
+            source: parent_decl.source.clone(),
+            kind: parent_kind,
+            name: parent.to_owned(),
+            harness: *harness,
+        };
+        grew |= expansion.add_dependency(
+            dep.kind,
+            &dep.name,
+            &dep.selected,
+            *harness,
+            Reason::RequiredBy { by },
+        );
+    }
+    grew
+}
+
 /// Of `tools`, each one `hook`'s pin alone keeps it off, those the walk
 /// withholds the hook from once that pin is dropped and the hook switched
-/// on: the walk run again over what the first one settled (`walked`),
-/// that one declaration taken without its list, from the hook down
-/// through what it requires and no further, since a hook's withholding
-/// is read off its companions alone. A companion that would not run
-/// there is read as the walk reads it, at any depth, a revision
-/// disagreement included. What that walk derives and finds is dropped;
-/// only the hook's withholding is read off it.
+/// on. Replay from the declaration/set seed so the hypothetical hook's
+/// hard closure precedes assignments. A completed walk can already hold an
+/// assignment subtree from another revision, whose obsolete descendants
+/// and disagreements would then affect this answer. Only the hypothetical
+/// hook's withholding survives the replay.
+#[allow(clippy::too_many_arguments)]
 fn withheld_past_pin(
     manifest: &Manifest,
-    walked: &Expansion,
+    seed: &Expansion,
     catalogs: &mut Catalogs,
     state: &DesiredState,
+    every_item: &VecDeque<Node>,
     hook: &str,
     tools: &[HarnessId],
 ) -> Vec<HarnessId> {
@@ -315,7 +324,7 @@ fn withheld_past_pin(
     decl.enabled = true;
     let decl = decl.clone();
     let asked = super::desired::target_harnesses(&decl, &unpinned, ItemKind::Hook, catalogs.scope);
-    let mut expansion = walked.clone();
+    let mut expansion = seed.clone();
     expansion.redeclare(ItemKind::Hook, hook, &decl, asked);
     // The resolutions already read are handed on, so the second walk
     // resolves no source the first one did. It judges no pin: only the
@@ -325,8 +334,13 @@ fn withheld_past_pin(
         pinned: state.pinned.clone(),
         ..DesiredState::default()
     };
-    let from_hook = VecDeque::from([(ItemKind::Hook, hook.to_owned())]);
-    walk(&unpinned, &mut expansion, catalogs, &mut scratch, from_hook);
+    walk(
+        &unpinned,
+        &mut expansion,
+        catalogs,
+        &mut scratch,
+        every_item.clone(),
+    );
     tools
         .iter()
         .copied()
@@ -336,32 +350,6 @@ fn withheld_past_pin(
                 .contains_key(&(ItemKind::Hook, hook.to_owned(), *harness))
         })
         .collect()
-}
-
-/// The declaration a companion is planned under when nothing else
-/// declares it: derived from its parent's. The one rule for it, read by
-/// the walk to know which catalog the plan will write the companion from
-/// and by [`expand`] to add the derivation, so the two cannot read
-/// different catalogs.
-fn derived_decl(parent_decl: &ItemDecl) -> ItemDecl {
-    ItemDecl {
-        source: parent_decl.source.clone(),
-        harnesses: None,
-        // A derived installation takes the scope's own default method:
-        // its parent's is a choice about the parent.
-        method: None,
-        // The revision is not: a pinned parent read its dependency list
-        // from the pinned catalog, and the dependency's bytes must come
-        // from the same place.
-        rev: parent_decl.rev.clone(),
-        // Nor is the switch: a companion that exists only because of its
-        // parent goes off with it, or switching a hook off would leave the
-        // wrappers it brought in armed beside a judge that no longer runs.
-        // `Expansion::add` turns it back on for any other requirer that is
-        // on.
-        enabled: parent_decl.enabled,
-        env: None,
-    }
 }
 
 /// What the walk came to, on the state the planner reads: every finding,
@@ -464,6 +452,7 @@ struct Dep {
     on: Vec<HarnessId>,
     source: String,
     header: Option<HookSpec>,
+    selected: Dependency,
 }
 
 /// A hook withheld from a tool is not written there, so a hook that
@@ -883,7 +872,7 @@ fn co_install(
 /// A name is resolved in the parent's catalog, where its author wrote it.
 /// Which copy of the companion the plan writes is the expansion's to say:
 /// the declaration it already holds for that name — the person's, a set's,
-/// or the first requirer's — and [`derived_decl`] of the parent's own for
+/// or the first requirer's — and [`Expansion::dependency`] for
 /// a companion nothing else declares. The companion is read from that
 /// catalog, so the walk decides on the copy the planner writes.
 ///
@@ -963,7 +952,7 @@ fn wanted_by(
     // Each name taken to the companion it names, and that companion to
     // the catalog the plan writes it from. A name that resolves to nothing
     // derives nothing, which withholds an armed hook where it is required.
-    let mut companions: Vec<(ItemKind, String, CatalogKey)> = Vec::new();
+    let mut companions: Vec<(ItemKind, String, Dependency)> = Vec::new();
     let mut unresolved = Vec::new();
     for (_, dep_kind) in DEPENDENT_KINDS
         .iter()
@@ -988,10 +977,8 @@ fn wanted_by(
                 unresolved.extend(on.iter().copied());
                 continue;
             };
-            let planned = expansion
-                .decl_of(*dep_kind, &dep)
-                .unwrap_or_else(|| derived_decl(parent_decl));
-            companions.push((*dep_kind, dep, (planned.source, planned.rev)));
+            let selected = expansion.dependency(kind, parent, *dep_kind, &dep);
+            companions.push((*dep_kind, dep, selected));
         }
     }
     if kind == ItemKind::Hook && wanted.armed {
@@ -1091,10 +1078,8 @@ fn agent_assignment(
 /// keeps its own declaration, revision and reasons, with no revision
 /// disagreement, finding or reason from this edge. Only its switch
 /// follows the agent: one brought in parked is switched on while the
-/// agent is on ([`walk`]), never one the person declared off. [`walk`]
-/// reads every agent after the hard edges, so which skills are held does
-/// not turn on walk order; [`wanted_by`] drops the findings on the skills
-/// this edge does bring.
+/// agent is on ([`walk`]), never one the person declared off.
+/// [`wanted_by`] drops the findings on the skills this edge does bring.
 fn held_elsewhere(expansion: &Expansion, agent: &str, skill: &str) -> bool {
     match expansion.derived_from(ItemKind::Skill, skill) {
         Some(Reason::RequiredBy { by }) => by.kind != ItemKind::Agent || by.name != agent,
@@ -1210,7 +1195,7 @@ fn derive(
     parent: &str,
     harnesses: &[HarnessId],
     requires_on: Option<&[String]>,
-    companions: Vec<(ItemKind, String, CatalogKey)>,
+    companions: Vec<(ItemKind, String, Dependency)>,
     manifest: &Manifest,
     catalogs: &mut Catalogs,
     state: &mut DesiredState,
@@ -1221,10 +1206,11 @@ fn derive(
     let withholds = kind == ItemKind::Hook && wanted.armed;
     // Every companion's catalog is opened before any is read, since an
     // open may move what is already open.
-    for (_, _, key) in &companions {
-        catalogs.get(&key.0, key.1.as_deref(), state);
+    for (_, _, selected) in &companions {
+        catalogs.get(&selected.decl.source, selected.decl.rev.as_deref(), state);
     }
-    for (dep_kind, dep, key) in companions {
+    for (dep_kind, dep, selected) in companions {
+        let key = (selected.decl.source.clone(), selected.decl.rev.clone());
         let harnesses = dependency_harnesses(dep_kind, harnesses, requires_on);
         let source = key.0.as_str();
         let found = &mut wanted.findings;
@@ -1244,6 +1230,7 @@ fn derive(
                     catalog,
                     &path,
                     source,
+                    selected,
                     wanted,
                 );
                 wanted.deps.push(landed);
@@ -1397,6 +1384,7 @@ fn companion(
     catalog: &OpenCatalog,
     path: &std::path::Path,
     source: &str,
+    selected: Dependency,
     wanted: &mut Wanted,
 ) -> Dep {
     let header = hook_header(&catalog.sealed, dep_kind, path);
@@ -1457,6 +1445,7 @@ fn companion(
         on,
         source: source.to_owned(),
         header: header.ok().flatten(),
+        selected,
     }
 }
 

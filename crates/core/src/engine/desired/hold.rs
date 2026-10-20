@@ -59,15 +59,38 @@ enum Owner {
     },
 }
 
-/// The declarations one installation is here under, following a dependency
-/// up to whatever asked for its parent.
+impl Owner {
+    /// Whether `manifest` still declares this owner under the source the
+    /// lock recorded for it: the identity [`held_manifest`] matches an
+    /// exemption by.
+    fn declared_in(&self, manifest: &Manifest) -> bool {
+        match self {
+            Owner::Item { kind, name, source } => manifest
+                .declared(*kind)
+                .get(name)
+                .is_some_and(|decl| &decl.source == source),
+            Owner::Bundle { name, source } => manifest
+                .bundles
+                .get(name)
+                .is_some_and(|decl| &decl.source == source),
+        }
+    }
+}
+
+/// The declarations one item is here under, following a dependency up to
+/// whatever asked for its parent.
 ///
 /// A dependency reads its own bytes from the catalog its parent was read
 /// at, so what has to be pinned to recover it is the declaration that
-/// brought the parent in, not anything of its own. `seen` is the cycle
-/// guard: two skills may require each other on purpose — and it keys on
-/// the source too, so a package installed from two of them is walked once
-/// per installation rather than once per name.
+/// brought the parent in, not anything of its own.
+///
+/// The item is its `(kind, name, source)`, the identity every consumer of
+/// the answer keys on: a pin, a reservation and an exemption each speak
+/// for every harness copy at once. Its lock entries are one per harness
+/// and can carry different reasons — assigned by an agent on one tool,
+/// required by a skill on another — so each item reads the union of its
+/// copies' reasons. Asked of one copy, the answer would turn on which
+/// harness name sorts first.
 ///
 /// Every reference is followed by the source it records, never by name
 /// alone: the edge names which parent, and which bundle, this dependency
@@ -80,24 +103,50 @@ enum Owner {
 /// and always names its sets — it carries their revision onto what it
 /// requires, so a set that owns a parent has to read fresh whatever the
 /// target's own declaration says.
-fn owners_of(
-    lock: &Lock,
-    entry: &LockEntry,
-    seen: &mut BTreeSet<(ItemKind, String, String)>,
+fn owners_of<'a>(
+    reasons: &Reasons<'a>,
+    kind: ItemKind,
+    name: &'a str,
+    source: &'a str,
     carriers: bool,
 ) -> BTreeSet<Owner> {
-    if !seen.insert((entry.kind, entry.name.clone(), entry.source.clone())) {
-        return BTreeSet::new();
-    }
     let mut owners = BTreeSet::new();
-    for reason in &entry.reasons {
+    walk_owners(
+        reasons,
+        (kind, name, source),
+        carriers,
+        &mut BTreeSet::new(),
+        &mut owners,
+    );
+    owners
+}
+
+/// [`owners_of`]'s walk. `visited` is one set for the whole walk: two
+/// skills may require each other on purpose, and an item reached by two
+/// paths names the same owners on both, because what it contributes
+/// depends on its own reasons alone — every parent walks with `carriers`
+/// set, and the agent arm decides per item. Only the root reads the
+/// caller's `carriers`, and a cycle back to it stops there.
+fn walk_owners<'a>(
+    reasons: &Reasons<'a>,
+    item: (ItemKind, &'a str, &'a str),
+    carriers: bool,
+    visited: &mut BTreeSet<(ItemKind, &'a str, &'a str)>,
+    owners: &mut BTreeSet<Owner>,
+) {
+    if !visited.insert(item) {
+        return;
+    }
+    let (kind, name, source) = item;
+    let own = || Owner::Item {
+        kind,
+        name: name.to_owned(),
+        source: source.to_owned(),
+    };
+    for &reason in reasons.get(&item).into_iter().flatten() {
         match reason {
             Reason::Requested => {
-                owners.insert(Owner::Item {
-                    kind: entry.kind,
-                    name: entry.name.clone(),
-                    source: entry.source.clone(),
-                });
+                owners.insert(own());
             }
             Reason::MemberOf { bundle } if carriers => {
                 owners.insert(Owner::Bundle {
@@ -106,23 +155,35 @@ fn owners_of(
                 });
             }
             Reason::MemberOf { .. } => {}
-            Reason::RequiredBy { by } => {
-                // A copy of the guard per parent, not one shared between
-                // them. One item is one entry per tool and those entries
-                // can carry different reasons — requested for one tool,
-                // carried by a set for another — so a shared guard stops at
-                // the first and drops every owner the rest would have
-                // named. The guard is here to stop a cycle, not to visit a
-                // parent once.
-                for parent in lock.entries.values().filter(|parent| {
-                    parent.kind == by.kind && parent.name == by.name && parent.source == by.source
-                }) {
-                    owners.extend(owners_of(lock, parent, &mut seen.clone(), true));
-                }
+            Reason::RequiredBy { by } if kind == ItemKind::Skill && by.kind == ItemKind::Agent => {
+                owners.insert(own());
             }
+            Reason::RequiredBy { by } => walk_owners(
+                reasons,
+                (by.kind, &by.name, &by.source),
+                true,
+                visited,
+                owners,
+            ),
         }
     }
-    owners
+}
+
+/// Every reason `lock` records for each item, keyed by its
+/// `(kind, name, source)` and unioned across its harness copies: what
+/// [`walk_owners`] reads at each item it visits. A caller builds it once
+/// for all its walks, so no walk rescans the lock at every ancestor.
+type Reasons<'a> = BTreeMap<(ItemKind, &'a str, &'a str), Vec<&'a Reason>>;
+
+fn reasons_by_item(lock: &Lock) -> Reasons<'_> {
+    let mut reasons: Reasons<'_> = BTreeMap::new();
+    for entry in lock.entries.values() {
+        reasons
+            .entry((entry.kind, &entry.name, &entry.source))
+            .or_default()
+            .extend(&entry.reasons);
+    }
+    reasons
 }
 
 /// The synthetic pins one held plan wrote — exactly these and nothing else
@@ -130,6 +191,7 @@ fn owners_of(
 #[derive(Default)]
 pub(crate) struct HeldPins {
     pins: Vec<HeldPin>,
+    reservations: Vec<HeldPin>,
     selectors: BTreeMap<(String, Held), Option<crate::lock::DeclaredSelector>>,
 }
 
@@ -174,6 +236,27 @@ impl HeldPins {
         &self.pins
     }
 
+    pub(crate) fn reservations(&self) -> &[HeldPin] {
+        &self.reservations
+    }
+
+    /// The held readings a plan consumed: every pin, since a pin rewrote
+    /// the planning manifest every reader of it consumes, then each
+    /// reservation whose `(source, held)` the plan's expansion read
+    /// through. A reservation no planned item read seeded nothing and is
+    /// left out.
+    pub(crate) fn read_by(&self, read: &BTreeSet<(String, Held)>) -> Vec<HeldPin> {
+        let reserved = self
+            .reservations
+            .iter()
+            .filter(|pin| read.contains(&(pin.source.clone(), pin.held.clone())));
+        self.pins.iter().chain(reserved).cloned().collect()
+    }
+
+    fn all(&self) -> impl Iterator<Item = &HeldPin> {
+        self.pins.iter().chain(&self.reservations)
+    }
+
     /// Remove the synthetic pins from a manifest the plan is about to
     /// write. Every pinned declaration had no `rev` before the hold, so
     /// clearing it restores the declaration exactly.
@@ -192,17 +275,27 @@ impl HeldPins {
     fn release_where(&mut self, manifest: &mut Manifest, release: impl Fn(&HeldPin) -> bool) {
         let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pins)
             .into_iter()
-            .partition(release);
+            .partition(&release);
         for pin in &gone {
             self.selectors
                 .remove(&(pin.source.clone(), pin.held.clone()));
         }
         HeldPins {
             pins: gone,
+            reservations: Vec::new(),
             selectors: BTreeMap::new(),
         }
         .unpin(manifest);
         self.pins = kept;
+        self.reservations.retain(|pin| {
+            if release(pin) {
+                self.selectors
+                    .remove(&(pin.source.clone(), pin.held.clone()));
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -242,7 +335,7 @@ pub(crate) fn held_planning<'a>(
     let (mut planning, mut pins) = planning_manifest(manifest, lock, options);
     crate::source::check_catalog_compatibility(env, scope, &planning)?;
     if let Some(pins) = pins.as_mut() {
-        release_unserved(env, options, planning.to_mut(), pins)?;
+        release_unserved(env, scope, options, planning.to_mut(), pins)?;
         crate::source::check_catalog_compatibility(env, scope, &planning)?;
         // An add retains the installed packages instead of reconciling
         // them; its existing dependency refusal must still see their pins.
@@ -250,7 +343,7 @@ pub(crate) fn held_planning<'a>(
             .update_only
             .as_ref()
             .is_some_and(|targets| targets.reach == Reach::Carriers);
-        if options.keep_source_records && reconciles && !pins.pins.is_empty() {
+        if options.keep_source_records && reconciles && pins.all().next().is_some() {
             loop {
                 let mut state = super::DesiredState::default();
                 let expanded =
@@ -299,8 +392,13 @@ fn planning_manifest<'a>(
 /// keep the record and release unserved pins. A hold that does not keep
 /// source records keeps every pin, so `verify --at-record` still reports
 /// what the record names.
+///
+/// A reservation is fetched for only where this plan reads it: most are
+/// for items nothing reaches, a removed package's among them, and a write
+/// that fetched for those would refuse offline over a read it never makes.
 fn release_unserved(
     env: &Env,
+    scope: &Scope,
     options: &super::super::PlanOptions,
     held: &mut Manifest,
     pins: &mut HeldPins,
@@ -313,60 +411,145 @@ fn release_unserved(
         pins,
         |repo, commit| crate::remote::serves(env, repo, commit),
         |repo| crate::remote::fetch_mirror(env, repo),
+        |held, pins| consumed(env, scope, held, pins),
     )
+}
+
+/// The reservations a walk of `held` reads: one a planned item reads
+/// through, or one whose commit the walk tried to open. The second is how
+/// a reservation at a commit the cache cannot serve shows: its catalog
+/// resolves pending, so nothing is planned from it and no item names it.
+fn consumed(
+    env: &Env,
+    scope: &Scope,
+    held: &Manifest,
+    pins: &HeldPins,
+) -> BTreeSet<(String, Held)> {
+    let mut state = super::DesiredState::default();
+    let read =
+        super::super::expansion::expand(env, scope, held, Some(pins), &mut state).held_readings();
+    pins.reservations
+        .iter()
+        .map(|pin| (pin.source.clone(), pin.held.clone(), pin.commit.clone()))
+        .filter(|(source, held, commit)| {
+            read.contains(&(source.clone(), held.clone()))
+                || state.pinned.contains_key(&(source.clone(), commit.clone()))
+        })
+        .map(|(source, held, _)| (source, held))
+        .collect()
 }
 
 /// [`release_unserved`] against the cache reads it is handed: `serves`
 /// answers whether a commit can be read here, `fetch` brings a repository's
-/// mirror current. Each commit is asked about once, and again once after
-/// its repository is fetched; each repository holding a commit `serves`
-/// refuses is fetched once, and a pin still refused after that is gone. A
-/// fetch that fails proves nothing about what upstream holds, so the write
-/// is refused and every pin stays. A pin on a switched-off source is read
-/// by nothing this pass, as the resolvers skip it, so it is neither asked
-/// about nor fetched for, and stays.
+/// mirror current, `consumed` names the reservations a walk of the
+/// manifest reads. Each commit is asked about once, and again once after
+/// its repository is fetched; each repository is fetched at most once.
+///
+/// Every repository holding a pin `serves` refuses is fetched, and a pin
+/// still refused after that is gone. A reservation is only asked about:
+/// one still refused in a repository fetched for a pin is gone too. Where
+/// one is refused in a repository nobody fetched, the walk is asked which
+/// reservations it reads, and only their repositories are fetched; a
+/// reservation still refused there is gone, and one nothing reads stays,
+/// unasked of upstream. A fetch that fails proves nothing about what
+/// upstream holds, so the write is refused and every hold stays. A hold on
+/// a switched-off source is read by nothing this pass, as the resolvers
+/// skip it, so it is neither asked about nor fetched for, and stays.
 fn release(
     held: &mut Manifest,
     pins: &mut HeldPins,
     serves: impl Fn(&str, &str) -> bool,
-    mut fetch: impl FnMut(&str) -> Result<()>,
+    fetch: impl FnMut(&str) -> Result<()>,
+    consumed: impl FnOnce(&Manifest, &HeldPins) -> BTreeSet<(String, Held)>,
 ) -> Result<()> {
-    let mut served: BTreeMap<(String, String), bool> = BTreeMap::new();
-    let mut fetching: BTreeMap<String, String> = BTreeMap::new();
-    for pin in &pins.pins {
-        if !held
-            .sources
+    let read = |held: &Manifest, pin: &HeldPin| {
+        held.sources
             .get(&pin.source)
             .is_some_and(|decl| decl.enabled)
-        {
-            continue;
-        }
-        let commit = (pin.repo.clone(), pin.commit.clone());
-        if !*served
-            .entry(commit)
-            .or_insert_with(|| serves(&pin.repo, &pin.commit))
-        {
-            fetching
-                .entry(pin.repo.clone())
-                .or_insert_with(|| pin.source.clone());
-        }
+    };
+    let mut cache = Availability {
+        served: BTreeMap::new(),
+        fetched: BTreeSet::new(),
+        serves,
+        fetch,
+    };
+    let pinned: Vec<HeldPin> = pins
+        .pins
+        .iter()
+        .filter(|pin| read(held, pin))
+        .cloned()
+        .collect();
+    cache.fetch_for(&pinned)?;
+    let unfetched: Vec<HeldPin> = pins
+        .reservations
+        .iter()
+        .filter(|pin| read(held, pin) && !cache.serves(pin) && !cache.fetched.contains(&pin.repo))
+        .cloned()
+        .collect();
+    pins.release_where(held, |pin| cache.gone(pin));
+    if unfetched.is_empty() {
+        return Ok(());
     }
-    for (repo, source) in &fetching {
-        if fetch(repo).is_err() {
-            return Err(CoreError::SourcePending {
-                name: source.clone(),
-            });
-        }
-    }
-    for ((repo, commit), readable) in &mut served {
-        if !*readable && fetching.contains_key(repo) {
-            *readable = serves(repo, commit);
-        }
-    }
-    pins.release_where(held, |pin| {
-        served.get(&(pin.repo.clone(), pin.commit.clone())) == Some(&false)
-    });
+    let wanted = consumed(held, pins);
+    let reads: Vec<HeldPin> = unfetched
+        .into_iter()
+        .filter(|pin| wanted.contains(&(pin.source.clone(), pin.held.clone())))
+        .collect();
+    cache.fetch_for(&reads)?;
+    pins.release_where(held, |pin| cache.gone(pin));
     Ok(())
+}
+
+/// [`release`]'s answers so far: what `serves` said of each commit, and
+/// which repositories were fetched.
+struct Availability<S, F> {
+    served: BTreeMap<(String, String), bool>,
+    fetched: BTreeSet<String>,
+    serves: S,
+    fetch: F,
+}
+
+impl<S: Fn(&str, &str) -> bool, F: FnMut(&str) -> Result<()>> Availability<S, F> {
+    fn serves(&mut self, pin: &HeldPin) -> bool {
+        *self
+            .served
+            .entry((pin.repo.clone(), pin.commit.clone()))
+            .or_insert_with(|| (self.serves)(&pin.repo, &pin.commit))
+    }
+
+    /// Fetch, once each, the repositories holding a commit of `holds` that
+    /// `serves` refuses, then ask again about every refused commit in them.
+    fn fetch_for(&mut self, holds: &[HeldPin]) -> Result<()> {
+        let mut fetching: BTreeMap<String, String> = BTreeMap::new();
+        for pin in holds {
+            if !self.serves(pin) && !self.fetched.contains(&pin.repo) {
+                fetching
+                    .entry(pin.repo.clone())
+                    .or_insert_with(|| pin.source.clone());
+            }
+        }
+        for (repo, source) in &fetching {
+            if (self.fetch)(repo).is_err() {
+                return Err(CoreError::SourcePending {
+                    name: source.clone(),
+                });
+            }
+            self.fetched.insert(repo.clone());
+        }
+        for ((repo, commit), readable) in &mut self.served {
+            if !*readable && fetching.contains_key(repo) {
+                *readable = (self.serves)(repo, commit);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this hold's commit is still refused after its repository
+    /// was fetched: gone from upstream, not merely unfetched.
+    fn gone(&self, pin: &HeldPin) -> bool {
+        self.fetched.contains(&pin.repo)
+            && self.served.get(&(pin.repo.clone(), pin.commit.clone())) == Some(&false)
+    }
 }
 
 /// The manifest a single-package update plans from: the targets read
@@ -495,7 +678,88 @@ fn held_manifest(
             selector,
         );
     }
+    reserve_readings(manifest, lock, &exempt, keeps_records, &mut pins);
     (held, pins)
+}
+
+/// Installed derived items have their own reads. Reservations grant no
+/// installation or user choice and are consulted only by a reached edge.
+///
+/// An item is reserved only where no declaration the planning manifest
+/// still holds owns it: a member of a live set reads the set's revision,
+/// and a dependency of a live declaration reads its requirer's. An item
+/// whose owners are all gone — an assigned skill, or one whose
+/// declaration or set the person removed — keeps its own record. An item
+/// the person keeps removed installs from nothing, so it reserves nothing.
+///
+/// The manifest declares no item revision for an undeclared item, so a
+/// write that keeps records releases a reservation only on the source
+/// revision. An item revision its record carries was copied from the
+/// declaration it once came in under, not chosen for it.
+fn reserve_readings(
+    manifest: &Manifest,
+    lock: &Lock,
+    exempt: &BTreeSet<Owner>,
+    keeps_records: bool,
+    pins: &mut HeldPins,
+) {
+    let reasons = reasons_by_item(lock);
+    let mut seen = BTreeSet::new();
+    for entry in lock.entries.values() {
+        if !PLANNED_KINDS.contains(&entry.kind)
+            || manifest.declared(entry.kind).contains_key(&entry.name)
+            || manifest.is_held_back(entry.kind, &entry.name)
+            || !seen.insert((entry.kind, entry.name.clone(), entry.source.clone()))
+        {
+            continue;
+        }
+        let own = Owner::Item {
+            kind: entry.kind,
+            name: entry.name.clone(),
+            source: entry.source.clone(),
+        };
+        if exempt.contains(&own)
+            || owners_of(&reasons, entry.kind, &entry.name, &entry.source, true)
+                .iter()
+                .any(|owner| exempt.contains(owner) || owner.declared_in(manifest))
+        {
+            continue;
+        }
+        let Some(repo) = held_repo(manifest, lock, &entry.source, keeps_records) else {
+            continue;
+        };
+        let source_rev = manifest
+            .sources
+            .get(&entry.source)
+            .and_then(|decl| decl.rev.as_deref());
+        if keeps_records
+            && lock.entries.values().any(|other| {
+                other.kind == entry.kind
+                    && other.name == entry.name
+                    && other
+                        .selector
+                        .as_ref()
+                        .is_some_and(|old| old.source_rev.as_deref() != source_rev)
+            })
+        {
+            continue;
+        }
+        let Some(reading) = held_at(lock, entry.kind, &entry.name, &entry.source, repo) else {
+            continue;
+        };
+        let pin = HeldPin {
+            held: Held::Item {
+                kind: entry.kind,
+                name: entry.name.clone(),
+            },
+            source: entry.source.clone(),
+            repo: repo.to_owned(),
+            commit: reading.commit,
+        };
+        pins.selectors
+            .insert((pin.source.clone(), pin.held.clone()), reading.selector);
+        pins.reservations.push(pin);
+    }
 }
 
 /// The declarations one target leaves unpinned: its own, and, for an item
@@ -549,18 +813,27 @@ fn exempted_by(manifest: &Manifest, lock: &Lock, target: &Held, reach: Reach) ->
     // Its installations under that source, and the declarations they came
     // in under. An entry a rebind left behind is an installation of a
     // package this declaration is not, and its edges lead to
-    // declarations this update has no business unpinning.
-    for entry in lock.entries.values().filter(|entry| {
-        entry.kind == target.0
-            && entry.name == target.1
-            && reads_from
-                .as_ref()
-                .is_none_or(|source| &entry.source == source)
-    }) {
+    // declarations this update has no business unpinning. A derived
+    // target is every source the lock installed it from.
+    let sources: BTreeSet<&str> = lock
+        .entries
+        .values()
+        .filter(|entry| {
+            entry.kind == target.0
+                && entry.name == target.1
+                && reads_from
+                    .as_ref()
+                    .is_none_or(|source| &entry.source == source)
+        })
+        .map(|entry| entry.source.as_str())
+        .collect();
+    let reasons = reasons_by_item(lock);
+    for source in sources {
         exempt.extend(owners_of(
-            lock,
-            entry,
-            &mut BTreeSet::new(),
+            &reasons,
+            target.0,
+            &target.1,
+            source,
             reads_from.is_none(),
         ));
     }
@@ -569,7 +842,7 @@ fn exempted_by(manifest: &Manifest, lock: &Lock, target: &Held, reach: Reach) ->
 
 /// Native callbacks read declarations at the agreed installed commit, including
 /// explicit tracking revisions. This is an in-memory reading copy, never a write.
-pub(crate) fn installed_manifest(manifest: &Manifest, lock: &Lock) -> Manifest {
+pub(crate) fn installed_manifest(manifest: &Manifest, lock: &Lock) -> (Manifest, HeldPins) {
     let mut installed = manifest.clone();
     for kind in PLANNED_KINDS {
         for (name, decl) in installed.declared_mut(kind) {
@@ -587,7 +860,9 @@ pub(crate) fn installed_manifest(manifest: &Manifest, lock: &Lock) -> Manifest {
             decl.rev = Some(reading.commit);
         }
     }
-    installed
+    let mut pins = HeldPins::default();
+    reserve_readings(manifest, lock, &BTreeSet::new(), false, &mut pins);
+    (installed, pins)
 }
 
 /// The repository a declared source reads from, or `None` when it has
