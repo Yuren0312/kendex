@@ -577,6 +577,13 @@ environment_rows() {
 [2,"cat > tmp/podman-acceptance.sh <<'EOF'\nset -euo pipefail\nexport ACCEPTANCE=1\npodman run --rm -e ACCEPTANCE --env DISPLAY_SCALE=1 localhost/acceptance:latest\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait printenv","heredoc-then-waiter-printenv"]
 [2,"cat > tmp/podman-acceptance.sh <<'EOF'\nset -euo pipefail\nexport ACCEPTANCE=1\npodman run --rm -e ACCEPTANCE --env DISPLAY_SCALE=1 localhost/acceptance:latest\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait set","heredoc-then-waiter-set"]
 [2,"cat tmp/podman-acceptance.sh | sh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","piped-waiter-unset-launch"]
+[2,"cat tmp/podman-acceptance.sh |\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","piped-newline-waiter-unset-launch"]
+[2,"cat tmp/podman-acceptance.sh | # piped\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","piped-comment-waiter-unset-launch"]
+[2,"cat tmp/podman-acceptance.sh \u007c&\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","piped-stderr-newline-waiter-unset-launch"]
+[2,"true &&\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash -s","and-newline-waiter-unset-launch"]
+[2,"cat > tmp/podman-acceptance.sh <<'EOF'\ntimeout 5 env\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","heredoc-timeout-env-body-then-waiter"]
+[2,"cat > tmp/podman-acceptance.sh <<'EOF'\ntimeout 5 printenv\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","heredoc-timeout-printenv-body-then-waiter"]
+[2,"cat > tmp/podman-acceptance.sh <<'EOF'\ngrep -a . /proc/self/environ\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","heredoc-proc-environ-body-then-waiter"]
 [2,"bash wrap.sh step cat \"/proc/self/environ\"","waiter-forwarded-cat-quoted-path"]
 [2,"bash wrap.sh step systemctl --user 'show-environment'","waiter-forwarded-systemctl-quoted-verb"]
 [2,"bash wrap.sh step 'cat' '/proc/self/environ'","waiter-forwarded-quoted-cat-and-path"]
@@ -1482,6 +1489,8 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "receiver-body-forwarding" { swap("body_decisions[doc]=fallback", ":") }
       defect == "heredoc-list-forwarding" { swap("[ \"$compound\" = heredoc ]", "false") }
       defect == "forwarded-body-cut" { swap("if [ -n \"$forwarded_operand\" ]; then", "if false; then") }
+      defect == "adjacent-stage-join" { swap("joins[stage]=$join", "joins[stage]=$join; [ \"$stage\" -eq 0 ] || joins[stage]=${separators[$((stage - 1))]}") }
+      defect == "forwarded-body-context" { swap("environment_dump shell forwarded; then", "environment_dump shell conservative; then") }
       { print }
       END { if (changed != 1) exit 1 }
     ' "$hook_source" >"$mutant" || exit 1
@@ -1518,6 +1527,8 @@ receiver-classification|FAIL environment: receiver-python-key-inventory: exit=2 
 receiver-evidence|FAIL environment: receiver-python-heredoc-whole-0: exit=0 expected=2
 heredoc-list-forwarding|FAIL environment: heredoc-then-waiter-unset-launch: exit=2 expected=0
 forwarded-body-cut|FAIL environment: heredoc-env-body-then-waiter: exit=0 expected=2
+adjacent-stage-join|FAIL environment: piped-newline-waiter-unset-launch: exit=0 expected=2
+forwarded-body-context|FAIL environment: heredoc-timeout-env-body-then-waiter: exit=0 expected=2
 receiver-evidence|FAIL environment: receiver-python-heredoc-whole-1: exit=0 expected=2
 receiver-evidence|FAIL environment: receiver-python3-heredoc-whole-0: exit=0 expected=2
 receiver-evidence|FAIL environment: receiver-node-heredoc-whole-0: exit=0 expected=2

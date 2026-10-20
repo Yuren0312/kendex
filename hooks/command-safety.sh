@@ -801,7 +801,7 @@ environment_dump() { # command kind; arguments are already decoded data
   local single_span_re="^[^']+" ansi_span_re="^[^'\\\\]+" double_span_re='^[^"\\$`]+' comment_span_re=$'^[^\n]+'
   local tokens=() kinds=() unquoted_words=() saved_quotes=() closers=() args=() arg_kinds=() arg_unquoted=() arg_roles=() stage_roles=() stage_args=() stage_kinds=() stage_unquoted=() heredocs=() heredoc_tabs=() heredoc_expand=() heredoc_bodies=() heredoc_starts=() body_ids=() stage_sources=() stage_stdin=() executable_texts=() executable_stages=()
   local body_decisions=()
-  local starts=() ends=() separators=() decisions=() literal_inputs=() input_bodies=() file_outputs=() executable_contexts=()
+  local starts=() ends=() separators=() joins=() join="" decisions=() literal_inputs=() input_bodies=() file_outputs=() executable_contexts=()
   if [ "${2:-}" = forwarded ]; then
     forwarded_argument=1
     set -- "$1" conservative "${@:3}"
@@ -1010,7 +1010,13 @@ environment_dump() { # command kind; arguments are already decoded data
       case "${tokens[$i]}" in '|' | ';' | '&&' | '||' | '&') ;; *) continue ;; esac
     fi
     starts[stage]=$start; ends[stage]=$i
-    separators[stage]=${tokens[$i]:-end}; stage=$((stage + 1)); start=$((i + 1))
+    separators[stage]=${tokens[$i]:-end}
+    # joins[stage] is the operator from the previous nonempty stage. A newline
+    # or parenthesis records `;` and an empty stage, so a pipe, `&&`, `||` or
+    # `&` before or after one still joins the stages around it.
+    joins[stage]=$join
+    if [ "$start" -lt "$i" ] || [ "$join" = ';' ]; then join=${separators[stage]}; fi
+    stage=$((stage + 1)); start=$((i + 1))
   done
   # Forwarded input has no local data contract for the complete pipeline.
   if [ -n "$pipeline" ] && [ -n "$incoming_sources" ] && [ -n "$heredoc_input" ] && environment_main_evidence "$text" "${@:3}"; then return 0; fi
@@ -1058,7 +1064,7 @@ environment_dump() { # command kind; arguments are already decoded data
     # An empty recorded stage cannot prove how literal input will execute.
     # Existing boundaries select this main-refusal path before head parsing.
     if [ "${#literal_inputs[@]}" -gt 0 ] && [ "$stage" -gt 0 ] && [ "$start" -eq "$end" ] &&
-       [ "${separators[$((stage - 1))]}" = '|' ] && [ "${separators[$stage]}" = '&' ] &&
+       [ "${joins[$stage]}" = '|' ] && [ "${separators[$stage]}" = '&' ] &&
        environment_main_evidence "${literal_inputs[@]}"; then return 0; fi
     environment_head "$1"
     main_start=0
@@ -1085,7 +1091,7 @@ environment_dump() { # command kind; arguments are already decoded data
       if [ -z "$stdin_program" ] && { [ -n "$redirect_evidence" ] || environment_main_evidence "${args[@]}"; }; then mode=dump-unknown; fi
     fi
     # Keep pipe input before the body fallback: an opaque receiver can execute it.
-    if [ "$stage" -gt 0 ] && [ "${separators[$((stage - 1))]}" = '|' ]; then
+    if [ "${joins[$stage]}" = '|' ]; then
       data_source="$data_source$piped_source"
     fi
     file_outputs[stage]=$file_output
@@ -1138,7 +1144,7 @@ environment_dump() { # command kind; arguments are already decoded data
       if [ "$1" = shell ] && [ -z "${2:-}$incoming_sources" ] &&
          { [ -z "$compound" ] || [ "$compound" = heredoc ]; } &&
          [[ $program =~ ^(bash|sh|dash|zsh|ksh)$ ]] && [ -z "$source_pos$syntax_head" ] &&
-         { [ "$stage" -eq 0 ] || [ "${separators[$((stage - 1))]}" = ';' ]; } &&
+         { [ -z "${joins[$stage]}" ] || [ "${joins[$stage]}" = ';' ]; } &&
          { [ "${separators[$stage]}" = ';' ] || [ "${separators[$stage]}" = end ]; } &&
          [ -z "$input_redirect" ] &&
          [ "${stage_kinds[$pos]:-}" = literal ] && [[ ${stage_args[$pos]:-} != [-+]* ]] &&
@@ -1199,14 +1205,16 @@ environment_dump() { # command kind; arguments are already decoded data
     fi
     case "$mode" in dump-*) [ -z "$output" ] || mode=unrouted ;; esac
     decisions[stage]=$mode
-    piped_source=$data_source
+    # An empty stage writes no output; the pipe still carries the last command's.
+    [ "$start" -eq "$end" ] || piped_source=$data_source
   done
   # A forwarded program can run a file another stage wrote. Judge every
-  # registered body as shell source; a file-write class grants it no data.
+  # registered body as forwarded shell source; a file-write class grants it
+  # no data, and an unresolved command keeps the complete-argument check.
   if [ -n "$forwarded_operand" ]; then
     for ((doc=0; doc<${#heredocs[@]}; doc++)); do
       local command_text=${heredoc_bodies[$doc]}
-      if environment_dump shell conservative; then return 0; fi
+      if environment_dump shell forwarded; then return 0; fi
     done
   fi
   if [ -n "$main_required" ]; then
