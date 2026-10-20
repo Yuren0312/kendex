@@ -116,27 +116,49 @@ def main():
         shutil.copytree(ROOT / "skills/jarvis/tests", skills / "jarvis/tests",
                         ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copyfile(ROOT / "rust-toolchain.toml", scratch / "rust-toolchain.toml")
+        # The slowest clean text-only case took 35.412 s across four starts
+        # on the shared macOS runner. Keep headroom over that whole case.
+        timer = skills / "jarvis/scripts/lib/session.py"
+        original = timer.read_text()
+        old = "\nCALL_SECONDS = 55\n"
+        assert original.count(old) == 1, "launch-timer-replacement: expected one CALL_SECONDS = 55 line"
+        shortened = original.replace(old, "\nCALL_SECONDS = 40\n")
+        assert shortened != original
+        timer.write_text(shortened)
         clean = {}
         for name, relative, old, new, test in controls:
             env = os.environ | {"JARVIS_TEST_SKILLS": str(skills), "JARVIS_TEST_NATIVE": str(native),
                                 "JARVIS_TEST_SCRIPT": str(skills / "jarvis/scripts/jarvis-session")}
-            if test not in clean:
-                started = time.monotonic()
-                print("control: start=baseline name=" + test, flush=True)
-                baseline = subprocess.run([os.environ["JARVIS_TEST_BASH"], str(skills / "jarvis/tests/session.test.sh"),
-                                           "SessionContract." + test], env=env, capture_output=True, text=True, timeout=90)
-                print(f"control: elapsed=baseline seconds={time.monotonic() - started:.3f} name={test}", flush=True)
-                assert baseline.returncode == 0, "clean case failed: " + test + "\n" + baseline.stdout + baseline.stderr
-                clean[test] = True
-                print("control: clean=" + test, flush=True)
+            # Each harness-specific defect needs its own matching clean case,
+            # without another harness's successful launch in its timed row.
+            harness = {"Copilot text-only resume": "copilot", "Codex text-only resume": "codex"}.get(name)
+            configuration = (test, harness)
+            baseline_name = test + (" harness=" + harness if harness else "")
+            fixture = skills / "jarvis/tests/session_test.py"
+            if harness:
+                fixture_original = fixture.read_text()
+                loop = '        real_tmux = shutil.which("tmux")\n        for harness in ("copilot", "codex"):\n'
+                assert fixture_original.count(loop) == 1, "resume-harness-replacement: " + name
+                scoped = fixture_original.replace(loop, '        real_tmux = shutil.which("tmux")\n        for harness in ' + repr((harness,)) + ':\n')
+                assert scoped != fixture_original
+                fixture.write_text(scoped)
             path = skills / relative
             original = path.read_text()
-            expected = 2 if name == "retained starting owner" else 1
-            assert original.count(old) == expected, name
-            mutant = original.replace(old, new)
-            assert mutant != original
-            path.write_text(mutant)
             try:
+                if configuration not in clean:
+                    started = time.monotonic()
+                    print("control: start=baseline name=" + baseline_name, flush=True)
+                    baseline = subprocess.run([os.environ["JARVIS_TEST_BASH"], str(skills / "jarvis/tests/session.test.sh"),
+                                               "SessionContract." + test], env=env, capture_output=True, text=True, timeout=90)
+                    print(f"control: elapsed=baseline seconds={time.monotonic() - started:.3f} name={baseline_name}", flush=True)
+                    assert baseline.returncode == 0, "clean case failed: " + baseline_name + "\n" + baseline.stdout + baseline.stderr
+                    clean[configuration] = True
+                    print("control: clean=" + baseline_name, flush=True)
+                expected = 2 if name == "retained starting owner" else 1
+                assert original.count(old) == expected, name
+                mutant = original.replace(old, new)
+                assert mutant != original
+                path.write_text(mutant)
                 started = time.monotonic()
                 print("control: start=mutant name=" + name, flush=True)
                 # One assertion failure proves rejection; later subtests add no evidence.
@@ -150,6 +172,8 @@ def main():
                 print("control: rejected=" + name, flush=True)
             finally:
                 path.write_text(original)
+                if harness:
+                    fixture.write_text(fixture_original)
     print("pass: " + str(len(controls)) + " fail: 0")
 
 
