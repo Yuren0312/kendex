@@ -141,12 +141,17 @@ run_succeed() {
 # directory and arguments, to watch.log, and one `stopped` line when it is
 # stopped. Started by a succession, it first stops the live watch it replaces,
 # as the real start does for a watch whose pane is gone (that rule is
-# oversee_watch_lifecycle.sh's); where norecord exists, such a start ends
-# before it records anything, a restart that never comes up.
+# oversee_watch_lifecycle.sh's); where norecord exists, such a start exits
+# before it claims, a restart that never comes up.
 FIXTURE_WATCH="$TMP_ROOT/fixture/oversee-watch"
 cat > "$FIXTURE_WATCH" <<EOF
 #!/usr/bin/env bash
 source "$SRC_DIR/lib/watch-pid.sh"
+# The pid line the real watch adds to its job's record before anything else.
+if [[ -n "\${OVERSEE_WATCH_JOB_RECORD:-}" ]]; then
+  watch_job_pid_write "\$OVERSEE_WATCH_JOB_RECORD"
+  unset OVERSEE_WATCH_JOB_RECORD
+fi
 trap 'echo "stopped \$\$" >> "$TMP_ROOT/watch.log"; exit 143' TERM
 state=""
 prev=""
@@ -382,21 +387,21 @@ assert_eq "$RC|$FAILED_LINE|$(grep -c '^started ' "$TMP_ROOT/watch.log")" \
 watch_stop "$OLD" "$FLEET_STATE" || true
 
 # A launch the runner refuses is a notice carrying the runner's own error,
-# never a handover or a restart. The helper's: a record the runner cannot
-# write, its temporary file's path taken by a directory. The restart's: a
-# setsid that starts the helper and fails every other start.
+# never a handover or a restart. The helper's: a setsid that fails every
+# start, whose refused job leaves no record of its own behind. The restart's:
+# a setsid that starts the helper and fails every other start.
 if command -v setsid >/dev/null 2>&1; then
-  RUNNER_PART="$TMP_ROOT/work/tmp/oversee-watch.runner.part"
+  mkdir -p "$TMP_ROOT/no-start"
+  printf '#!/bin/sh\nexit 1\n' > "$TMP_ROOT/no-start/setsid"
+  chmod +x "$TMP_ROOT/no-start/setsid"
   new_caller
   fresh_output
   start_watch
-  mkdir -p "$RUNNER_PART"
   STARTED="$(grep -c '^started ' "$TMP_ROOT/watch.log")"
-  run_succeed
-  rmdir -- "$RUNNER_PART"
+  ROW_PATH="$TMP_ROOT/no-start" run_succeed
   HELPER_LINE="$(grep '^oversee-succeed: watch-restart-failed step=helper ' <<<"$OUT" || true)"
-  assert_eq "$RC|$HELPER_LINE|$(grep -c '^oversee-succeed: watch-handover ' <<<"$OUT")|$(grep -c '^started ' "$TMP_ROOT/watch.log")" \
-    "1|oversee-succeed: watch-restart-failed step=helper pid=$OLD error=record-unwritable path=$(cd "$TMP_ROOT/work/tmp" && pwd -P)/oversee-watch.runner|0|$STARTED" \
+  assert_eq "$RC|$HELPER_LINE|$(grep -c '^oversee-succeed: watch-handover ' <<<"$OUT")|$(grep -c '^started ' "$TMP_ROOT/watch.log")|$(find "$TMP_ROOT/work/tmp" -name 'oversee-watch.runner.*' | wc -l | tr -d ' ')" \
+    "1|oversee-succeed: watch-restart-failed step=helper pid=$OLD error=launch-failed status=1|0|$STARTED|0" \
     "a helper the runner refuses stops succession with the runner error"
   watch_stop "$OLD" "$FLEET_STATE" || true
 

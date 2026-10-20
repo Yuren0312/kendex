@@ -731,6 +731,9 @@ if [[ "${1:-}" == --watch-restart ]]; then
   shift
   [[ $# -ge 9 ]] || die unknown-option "arg=--watch-restart"
   watch_restart "$@"
+  # This helper's own job record (lib/watch-handover.sh § watch_job_launch),
+  # which nothing reads once the helper has run.
+  [[ -z "${OVERSEE_WATCH_JOB_RECORD:-}" ]] || rm -f -- "$OVERSEE_WATCH_JOB_RECORD"
   exit 0
 fi
 
