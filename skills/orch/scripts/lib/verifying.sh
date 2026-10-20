@@ -10,11 +10,12 @@ verifying_error() { # KEY [FIELDS...]
 }
 
 # Callers supply live parents and their direct child state facts.
-# A container whose every child is Done or Canceled is due for container-close.
-# A parent is a container unless linear's safe read reports in_pr_bundle, the
-# one tracker answer every container reader consumes.
+# A parent is due for container-close when every child is Done or Canceled
+# and its checklist records the child box. Historical children alone do not
+# show that the parent's own work moved into children.
 verifying_containers() { # SAFE_ITEMS
-  jq -c '
+  local candidates row desc parsed child_box
+  candidates="$(jq -c '
     . as $live
     | map(select(.parent_id != null and .parent_id != "")) | group_by(.parent_id)[]
     | .[0].parent_id as $pid
@@ -22,7 +23,15 @@ verifying_containers() { # SAFE_ITEMS
     | ($live[] | select(.id == $pid))
     | select(.state_type != "completed" and .state_type != "canceled")
     | select(.in_pr_bundle != true)
-    | . + {container: true}' <<<"$1"
+    | . + {container: true}' <<<"$1")" || return 1
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    desc="$(jq -r '.description // ""' <<<"$row")" || return 1
+    parsed="$(done_when_parse "$desc" '[]')" || return 1
+    child_box="$(jq -r '.child_box' <<<"$parsed")" || return 1
+    [[ "$child_box" != null ]] || continue
+    printf '%s\n' "$row"
+  done <<<"$candidates"
 }
 
 verifying_parse() { # SAFE_ROW

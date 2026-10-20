@@ -175,6 +175,8 @@ with an Evidence line naming each child's state, in the update that sets
 Done. A refusal prints each refused row on stderr, with the `remedy` for its
 cause, before
 `container-close: completion-refused parent-id=<PARENT_ID> cause=<CAUSE>`:
+`no-child-box`, a live parent whose checklist does not record that its own
+work moved into children, until that conversion is complete;
 `open-box`, any other box open or missing its Evidence, until it moves into
 its own child, whether the children were Done or every one was canceled;
 `checklist-invalid`, a Post-merge box whose fields fail the checklist rule,
@@ -313,7 +315,9 @@ CLOSE_DEFS='def pending: .state_type != "completed" and .state_type != "canceled
   def refused_child($id): .id != $id and .ok == false;
   def boxes: map(tostring) | unique | join(", ");
   def remedy($cause; $id):
-    if $cause == "open-box" then
+    if $cause == "no-child-box" then
+      "Nothing records that the work owned by \($id) moved into children. If it has, add \"- [ ] Every child Done or cancelled\" under its ## Done when, then rerun container-close."
+    elif $cause == "open-box" then
       "Move each open box of \($id) (\(.container_open_boxes | boxes)) into its own child item, then rerun container-close."
     elif $cause == "checklist-invalid" then
       "Correct the Post-merge fields of each box of \($id) that errors names (\([.errors[].box] | boxes)), then rerun container-close."
@@ -331,6 +335,7 @@ CLOSE_DECISION="$CLOSE_DEFS"'
     elif $children == [] then "refuse:no-children"
     elif any($children[]; pending) then "keep"
     elif $validation == null then "read:validation"
+    elif ($parent | pending) and ($validation.results[] | select(.id == $id) | .child_box == null) then "refuse:no-child-box"
     elif $validation.results[] | select(.id == $id) | open_box then "refuse:open-box"
     elif $validation.results[] | select(.id == $id) | checklist_invalid then "refuse:checklist-invalid"
     elif any($validation.results[]; refused_child($id)) then "refuse:child-not-ok"

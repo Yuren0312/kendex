@@ -9,7 +9,8 @@
 # the Linear API key reaches where none is set, read live through the linear
 # skill (`issues list --max [--team]`, archived and trashed issues excluded):
 #   container-parked  a parent in a non-terminal state whose children are
-#                     all Done or Canceled; container-close has not closed it
+#                     all Done or Canceled and whose Done when holds its child
+#                     box; container-close has not closed it
 #   merged-in-review  an In Review item whose branch-named PRs are all merged
 #                     (at least one), at any age — no later step moves it
 #   started-stale     an In Progress / In Review item untouched for longer
@@ -144,7 +145,7 @@ findings=0
 note() { findings=$((findings + 1)); message "$@"; }
 
 # --- container-parked --------------------------------------------------------
-# Non-terminal parents whose children (by parent identifier) are all Done or
+# Explicit containers whose children (by parent identifier) are all Done or
 # Canceled. Trashed/archived rows never count as children or parents.
 
 safe_issues="$(jq -c '{issues:{nodes: map(select((.trashed // false) == false and .archivedAt == null))}}' "$ISSUES")" \

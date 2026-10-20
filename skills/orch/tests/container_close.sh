@@ -74,7 +74,8 @@ case "$resource:$action" in
     [[ "$state" == Done ]] && type=completed
     [[ "$state" == Canceled ]] && type=canceled
     in_pr_bundle=false; [[ ! -e "$root/parent.in-pr-bundle" ]] || in_pr_bundle=true
-    printf '{"id":"PARENT-1","title":"Container","state":"%s","state_type":"%s","in_pr_bundle":%s}\n' "$state" "$type" "$in_pr_bundle"
+    printf '{"id":"PARENT-1","title":"Container","state":"%s","state_type":"%s","in_pr_bundle":%s}\n' "$state" "$type" "$in_pr_bundle" \
+      | jq --argjson facts "$(cat "$root/parent.facts" 2>/dev/null || printf '{}')" '. + $facts' 
     ;;
   issues:update)
     [[ "$#" == 3 && "$2" == --state ]] || exit 2
@@ -115,7 +116,7 @@ case "$resource:$action" in
       wrong_child_ok) printf '{"all_ok":true,"results":[{"id":"PARENT-1","has_summary":false,"ok":true,"errors":[],"container_open_boxes":[]},{"id":"CHILD-1","ok":"true"}]}\n' ;;
       missing_child_state_ok) printf '{"all_ok":false,"results":[{"id":"PARENT-1","has_summary":false,"ok":true,"errors":[],"container_open_boxes":[]},{"id":"CHILD-1","ok":false,"has_summary":true}]}\n' ;;
       missing_child_summary) printf '{"all_ok":false,"results":[{"id":"PARENT-1","has_summary":false,"ok":true,"errors":[],"container_open_boxes":[]},{"id":"CHILD-1","ok":false,"state_ok":true}]}\n' ;;
-      *) printf '{"all_ok":true,"results":[{"id":"PARENT-1","state_type":"started","has_summary":%s,"ok":true,"errors":[],"container_open_boxes":[]}]}\n' "$has_summary" ;;
+      *) printf '{"all_ok":true,"results":[{"id":"PARENT-1","state_type":"started","has_summary":%s,"ok":true,"errors":[],"container_open_boxes":[],"child_box":1}]}\n' "$has_summary" ;;
     esac
     ;;
   issues:complete)
@@ -208,7 +209,7 @@ reset_state() {
   rm -f "$FAKE_LINEAR_ROOT/complete.calls" "$FAKE_LINEAR_ROOT/complete.args" "$FAKE_LINEAR_ROOT/summary.calls"     "$FAKE_LINEAR_ROOT/summary.posted" "$FAKE_LINEAR_ROOT/summary.body" "$FAKE_LINEAR_ROOT/fail.complete.once"     "$FAKE_LINEAR_ROOT/hold.complete" "$FAKE_LINEAR_ROOT/release.complete" "$FAKE_LINEAR_ROOT/gh.mode" "$FAKE_LINEAR_ROOT/linear.calls" \
     "$FAKE_LINEAR_ROOT/complete.invocations" "$FAKE_LINEAR_ROOT/supersession.calls" "$FAKE_LINEAR_ROOT/post-done.mode" \
     "$FAKE_LINEAR_ROOT/ratelimit.complete.once" "$FAKE_LINEAR_ROOT/ratelimit.reset" "$FAKE_LINEAR_ROOT/ratelimit.hold-reset" "$HELD_DIR/summary.md" "$HELD_DIR/children.tsv" \
-    "$FAKE_LINEAR_ROOT/parent.description" "$FAKE_LINEAR_ROOT/complete.evidence" "$FAKE_LINEAR_ROOT/parent.in-pr-bundle"
+    "$FAKE_LINEAR_ROOT/parent.description" "$FAKE_LINEAR_ROOT/complete.evidence" "$FAKE_LINEAR_ROOT/parent.in-pr-bundle" "$FAKE_LINEAR_ROOT/parent.facts"
   [[ ! -d "$HELD_DIR" ]] || rmdir "$HELD_DIR"
   rm -f -- "${FAKE_LINEAR_ROOT:?}"/comments.*
   rm -rf "$FAKE_LINEAR_ROOT/complete.entries"; mkdir "$FAKE_LINEAR_ROOT/complete.entries"
@@ -228,7 +229,9 @@ close_row() { # STATE IN_PR DESCRIPTION CHILDREN BARE [SCRIPT]
   printf 'children\n' >"$FAKE_LINEAR_ROOT/validation.mode"
   [[ -z "$3" ]] || printf '%b\n' "$3" >"$FAKE_LINEAR_ROOT/parent.description"
   printf '%s\n' "$4" >"$FAKE_LINEAR_ROOT/children.json"
-  local rc=0 out id
+  local rc=0 out id facts='{}'
+  [[ -z "${7:-}" ]] || facts="$7"
+  printf '%s\n' "$facts" >"$FAKE_LINEAR_ROOT/parent.facts"
   for id in $(jq -r '.[] | select(.state_type == "completed") | .id' <<<"$4"); do
     [[ "$id" == "$5" ]] || printf '## Completion Summary\n' >"$FAKE_LINEAR_ROOT/comments.$id"
   done
@@ -249,8 +252,8 @@ ALL_CANCELED='[{"id":"CHILD-1","title":"one","state":"Canceled","state_type":"ca
 # Linear lets a team add completed states besides Done.
 COMPLETED_NOT_DONE='[{"id":"CHILD-1","title":"one","state":"Released","state_type":"completed"},{"id":"CHILD-2","title":"two","state":"Done","state_type":"completed"}]'
 READ=get,children,validate-completion
-while IFS='|' read -r row state in_pr description children bare want refused evidence summary; do
-  assert_eq "$(close_row "$state" "$in_pr" "$description" "${!children}" "$bare")" "$want" "$row decides the container's close" "$TMP_ROOT/close-row.err"
+while IFS='|' read -r row state in_pr description children bare want refused evidence summary facts; do
+  assert_eq "$(close_row "$state" "$in_pr" "$description" "${!children}" "$bare" '' "$facts")" "$want" "$row decides the container's close" "$TMP_ROOT/close-row.err"
   assert_eq "$(refused_rows)" "$refused" "$row prints each refused row with its remedy" "$TMP_ROOT/close-row.err"
   if [[ -n "$evidence" ]]; then
     assert_file_contains "$FAKE_LINEAR_ROOT/parent.description" '- [x] Every child Done or cancelled' "$row ticks the child box"
@@ -275,8 +278,25 @@ parent already Done, every child Canceled|Done|no|$CHILD_BOX_DONE|ALL_CANCELED||
 child box, every child Done|In Progress|no|$CHILD_BOX_DONE|ALL_DONE||0:closed PARENT-1:Done::$READ,complete||CHILD-1 Done, CHILD-2 Done|CHILD-1 ✓ one — PR #101;CHILD-2 ✓ two — PR #102
 child box, Done and Canceled|In Progress|no|$CHILD_BOX_DONE|DONE_AND_CANCELED||0:closed PARENT-1:Done::$READ,complete||CHILD-1 Done, CHILD-2 Canceled|CHILD-1 ✓ one — PR #101
 child box on a parent another route set Done|Done|no|$CHILD_BOX_DONE|ALL_DONE||0:closed PARENT-1:Done::$READ,complete||CHILD-1 Done, CHILD-2 Done|
-no checklist, every child Done|In Progress|no||ALL_DONE||0:closed PARENT-1:Done::$READ,complete|||CHILD-1 ✓ one — PR #101;CHILD-2 ✓ two — PR #102
+residual work after Done prerequisites|Backlog|no|## Objective\nFinish residual work|ALL_DONE||1::Backlog:completion-refused cause=no-child-box:$READ|PARENT-1=string|||{"labels":["needs-review"],"blocked_by_open":["BLOCKER-1"]}
+residual work after absorbed Canceled children|Backlog|no|## Acceptance\nFinish absorbed work|ALL_CANCELED||1::Backlog:completion-refused cause=no-child-box:$READ|PARENT-1=string|||{"labels":["needs-review"],"blocked_by_open":[]}
+no checklist, parent another route set Done|Done|no||ALL_DONE||0:closed PARENT-1:Done::$READ,complete|||
 a Canceled parent with a Done child|Canceled|no|$CHILD_BOX_DONE|DONE_AND_CANCELED||1::Canceled:completion-refused cause=parent-canceled:$READ|PARENT-1=string||
+ROWS
+
+# HT-138 and HT-52: disabling only the structural proof must restore the
+# unsafe Done and Canceled mutations. Only these close rows run the control.
+PROOF_MUTANT="$SANDBOX/skills/orch/scripts/container-close-proof-mutant"
+cp "$SCRIPT" "$PROOF_MUTANT"
+mutate_file "$PROOF_MUTANT" '.child_box == null' '(.child_box == null and false)'
+while IFS='|' read -r children state mutation; do
+  control_rc=0
+  ( FAIL=0; assert_eq "$(close_row Backlog no '' "${!children}" '' "$PROOF_MUTANT")" "1::Backlog:completion-refused cause=no-child-box:$READ" 'legacy parent stays open'; [[ "$FAIL" == 0 ]] ) >"$TMP_ROOT/proof-$children-control.log" || control_rc=$?
+  assert_eq "$control_rc" 1 "$children control rejects unsafe legacy completion"
+  assert_eq "$(cat "$FAKE_LINEAR_ROOT/parent.state"):$(tail -n 1 "$FAKE_LINEAR_ROOT/linear.calls")" "$state:issues:$mutation" "$children control reaches the unsafe mutation"
+done <<'ROWS'
+ALL_DONE|Done|complete
+ALL_CANCELED|Canceled|update
 ROWS
 
 # Controls, each in a disposable copy: a pending filter that keeps canceled
@@ -499,6 +519,7 @@ micro_child_close() { # POST_COMMAND
 while IFS='|' read -r row command want; do
   reset_state
   printf 'children\n' > "$FAKE_LINEAR_ROOT/validation.mode"
+  printf '%b\n' "$CHILD_BOX_DONE" > "$FAKE_LINEAR_ROOT/parent.description"
   printf '%s\n' '[{"id":"CHILD-1","title":"one","state":"Done","state_type":"completed"}]' > "$FAKE_LINEAR_ROOT/children.json"
   rc=0; out="$(micro_child_close "$command" 2>"$TMP_ROOT/micro-$row.err")" || rc=$?
   refusal="$(grep -o 'completion-refused parent-id=PARENT-1' "$TMP_ROOT/micro-$row.err" || true)"

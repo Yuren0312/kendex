@@ -66,18 +66,24 @@ issue() { # ID TITLE STATE_NAME STATE_TYPE UPDATED [PARENT] [DESC]
   issue "T-13" "done with open boxes"    "Done"        "completed" "$now" "" "did:\n- [x] one\n- [ ] two"
   issue "T-14" "done all checked"        "Done"        "completed" "$now" "" "did:\n- [x] one\n- [x] two"
   issue "T-15" "trashed parked"          "Todo"        "unstarted" "$now"
-  issue "T-16" "ship the widget (One PR)" "In Review"  "started"   "$now"
+  issue "T-16" "ship the widget (One PR)" "In Review"  "started"   "$now" "" $'## Done when\n- [ ] Every child Done or cancelled'
   issue "T-17" "done bundle child"       "Done"        "completed" "$now" "T-16"
   issue "T-18" "review all merged"       "In Review"   "started"   "$now"
   issue "T-19" "review open and merged"  "In Review"   "started"   "$now"
   issue "T-20" "review no own pr"        "In Review"   "started"   "$now"
-  issue "T-21" "all-canceled container"  "Todo"        "unstarted" "$now"
+  issue "T-21" "all-canceled container"  "Todo"        "unstarted" "$now" "" $'## Done when\n- [ ] Every child Done or cancelled'
   issue "T-22" "canceled only child"     "Canceled"    "canceled"  "$now" "T-21"
   issue "T-23" "in-PR root in review"    "In Review"   "started"   "$now" "" $'**In-PR bundle**: yes\n\n## Done when\n- [ ] branch work'
   issue "T-24" "canceled audit child"    "Canceled"    "canceled"  "$now" "T-23"
   issue "T-25" "in-PR root verifying"    "Verifying"   "started"   "$now" "" $'**In-PR bundle**: yes\n\n## Done when\n- [x] branch work\n  Evidence: branch read\n- [ ] Post-merge: Read health; Where: service; Why after merge: deployment; Deadline: 2026-10-04T00:00:00Z'
   issue "T-26" "done audit child"        "Done"        "completed" "$now" "T-25"
-} | jq -s 'map(if .identifier == "T-15" then .trashed = true else . end)' >"$R/.tracker-fixture/issues.json"
+  issue "T-27" "residual prerequisite work" "Backlog" "backlog" "$now" "" $'## Objective\nFinish residual work'
+  issue "T-28" "done prerequisite" "Done" "completed" "$now" "T-27"
+  issue "T-29" "absorbed canceled work" "Backlog" "backlog" "$now" "" $'## Acceptance\nFinish absorbed work'
+  issue "T-30" "canceled child" "Canceled" "canceled" "$now" "T-29"
+} | jq -s 'map(if .identifier == "T-15" then .trashed = true
+  elif .identifier == "T-27" then .labels = {nodes:[{name:"needs-review"}]} | .inverseRelations = {nodes:[{type:"blocks", issue:{identifier:"T-BLOCKER",state:{type:"started"}}}]}
+  elif .identifier == "T-29" then .labels = {nodes:[{name:"needs-review"}]} else . end)' >"$R/.tracker-fixture/issues.json"
 
 cat >"$TMP/gh-stub" <<'STUB'
 #!/usr/bin/env bash
@@ -140,23 +146,46 @@ mutate_file "$MUTANT_LIB" 'if $row.container == true then' 'if false then'
 CONTROL_OUT="$(cd "$R" && RECONCILE_GH_CLI="$TMP/gh-stub" "$MUTANT_RW" 2>&1)" || true
 assert_contains "$CONTROL_OUT" 'verifying-invalid issue=T-1' "control restores the base parser’s invalid container"
 
+# Scope the unsafe-candidate control to the two held residual parents.
+MUTANT_RW="$(mutant_scripts container-proof/orch reconcile-work-items)/reconcile-work-items" || exit 1
+ln -s "$TMP/skills/linear" "${MUTANT_RW%/orch/scripts/*}/linear"
+MUTANT_LIB="${MUTANT_RW%/*}/lib/verifying.sh"
+rm -- "${MUTANT_LIB:?}"
+cp "$SKILL_DIR/scripts/lib/verifying.sh" "$MUTANT_LIB"
+mutate_file "$MUTANT_LIB" '[[ "$child_box" != null ]] || continue' '[[ "$child_box" != null || "$child_box" == null ]] || continue'
+cp "$R/.tracker-fixture/issues.json" "$TMP/full-fixture.json"
+jq '[.[] | select(.identifier == "T-27" or .identifier == "T-28" or .identifier == "T-29" or .identifier == "T-30")]' "$TMP/full-fixture.json" >"$R/.tracker-fixture/issues.json"
+CONTROL_OUT="$(cd "$R" && RECONCILE_GH_CLI="$TMP/gh-stub" "$MUTANT_RW" 2>&1)" || true
+for id in T-27 T-29; do
+  control_rc=0
+  ( FAIL=0; assert_not_contains "$CONTROL_OUT" "container-parked issue=$id " 'legacy parent offers no closure'; [ "$FAIL" = 0 ] ) >"$TMP/proof-$id-control.log" || control_rc=$?
+  assert_eq "$control_rc" 1 "$id control rejects the unsafe container-close offer"
+done
+mv "$TMP/full-fixture.json" "$R/.tracker-fixture/issues.json"
+
 # A box beside the child box is an outcome still to move into a child; with
 # none, the container goes to container-close.
 while IFS='|' read -r outcome description expected; do
   jq --arg d "$(printf '%b' "$description")" 'map(if .identifier == "T-1" then .description = $d else . end)' "$R/.tracker-fixture/issues.json" >"$TMP/outcome.json"
   mv -- "$TMP/outcome.json" "$R/.tracker-fixture/issues.json"
   CASE_OUT="$(cd "$R" && RECONCILE_GH_CLI="$TMP/gh-stub" "$RW" 2>&1)" || true
-  assert_contains "$CASE_OUT" "$expected" "$outcome container reads its duty"
+  if [ "$expected" = absent ]; then
+    assert_not_contains "$CASE_OUT" 'container-parked issue=T-1 ' "$outcome leaves ordinary parent work open"
+    assert_not_contains "$CASE_OUT" 'verifying-empty issue=T-1' "$outcome offers no empty verification"
+    assert_not_contains "$CASE_OUT" 'verifying T-1 ' "$outcome offers no outcome read"
+  else
+    assert_contains "$CASE_OUT" "$expected" "$outcome container reads its duty"
+  fi
 done <<'ROWS'
 open-outcome|## Done when\n- [ ] Every child Done or cancelled\n- [ ] Read shared outcome|verifying T-1 box=2 trigger="outcome"
-missing-proof|## Done when\n- [x] Read shared outcome|verifying T-1 box=1 trigger="outcome"
-absent|Old acceptance criteria|reconcile-work-items: verifying-empty issue=T-1
-empty|## Done when|reconcile-work-items: verifying-empty issue=T-1
-proved|## Done when\n- [x] Read shared outcome\n  Evidence: holder read passed|reconcile-work-items: verifying-empty issue=T-1
+missing-proof|## Done when\n- [x] Read shared outcome|absent
+absent|Old acceptance criteria|absent
+empty|## Done when|absent
+proved|## Done when\n- [x] Read shared outcome\n  Evidence: holder read passed|absent
 ROWS
 
-# Only the in-PR bundle line exempts a parent; a title marks nothing.
-assert_contains "$OUT" "container-parked issue=T-16" "a legacy (One PR) parent with children is a container"
+# An explicit child box admits a parent; a title marks nothing.
+assert_contains "$OUT" "container-parked issue=T-16" "a (One PR) title preserves an explicitly converted container"
 assert_not_contains "$OUT" "container-parked issue=T-23" "an In Review in-PR bundle root with only canceled children is not container-parked"
 assert_not_contains "$OUT" "container-parked issue=T-25" "a Verifying in-PR bundle root with Done children is not container-parked"
 assert_contains "$OUT" 'verifying T-25 box=2 trigger="merge"' "a Verifying in-PR bundle root keeps its post-merge route"
@@ -175,6 +204,12 @@ assert_not_contains "$OUT" "T-12" "a stale item with a live PR stays quiet"
 assert_contains "$OUT" "done-unchecked issue=T-13" "the Done item with open boxes is reported"
 assert_not_contains "$OUT" "T-14" "a Done item with every box checked stays quiet"
 assert_not_contains "$OUT" "T-15" "a trashed row stays out of every check"
+
+for id in T-27 T-29; do
+  assert_not_contains "$OUT" "container-parked issue=$id " "$id held residual work offers no closure"
+  assert_not_contains "$OUT" "verifying-empty issue=$id" "$id held residual work offers no empty verification"
+  assert_not_contains "$OUT" "verifying $id " "$id held residual work offers no outcome read"
+done
 
 # Clean fixture: only healthy rows -> exit 0 with the clean line.
 jq '[.[] | select(.identifier == "T-5" or .identifier == "T-6" or .identifier == "T-7" or .identifier == "T-14" or .identifier == "T-11")]' \

@@ -5377,7 +5377,10 @@ owed_read() {
   if [[ -n "${LINEAR_TEAM:-}" ]]; then
     # Read child state facts only for live candidates. Historical descriptions
     # are not needed to decide whether a container is due for container-close.
-    local containers candidates children
+    local containers candidates children lib="$SKILLS_DIR/linear/scripts/lib/issue-validation.sh"
+    [[ -r "$lib" ]] || die missing-linear "" "path=$lib"
+    # shellcheck source=../../../linear/scripts/lib/issue-validation.sh
+    source "$lib"
     candidates="$(jq -r '.[] | select(.in_pr_bundle != true) | .id' <<<"$out")" \
       || die tracker-list-invalid "" "team=$LINEAR_TEAM"
     printf '%s\n' "$out" >"$WORK_DIR/container-facts.jsonl"
@@ -5484,7 +5487,6 @@ owed_accounts() { # HOST
 # Verification uses the same inventory as owed work, before queue and active
 # lane filtering. Deadlines remain per box in the issue description.
 verifying_read() { # SAFE_ITEMS
-  local lib="$SKILLS_DIR/linear/scripts/lib/issue-validation.sh"
   local rows row id branch boxes merged merged_repos repo out lines due line prior key rc floor read_dir search items
   local state="${PW_SEEN[0]}" errf="$WORK_DIR/verifying.err"
   # One record per issue, its ID, branch and row: owed_read admits no unit
@@ -5518,9 +5520,6 @@ verifying_read() { # SAFE_ITEMS
     lane_row_commit "$state"
     return 0
   fi
-  [[ -r "$lib" ]] || die missing-linear "" "path=$lib"
-  # shellcheck source=../../../linear/scripts/lib/issue-validation.sh
-  source "$lib"
   read_dir="$(mktemp -d "$WORK_DIR/verifying.XXXXXX")" || die state-write-failed "" "path=$WORK_DIR"
   while IFS=$'\037' read -r id branch row; do
     [[ -n "$id" ]] || continue

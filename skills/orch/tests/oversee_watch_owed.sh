@@ -391,12 +391,12 @@ if [[ "$PART" == all || "$PART" == membership ]]; then
 # An unmerged Triage container with complete children reaches the same
 # reader; a box beside its child box is an outcome still to move into a child.
 world verifying_container
-jq '. + [{id:"KEN-P", title:"Shared outcome", state:"Triage", state_type:"triage", parent_id:"", description:"## Done when\n- [ ] Read shared outcome at source"},
+jq '. + [{id:"KEN-P", title:"Shared outcome", state:"Triage", state_type:"triage", parent_id:"", description:"## Done when\n- [ ] Every child Done or cancelled\n- [ ] Read shared outcome at source"},
          {id:"KEN-C", title:"Done child", state:"Done", state_type:"completed", parent_id:"KEN-P"}]' "$STUB_DIR/tracker.out" >"$STUB_DIR/container.json"
 mv -- "$STUB_DIR/container.json" "$STUB_DIR/tracker.out"
 watch_pass -- --state "$STUB_DIR/state.json"
-assert_contains "$(verification_lines)" 'verifying KEN-P box=1 trigger="outcome" status=due deadline=- blocked_by=-' "the container’s open outcome is due without a merge" "$ERR"
-assert_contains "$(verification_events)" 'EVENT verifying-deadline KEN-P box=1' "the existing verification event names the container outcome" "$ERR"
+assert_contains "$(verification_lines)" 'verifying KEN-P box=2 trigger="outcome" status=due deadline=- blocked_by=-' "the container’s open outcome is due without a merge" "$ERR"
+assert_contains "$(verification_events)" 'EVENT verifying-deadline KEN-P box=2' "the existing verification event names the container outcome" "$ERR"
 assert_eq "$(owed KEN-P)" '-' "a container is not owed a development launch" "$ERR"
 MUTANT_DIR="$TMP_ROOT/container-selection"
 MUTANT_WATCH="$(mutant_scripts container-selection/orch oversee-watch)/oversee-watch" || exit 1
@@ -404,7 +404,7 @@ ln -s "$REPO_ROOT/skills/github" "$MUTANT_DIR/github"
 ln -s "$REPO_ROOT/skills/linear" "$MUTANT_DIR/linear"
 mutate_file "$MUTANT_WATCH" 'containers="$(verifying_containers "$out")"' 'containers=""'
 WATCH_BIN="$MUTANT_WATCH" watch_pass -- --state "$STUB_DIR/state.json"
-assert_not_contains "$(verification_lines)" 'verifying KEN-P box=1' "control loses the outcome when the caller omits its container" "$ERR"
+assert_not_contains "$(verification_lines)" 'verifying KEN-P box=2' "control loses the outcome when the caller omits its container" "$ERR"
 # The in-PR bundle root is the one parent that is a work item: its safe read
 # reports in_pr_bundle, and its boxes stay branch work. A title marks nothing.
 while IFS='|' read -r state title in_pr outcome owed_line; do
@@ -412,7 +412,7 @@ while IFS='|' read -r state title in_pr outcome owed_line; do
   jq --arg state "$state" --arg title "$title" --argjson in_pr "$in_pr" '. +
     [{id:"KEN-P", title:$title, state:$state, in_pr_bundle:$in_pr,
       state_type:(if $state == "In Progress" then "started" else "backlog" end), parent_id:"",
-      description: "## Done when\n- [ ] Build attention\n- [ ] Build choice\n- [ ] Wire commands\n- [ ] Test behavior"}]
+      description: "## Done when\n- [ ] Every child Done or cancelled\n- [ ] Build attention\n- [ ] Build choice\n- [ ] Wire commands\n- [ ] Test behavior"}]
     + [range(1;5) | {id:("KEN-C" + tostring), state:"Done", state_type:"completed", parent_id:"KEN-P"}]' \
     "$STUB_DIR/tracker.out" >"$STUB_DIR/parent.json"
   mv -- "$STUB_DIR/parent.json" "$STUB_DIR/tracker.out"
@@ -432,38 +432,81 @@ ln -s "$REPO_ROOT/skills/linear" "$MUTANT_DIR/linear"
 mutate_verifying "$MUTANT_WATCH" '    | select(.in_pr_bundle != true)' ''
 mutate_file "$MUTANT_WATCH" "select(.in_pr_bundle != true) | .id" ".id"
 WATCH_BIN="$MUTANT_WATCH" watch_pass -- --state "$STUB_DIR/state.json"
-assert_contains "$(verification_lines)" 'verifying KEN-P box=1 trigger="outcome"' "control misreads the in-PR bundle root's branch work as an outcome" "$ERR"
+assert_contains "$(verification_lines)" 'verifying KEN-P box=2 trigger="outcome"' "control misreads the in-PR bundle root's branch work as an outcome" "$ERR"
 assert_eq "$(owed KEN-P)" '-' "control loses the in-PR bundle root's owed development" "$ERR"
 world verifying_container
-jq '. + [{id:"KEN-P", title:"Shared outcome", state:"Triage", state_type:"triage", parent_id:"", description:"## Done when\n- [ ] Read shared outcome at source"},
+jq '. + [{id:"KEN-P", title:"Shared outcome", state:"Triage", state_type:"triage", parent_id:"", description:"## Done when\n- [ ] Every child Done or cancelled\n- [ ] Read shared outcome at source"},
          {id:"KEN-C", title:"Done child", state:"Done", state_type:"completed", parent_id:"KEN-P"}]' "$STUB_DIR/tracker.out" >"$STUB_DIR/container.json"
 mv -- "$STUB_DIR/container.json" "$STUB_DIR/tracker.out"
 watch_pass -- --state "$STUB_DIR/state.json"
 # Completed history is absent from the parent list, but direct child facts
 # still make a Triage container due. No child read visits closed history.
 assert_not_contains "$(cat "$STUB_DIR/tracker.bulk-stdin")" 'KEN-C' "closed child history is not scanned as a candidate" "$ERR"
-# A container holding only its child box, or no box, reads boxes=0 and goes
-# to container-close; any other unproved box stays an outcome line.
+# Only an explicit child box admits a container; legacy acceptance stays
+# ordinary work even when historical children are terminal.
 while IFS='|' read -r outcome description child_type expected event; do
   jq --arg d "$(printf '%b' "$description")" --arg type "$child_type" \
     'map(if .id == "KEN-P" then .description = $d elif .id == "KEN-C" then .state_type = $type else . end)' \
     "$STUB_DIR/tracker.out" >"$STUB_DIR/outcome.json"
   mv -- "$STUB_DIR/outcome.json" "$STUB_DIR/tracker.out"
   watch_pass -- --state "$STUB_DIR/state.json"
-  assert_contains "$(verification_lines)" "verifying KEN-P $expected" "$outcome container reads its duty" "$ERR"
+  if [[ "$expected" == absent ]]; then
+    assert_not_contains "$(verification_lines)" 'verifying KEN-P ' "$outcome keeps legacy work out of verification" "$ERR"
+    assert_not_contains "$(verification_events)" 'EVENT verifying-deadline KEN-P ' "$outcome offers no completion" "$ERR"
+  else
+    assert_contains "$(verification_lines)" "verifying KEN-P $expected" "$outcome container reads its duty" "$ERR"
+  fi
   [[ -z "$event" ]] || assert_contains "$(verification_events)" "EVENT verifying-deadline KEN-P $event" "$outcome container raises its event" "$ERR"
 done <<'ROWS'
-missing-proof|## Done when\n- [x] Read shared outcome at source|completed|box=1 trigger="outcome"|
+missing-proof|## Done when\n- [x] Read shared outcome at source|completed|absent|
 child-box|## Done when\n- [ ] Every child Done or cancelled|completed|boxes=0|boxes=0
-absent|Old acceptance criteria|completed|boxes=0|
-empty|## Done when|completed|boxes=0|
-proved|## Done when\n- [x] Read shared outcome at source\n  Evidence: holder read passed|completed|boxes=0|
+absent|Old acceptance criteria|completed|absent|
+empty|## Done when|completed|absent|
+proved|## Done when\n- [x] Read shared outcome at source\n  Evidence: holder read passed|completed|absent|
 all-canceled|## Done when\n- [ ] Every child Done or cancelled|canceled|boxes=0|
 ROWS
 jq 'map(if .id == "KEN-C" then .state_type = "completed" else . end)' "$STUB_DIR/tracker.out" >"$STUB_DIR/outcome.json"
 mv -- "$STUB_DIR/outcome.json" "$STUB_DIR/tracker.out"
-jq 'map(if .id == "KEN-P" then .description = "## Done when\n- [ ] Read shared outcome at source" else . end)' "$STUB_DIR/tracker.out" >"$STUB_DIR/outcome.json"
+jq 'map(if .id == "KEN-P" then .description = "## Done when\n- [ ] Every child Done or cancelled\n- [ ] Read shared outcome at source" else . end)' "$STUB_DIR/tracker.out" >"$STUB_DIR/outcome.json"
 mv -- "$STUB_DIR/outcome.json" "$STUB_DIR/tracker.out"
+
+# The held Backlog producers from HT-138 and HT-52 have residual scope
+# outside Done when. A started legacy parent must also keep its owed row.
+MUTANT_DIR="$TMP_ROOT/container-proof"
+MUTANT_WATCH="$(mutant_scripts container-proof/orch oversee-watch)/oversee-watch" || exit 1
+ln -s "$REPO_ROOT/skills/github" "$MUTANT_DIR/github"
+ln -s "$REPO_ROOT/skills/linear" "$MUTANT_DIR/linear"
+mutate_verifying "$MUTANT_WATCH" '[[ "$child_box" != null ]] || continue' '[[ "$child_box" != null || "$child_box" == null ]] || continue'
+while IFS='|' read -r name state child_type blockers want_owed; do
+  world "legacy_$name"
+  jq --arg state "$state" --arg type "$child_type" --argjson blockers "$blockers" '. + [
+    {id:"KEN-P",state:$state,state_type:(if $state == "Backlog" then "backlog" else "started" end),
+      description:"## Objective\nFinish residual work\n## Acceptance\nOwn the absorbed work",
+      labels:["needs-review"],blocked_by_open:$blockers},
+    {id:"KEN-C",state_type:$type,parent_id:"KEN-P"}]' "$STUB_DIR/tracker.out" >"$STUB_DIR/legacy.json"
+  mv -- "$STUB_DIR/legacy.json" "$STUB_DIR/tracker.out"
+  watch_pass -- --state "$STUB_DIR/state.json"
+  assert_eq "$RC" 0 "$name completes its watch pass" "$ERR"
+  assert_not_contains "$(verification_lines)" 'verifying KEN-P ' "$name offers no container verification" "$ERR"
+  assert_not_contains "$(verification_events)" 'EVENT verifying-deadline KEN-P ' "$name offers no closure event" "$ERR"
+  assert_eq "$(owed KEN-P)" "$want_owed" "$name preserves ordinary owed membership" "$ERR"
+  # Only this fixture row runs against the mutated candidate filter.
+  WATCH_BIN="$MUTANT_WATCH" watch_pass -- --state "$STUB_DIR/state.json"
+  control_rc=0
+  ( FAIL=0; assert_not_contains "$(verification_events)" 'EVENT verifying-deadline KEN-P boxes=0' 'legacy parent offers no closure'; [[ "$FAIL" == 0 ]] ) >"$TMP_ROOT/proof-$name-control.log" || control_rc=$?
+  assert_eq "$control_rc" 1 "$name control rejects the unsafe closure event" "$ERR"
+done <<'ROWS'
+prerequisites|Backlog|completed|["KEN-BLOCKER"]|-
+absorbed|Backlog|canceled|[]|-
+started|In Progress|completed|[]|owed KEN-P state=in-progress priority=- lane=none verdict=queue
+ROWS
+
+# Restore the explicit container for the bounded-request rows below.
+world verifying_container_bounded
+jq '. + [{id:"KEN-P",state:"Triage",state_type:"triage",description:"## Done when\n- [ ] Every child Done or cancelled\n- [ ] Read shared outcome at source"},
+         {id:"KEN-C",state:"Done",state_type:"completed",parent_id:"KEN-P"}]' "$STUB_DIR/tracker.out" >"$STUB_DIR/container.json"
+mv -- "$STUB_DIR/container.json" "$STUB_DIR/tracker.out"
+watch_pass -- --state "$STUB_DIR/state.json"
 
 # The server-side filter must retain Triage and exclude terminal states.
 bounded_request='issues list --team kendex --state In Progress,In Review,Verifying,Todo,Backlog,Triage --select owed --max --format=safe'
@@ -507,7 +550,7 @@ while IFS='|' read -r child_type due; do
   fleet '["KEN-A"]'
   jq -nc --arg type "$child_type" '[
     {id:"KEN-P",title:"Shared outcome",state:"Backlog",state_type:"backlog",
-      description:"## Done when\n- [ ] Read shared outcome at source"},
+      description:"## Done when\n- [ ] Every child Done or cancelled\n- [ ] Read shared outcome at source"},
     {id:"KEN-A",title:"Queued work",state:"In Progress",state_type:"started"},
     {id:"KEN-Q",title:"In-PR bundle root",state:"Todo",state_type:"unstarted",in_pr_bundle:true},
     {id:"KEN-C",title:"Closed child",state:"Done",state_type:"completed",parent_id:"KEN-P"},
@@ -518,7 +561,7 @@ while IFS='|' read -r child_type due; do
     'rc=0 reads=1' "the candidate set uses one bulk child read" "$ERR"
   assert_eq "$(cat "$STUB_DIR/tracker.bulk-stdin")" $'KEN-P\nKEN-A' "bulk children use the same open non-bundle candidates before queue filtering" "$ERR"
   assert_not_contains "$(cat "$STUB_DIR/tracker.args.all")" 'issues children ' "the pass makes no individual child read" "$ERR"
-  assert_eq "$(verification_lines | grep -c '^verifying KEN-P box=1' || true)" "$due" "$child_type child keeps exact outcome membership" "$ERR"
+  assert_eq "$(verification_lines | grep -c '^verifying KEN-P box=2' || true)" "$due" "$child_type child keeps exact outcome membership" "$ERR"
 done <<'ROWS'
 completed|1
 canceled|1
@@ -552,14 +595,14 @@ ROWS
 
 # Restore the outcome case after the separate API refusal cases.
 world verifying_container_repeat
-jq '. + [{id:"KEN-P", title:"Shared outcome", state:"Triage", state_type:"triage", parent_id:"", description:"## Done when\n- [ ] Read shared outcome at source"},
+jq '. + [{id:"KEN-P", title:"Shared outcome", state:"Triage", state_type:"triage", parent_id:"", description:"## Done when\n- [ ] Every child Done or cancelled\n- [ ] Read shared outcome at source"},
          {id:"KEN-C", title:"Done child", state:"Done", state_type:"completed", parent_id:"KEN-P"}]' "$STUB_DIR/tracker.out" >"$STUB_DIR/container.json"
 mv -- "$STUB_DIR/container.json" "$STUB_DIR/tracker.out"
 
 # The held evidence remains open on a repeated failed or unread source read.
 watch_pass -- --state "$STUB_DIR/state.json"
-assert_contains "$(verification_lines)" 'verifying KEN-P box=1' "an unproved outcome remains visible on heartbeat" "$ERR"
-jq 'map(if .id == "KEN-P" then .description = "## Done when\n- [x] Read shared outcome at source\n  Evidence: holder read passed" else . end)' "$STUB_DIR/tracker.out" >"$STUB_DIR/proved.json"
+assert_contains "$(verification_lines)" 'verifying KEN-P box=2' "an unproved outcome remains visible on heartbeat" "$ERR"
+jq 'map(if .id == "KEN-P" then .description = "## Done when\n- [ ] Every child Done or cancelled\n- [x] Read shared outcome at source\n  Evidence: holder read passed" else . end)' "$STUB_DIR/tracker.out" >"$STUB_DIR/proved.json"
 mv -- "$STUB_DIR/proved.json" "$STUB_DIR/tracker.out"
 watch_pass -- --state "$STUB_DIR/state.json"
 assert_contains "$(verification_lines)" 'verifying KEN-P boxes=0' "holder evidence requests container completion with no merge" "$ERR"
