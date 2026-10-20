@@ -533,8 +533,8 @@ for setting in '-c check_for_update_on_startup=false' '-c features.daemon_auto_s
   done
 done
 # A --cmd template keeps the caller's arguments while the launch owner supplies
-# its account environment. Execute the captured pane command to read both.
-CMD_TEMPLATE_CODEX="codex -m gpt-6-astra -c model_reasoning_effort=high -c features.default_mode_request_user_input=false {issue} '$UNATTENDED_TEXT'"
+# its required settings and account environment. Read the actual child argv.
+CMD_TEMPLATE_CODEX="codex -m gpt-6-astra -c model_reasoning_effort=high --ask-for-approval=on-request -c features.default_mode_request_user_input=false {issue} '$UNATTENDED_TEXT'"
 OT_CAPTURE="$TMP_ROOT/launch-codex-cmd.cmd" LANES_HOME="$SESSION_HOME" run_case launch-codex-cmd -- \
   --harness codex --cmd "$CMD_TEMPLATE_CODEX" CC-11
 await_file "$TMP_ROOT/launch-codex-cmd.cmd"
@@ -545,7 +545,8 @@ printf '#!%s\n' "$BASH" > "$CODEX_TEMPLATE_BIN/codex"
 cat >> "$CODEX_TEMPLATE_BIN/codex" <<'EOF'
 set -euo pipefail
 printf '%s\n' "$PWD" "${KENDEX_LANE_ORIGIN-unset}" "${KENDEX_USER_EMAIL-unset}" \
-  "${CODEX_HOME-unset}" "${ORCH_COMPACTION_OVERRIDES-unset}" "$@" > "$CODEX_TEMPLATE_RECORD"
+  "${CODEX_HOME-unset}" "${ORCH_COMPACTION_OVERRIDES-unset}" > "$CODEX_TEMPLATE_RECORD"
+printf '%s\0' "$@" > "$CODEX_TEMPLATE_RECORD.argv"
 EOF
 chmod +x "$CODEX_TEMPLATE_BIN/codex"
 codex_template_result() { # CAPTURED_PANE_COMMAND
@@ -558,33 +559,47 @@ codex_template_result() { # CAPTURED_PANE_COMMAND
   if [[ -f "$record" ]]; then cat "$record"; else printf 'child-record-missing\n'; fi
 }
 CODEX_TEMPLATE_EXPECTED="$(printf '%s\n' rc=0 "$TMP_ROOT/wt/CC-11" "$TMP_ROOT/wt/CC-11" '' \
-  "$(lane_codex_home_path "$SESSION_HOME/.codex" "$TMP_ROOT/wt/CC-11")" '' \
-  -m gpt-6-astra -c model_reasoning_effort=high -c features.default_mode_request_user_input=false \
-  CC-11 "$UNATTENDED_TEXT")"
-assert_eq "$(codex_template_result "$LAUNCH_CODEX_CMD")" "$CODEX_TEMPLATE_EXPECTED" \
-  "a codex --cmd child receives only the caller's arguments and its lane environment"
+  "$(lane_codex_home_path "$SESSION_HOME/.codex" "$TMP_ROOT/wt/CC-11")" '')"
+assert_codex_template() { # CHILD_RESULT
+  local arguments
+  assert_eq "$1" "$CODEX_TEMPLATE_EXPECTED" "the custom Codex child keeps its account and launch environment"
+  arguments="$(perl -e '
+    use strict; use warnings; local $/;
+    open my $f,"<",shift @ARGV or die $!;
+    my @actual=split /\0/,<$f>,-1; pop @actual;
+    my $tail=@actual >= @ARGV && join("\0",splice @actual,-scalar @ARGV) eq join("\0",@ARGV);
+    my $prefix="\0".join("\0",@actual)."\0";
+    my @required=qw(check_for_update_on_startup=false features.daemon_auto_start=false
+      notice.hide_rate_limit_model_nudge=true features.default_mode_request_user_input=false
+      model_auto_compact_token_limit=9223372036854775807
+      model_auto_compact_token_limit_scope=body_after_prefix model_post_turn_compact_threshold_percent=0);
+    my $mandatory=index($prefix,"\0--dangerously-bypass-hook-trust\0") >= 0;
+    for my $word (@required) { $mandatory &&= index($prefix,"\0-c\0$word\0") >= 0; }
+    print "tail=",($tail ? "preserved" : "altered"),"\nmandatory=",($mandatory ? "present" : "missing"),"\n";
+  ' "$TMP_ROOT/codex-template.record.argv" -m gpt-6-astra -c model_reasoning_effort=high \
+    --ask-for-approval=on-request -c features.default_mode_request_user_input=false CC-11 "$UNATTENDED_TEXT")" || exit 1
+  assert_eq "${arguments%%$'\n'*}" tail=preserved "the custom Codex child keeps caller model, effort, permission and argument order"
+  assert_eq "${arguments#*$'\n'}" mandatory=present "the custom Codex child receives mandatory settings before the caller tail"
+}
+assert_codex_template "$(codex_template_result "$LAUNCH_CODEX_CMD")"
 
-# Keep the caller's template in the control, but append an unwanted setting in
-# a private launch owner. The same child comparison must reject the extra argv.
-CODEX_TEMPLATE_CONTROL="$(mutant_scripts codex-template-control lib/lane-launch.sh)" || exit 1
+CODEX_TEMPLATE_CONTROL="$(mutant_scripts codex-template-control open-terminal)" || exit 1
 git -C "$TMP_ROOT/codex-template-control" init -q
 orch_fixture_shared_libs "$TMP_ROOT/codex-template-control"
-mutate_file "$CODEX_TEMPLATE_CONTROL/lib/lane-launch.sh" \
-  '"$(lane_single_quote "$cmd")"' '"$(lane_single_quote "$cmd -c check_for_update_on_startup=false")"'
+mutate_file "$CODEX_TEMPLATE_CONTROL/open-terminal" \
+  'CMD_TEMPLATE="$LAUNCH_CHOICE_TEMPLATE"' 'CMD_TEMPLATE="$CMD_TEMPLATE"'
 OT="$CODEX_TEMPLATE_CONTROL/open-terminal" OT_CAPTURE="$TMP_ROOT/launch-codex-cmd-control.cmd" \
   LANES_HOME="$SESSION_HOME" run_case launch-codex-cmd-control -- \
   --harness codex --cmd "$CMD_TEMPLATE_CODEX" CC-11
 await_file "$TMP_ROOT/launch-codex-cmd-control.cmd"
 CODEX_TEMPLATE_CONTROL_RESULT="$(codex_template_result "$(cat "$TMP_ROOT/launch-codex-cmd-control.cmd")")"
-assert_eq "$CODEX_TEMPLATE_CONTROL_RESULT" "$(printf '%s\n' "$CODEX_TEMPLATE_EXPECTED" -c check_for_update_on_startup=false)" \
-  "control: the custom command reaches Codex with an added startup setting"
 control_rc=0
 (
-  source "$TEST_DIR/lib/assertions.sh"
-  assert_eq "$CODEX_TEMPLATE_CONTROL_RESULT" "$CODEX_TEMPLATE_EXPECTED" "custom Codex command arguments"
+  FAIL=0
+  assert_codex_template "$CODEX_TEMPLATE_CONTROL_RESULT"
   [[ "$FAIL" -eq 0 ]]
 ) > "$TMP_ROOT/codex-template-control.log" || control_rc=$?
-assert_eq "$control_rc" 1 "control: the child comparison rejects the added startup setting" \
+assert_eq "$control_rc" 1 "control: missing mandatory settings fail the same custom Codex child assertions" \
   "$TMP_ROOT/codex-template-control.log"
 
 OLD_CODEX="$SESSION_HOME/.old-codex"; CROSS_CODEX=55555555-5555-5555-5555-555555555555; mkdir -p "$OLD_CODEX/sessions/2026"

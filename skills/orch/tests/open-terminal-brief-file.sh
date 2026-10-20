@@ -208,13 +208,19 @@ codex_brief_row() { # OT SURFACE ROUTE
   local ot="$1" surface="$2" route="$3" env_words="CODEX_HOME=$TMP_ROOT/codex-home" line="" args=()
   [[ "$route" != relaunch ]] || args=(--relaunch)
   ot_fleet_state "$SCRIPTS_DIR/workflow-state" "$TMP_ROOT/fleet-$RUN_SEQ" "$PWD" || exit 1
-  if [[ "$surface" == tmux ]]; then env_words+=";TMUX=stub,1,0;ORCH_TMUX_SESSION=stub"
+  if [[ "$surface" == tmux || "$surface" == hosted ]]; then env_words+=";TMUX=stub,1,0;ORCH_TMUX_SESSION=stub"
   else env_words+=";TMUX="; fi
-  run_ot "$ot" "$env_words" "--$surface" ${args[@]+"${args[@]}"} \
+  if [[ "$surface" == hosted ]]; then
+    env_words+=";ORCH_LANE_ALIASES=eclaude=work;LANE_HOST_STUB_CREATE_LINE=ssh-target=lane.example"$'\t'"path=$REMOTE_LANE"$'\t'"remote-prefix=exec bash -c"
+    args+=(--host "$HOST_STUB" --lane work --repo o/r)
+  fi
+  run_ot "$ot" "$env_words" "--${surface/hosted/tmux}" ${args[@]+"${args[@]}"} \
     --state-dir "$TMP_ROOT/fleet-$RUN_SEQ" --harness codex \
     --cmd "codex -m gpt-6-astra -c model_reasoning_effort=high {brief}" \
     --brief-file "$BRIEF_FILE" KEN-2
-  if [[ "$surface" == tmux ]]; then line="$(typed_line 'clear; source ')" || line=""
+  if [[ "$surface" == hosted ]]; then
+    line="$(awk '/^exec bash -c / { copying=1 } copying && /^paste-buffer / { exit } copying { print }' "$RUN/tmux.log")"
+  elif [[ "$surface" == tmux ]]; then line="$(typed_line 'clear; source ')" || line=""
   else line="$(gui_line)" || line=""; fi
   printf '%s\n\n%s' "$(cat "$BRIEF_FILE")" "$LAUNCH_UNATTENDED_TEXT" > "$BRIEF_WANT"
   CODEX_BRIEF_GOT="rc=$RC harness=$(received "$line") evidence=$(jq -c '[.harness,.settings.model_auto_compact_token_limit,.settings.model_auto_compact_token_limit_scope,.settings.model_post_turn_compact_threshold_percent]' "$RECEIVED_EVIDENCE" 2>/dev/null)"
@@ -231,6 +237,8 @@ ghostty|fresh
 ghostty|relaunch
 tmux|fresh
 tmux|relaunch
+hosted|fresh
+hosted|relaunch
 ROWS
 
 printf '%s' "$(cat "$BRIEF_FILE")" > "$BRIEF_WANT"
@@ -247,7 +255,10 @@ supplied_row() { # OT SURFACE HARNESS FLAGS REQUIRED
     route=(--host "$HOST_STUB" --lane work --repo o/r)
   fi
   template="$harness $flags '' 'multi"$'\n'"line' 'literal \$HOME' -- {brief}"
-  [[ "$harness" != opencode ]] || template="${template%\{brief\}}--prompt={brief}"
+  case "$harness" in
+    copilot) template="$harness $flags -i {brief}" ;;
+    opencode) template="$harness $flags --prompt={brief}" ;;
+  esac
   run_ot "$ot" "$env_words" "--${surface/hosted/tmux}" --harness "$harness" ${route[@]+"${route[@]}"} \
     --cmd "$template" --brief-file "$BRIEF_FILE" KEN-2
   if [[ "$surface" == hosted ]]; then
@@ -268,12 +279,15 @@ supplied_row() { # OT SURFACE HARNESS FLAGS REQUIRED
       use strict; use warnings; local $/;
       open my $a,"<",$ARGV[0] or die $!; my @a=split /\0/,<$a>,-1; pop @a;
       open my $b,"<",$ARGV[1] or die $!;
-      my @want=("", "multi\nline", q(literal $HOME), "--", scalar <$b>);
-      my $tail=join("\0",splice @a,-5);
+      my $brief=scalar <$b>;
+      my @want=$ARGV[3] eq "copilot" ? ("-i", $brief)
+        : $ARGV[3] eq "opencode" ? ($brief)
+        : ("", "multi\nline", q(literal $HOME), "--", $brief);
+      my $tail=join("\0",splice @a,-scalar @want);
       exit 1 unless $tail eq join("\0",@want);
       my @required=split /\n/,$ARGV[2];
       for my $word (@required) { exit 1 unless grep { $_ eq $word } @a; }
-    ' "$RECEIVED_ARGV" "$BRIEF_WANT" "$required"; then SUPPLIED_GOT+=' argv=preserved'; else SUPPLIED_GOT+=' argv=altered'; fi
+    ' "$RECEIVED_ARGV" "$BRIEF_WANT" "$required" "$harness"; then SUPPLIED_GOT+=' argv=preserved'; else SUPPLIED_GOT+=' argv=altered'; fi
   else SUPPLIED_GOT+=' argv=missing'; fi
   cmp -s "$BRIEF_FILE" "$TMP_ROOT/brief.original" && SUPPLIED_GOT+=' caller=unchanged' || SUPPLIED_GOT+=' caller=altered'
 }
@@ -331,6 +345,20 @@ CONTROL_RC=0
   [[ "$FAIL" -eq 0 ]]
 ) > "$RUN/evidence-assertion.out" 2>&1 || CONTROL_RC=$?
 assert_eq "$CONTROL_RC" 1 "control: reading the original command fails the same normalized Codex evidence assertion" "$RUN/evidence-assertion.out"
+
+HOSTED_EVIDENCE_OT="$(mutant_scripts brief-hosted-codex-evidence open-terminal)/open-terminal" || exit 1
+orch_fixture_shared_libs "$TMP_ROOT/brief-hosted-codex-evidence"
+mutate_file "$HOSTED_EVIDENCE_OT" 'if [[ "$HARNESS" == codex && -n "$BRIEF_FILE" ]]; then' \
+  'if [[ "$HARNESS" == codex && -n "$brief_prompt_file" ]]; then'
+CODEX_SURFACE=hosted CODEX_ROUTE=fresh
+codex_brief_row "$HOSTED_EVIDENCE_OT" "$CODEX_SURFACE" "$CODEX_ROUTE"
+CONTROL_RC=0
+(
+  FAIL=0
+  assert_codex_brief
+  [[ "$FAIL" -eq 0 ]]
+) > "$RUN/evidence-assertion.out" 2>&1 || CONTROL_RC=$?
+assert_eq "$CONTROL_RC" 1 "control: tying evidence to a local snapshot fails the same hosted Codex child assertion" "$RUN/evidence-assertion.out"
 
 printf '%s' "$(cat "$BRIEF_FILE")" > "$BRIEF_WANT"
 
