@@ -5,7 +5,7 @@
 # matcher: Bash
 # description: On harnesses that execute hooks, refuse recognized whole-environment reads unless a proven direct pipe filters named variables. This fixed check runs outside Git and before project policy. Nested dumps and unsupported routing can refuse conservatively. It reads submitted text, not unseen programs, aliases or runtime-built commands. COMMAND_SAFETY_DENY_PATTERN replaces only the default systemd-run memory-cap pattern; `^$` disables only that project-pattern check.
 # summary: Refuses recognized whole-environment command text and gives a filter that names a variable. Also applies the project deny pattern or the default systemd-run memory-cap rule. Unreadable payloads warn and allow the call; unreadable policy support affects only the pattern check.
-# safety: Classify literal command producers and the program receiving inline code or registered heredoc input. Shells retain shell parsing, known interpreters use language-specific whole-environment evidence, literal cat bodies retain their data contract unless a forwarding launcher in a `;` or newline list can run them as shell, and unknown receivers retain conservative shell-word detection. Unquoted body expansions are checked independently, and unsupported forwarded contexts retain conservative refusal. Only proven direct named-variable filters grant dump permission; project-pattern matching remains independent and reads the submitted text. Unseen programs and runtime-built names are outside this text check; unreadable payloads or policy support warn and allow their affected check. Every diagnostic starts with command-safety: <key>=<value>.
+# safety: Classify literal command producers and the program receiving inline code or registered heredoc input. Shells retain shell parsing, known interpreters use language-specific whole-environment evidence, literal cat bodies retain their data contract unless a forwarding launcher in a `;` or newline list can run them, where every literal input is judged as forwarded shell source and as interpreter input and other list stages keep conservative word detection, and unknown receivers retain conservative shell-word detection. Unquoted body expansions are checked independently, and unsupported forwarded contexts retain conservative refusal. Only proven direct named-variable filters grant dump permission; project-pattern matching remains independent and reads the submitted text. Unseen programs and runtime-built names are outside this text check; unreadable payloads or policy support warn and allow their affected check. Every diagnostic starts with command-safety: <key>=<value>.
 # timeout: 10
 # requires-skills: [commit-guards]
 # ---
@@ -694,6 +694,17 @@ environment_receiver_evidence() {
   return 1
 }
 
+# A written file reaches whichever interpreter runs it. Each program here
+# names one language environment_receiver classifies.
+environment_interpreter_evidence() { # body
+  local program receiver receiver_pattern receiver_option receiver_named
+  for program in python3 node ruby perl; do
+    environment_receiver
+    if environment_receiver_evidence "$1"; then return 0; fi
+  done
+  return 1
+}
+
 # Shell invocation options precede the executable operand, including options
 # after -c. Known literal input stays conservative for every shell invocation;
 # script operands and redirects do not prove that the body is unused.
@@ -793,7 +804,7 @@ environment_dump() { # command kind; arguments are already decoded data
   local j start=0 end n fd redirection_kind target proc output input_redirect input_escaped pos program value named flags
   local mode pattern_count pattern filter_ok stage=0 text text_length span span_re comment_span options_ended null_output syntax_head program_pos stdin_program source_pos data_source piped_source="" pipeline="" heredoc_input=${heredoc_input:-}
   local receiver receiver_pattern receiver_option receiver_named
-  local unsupported="" scan candidate limit producer_end code incoming_sources="" file_output file_body redirect_evidence head_start main_start script_pos forwarded_argument="" forwarded_operand=""
+  local unsupported="" scan candidate limit producer_end code incoming_sources="" file_output file_body redirect_evidence head_start main_start script_pos forwarded_argument="" forwarded_stages=()
   local heredoc_op="" heredoc_origin delimiter line remaining doc body found math_depth=0 needs_target="" main_text main_required="" body_start body_end
   local name_re='^[A-Za-z_][A-Za-z0-9_]*(=.*)?$'
   local filter_re='^([A-Za-z_][A-Za-z0-9_]*=?|\^[A-Za-z_][A-Za-z0-9_]*=|\^\([A-Za-z_][A-Za-z0-9_]*(\|[A-Za-z_][A-Za-z0-9_]*)+\)=)$'
@@ -1177,7 +1188,7 @@ environment_dump() { # command kind; arguments are already decoded data
         fi
         # Waiter launchers execute forwarded argv. Keep each selected program
         # beside its operands before considering a quoted command string.
-        forwarded_operand=1
+        forwarded_stages[stage]=1
         limit=${#stage_args[@]}
         args=("${stage_args[@]:candidate:limit-candidate}")
         arg_kinds=("${stage_kinds[@]:candidate:limit-candidate}")
@@ -1208,13 +1219,26 @@ environment_dump() { # command kind; arguments are already decoded data
     # An empty stage writes no output; the pipe still carries the last command's.
     [ "$start" -eq "$end" ] || piped_source=$data_source
   done
-  # A forwarded program can run a file another stage wrote. Judge every
-  # registered body as forwarded shell source; a file-write class grants it
-  # no data, and an unresolved command keeps the complete-argument check.
-  if [ -n "$forwarded_operand" ]; then
-    for ((doc=0; doc<${#heredocs[@]}; doc++)); do
-      local command_text=${heredoc_bodies[$doc]}
+  # A forwarded program can run a file another list stage wrote, in any
+  # language. Each literal input gets the judgement it would get alone: as
+  # forwarded shell source, and as any interpreter's input, which also covers
+  # an interpreter heredoc nested in a shell body.
+  # This text check cannot see which program writes a file, so every other
+  # stage's words keep main's conservative evidence.
+  if [ "${#forwarded_stages[@]}" -gt 0 ]; then
+    for ((doc=0; doc<${#literal_inputs[@]}; doc++)); do
+      local command_text=${literal_inputs[doc]}
       if environment_dump shell forwarded; then return 0; fi
+      if environment_interpreter_evidence "$command_text"; then return 0; fi
+    done
+    for ((stage=0; stage<${#starts[@]}; stage++)); do
+      [ -z "${forwarded_stages[$stage]:-}" ] || continue
+      for ((j=${starts[$stage]}; j<${ends[$stage]}; j++)); do
+        # A here-string operand is a literal input judged above.
+        if [ "$j" -gt "${starts[$stage]}" ] && [ "${tokens[$((j - 1))]}" = '<<<' ] &&
+           [[ ${kinds[$((j - 1))]} == operator* ]]; then continue; fi
+        if environment_main_evidence "${tokens[$j]}"; then return 0; fi
+      done
     done
   fi
   if [ -n "$main_required" ]; then
