@@ -31,7 +31,7 @@ for arg in "$@"; do
 done
 printf '%s\t%s\t%s\n' "$endpoint" "$config" "$beta" >> "$CURL_LOG"
 case "$endpoint" in
-  usage) code="$USAGE_CODE"; body='{}' ;;
+  usage) code="$USAGE_CODE"; body='{}'; [[ ! -f "$USAGE_BODY" ]] || body="$(cat "$USAGE_BODY")" ;;
   profile)
     [[ "$PROFILE_CODE" != transport ]] || exit 7
     code="$PROFILE_CODE"; body="$(cat "$PROFILE_BODY")"
@@ -46,6 +46,9 @@ ACTIVE='{"account":{"has_claude_max":true},"organization":{"organization_type":"
 SHIPPED="$LANES"
 CLASSIFY="$(mutant_scripts profile-classify lanes)"
 mutate_file "$CLASSIFY/lanes" 'detail="$profile_detail"' ': "$profile_detail"'
+STATUS_CONTROL="$(mutant_scripts profile-status lanes)"
+mutate_file "$STATUS_CONTROL/lanes" '		status=plan_ended
+' ''
 ACTIVE_CONTROL="$(mutant_scripts profile-active lanes)"
 mutate_file "$ACTIVE_CONTROL/lanes" '$org.organization_type == "claude_free"' '$org.organization_type != null'
 mutate_file "$ACTIVE_CONTROL/lanes" '$org.subscription_status == "canceled"' '$org.subscription_status != null'
@@ -67,7 +70,7 @@ profile_run() { # SCRIPT USAGE_CODE PROFILE_CODE ARGS...
     ORCH_LANE_DIRS="$ACCOUNT" ORCH_LANES_CLAUDE_USAGE_URL=https://lanes-test.invalid/api/oauth/usage \
     ORCH_LANES_CODEX_USAGE_URL=https://lanes-test.invalid/codex/usage \
     OVERSEE_WATCH_STATE_DIR="$H/store" ORCH_STATE_DIR="$H/state" \
-    CURL_LOG="$H/curl.log" USAGE_CODE="$usage" PROFILE_CODE="$profile" PROFILE_BODY="$H/profile.json" \
+    CURL_LOG="$H/curl.log" USAGE_CODE="$usage" USAGE_BODY="$H/usage.json" PROFILE_CODE="$profile" PROFILE_BODY="$H/profile.json" \
     "$script" "$@" 2>"$H/err")
 }
 
@@ -89,6 +92,7 @@ for row in \
   "unreachable|503|200|$LAPSED|claude|max|baseline|0|$SHIPPED" \
   "codex-refused|403|200|$LAPSED|codex|max|same|0|$SHIPPED" \
   "control-classify|403|200|$LAPSED|claude|max|ended|1|$CLASSIFY/lanes" \
+  "control-status|403|200|$LAPSED|claude|max|ended|1|$STATUS_CONTROL/lanes" \
   "control-active|403|200|$ACTIVE|claude|free|same|1|$ACTIVE_CONTROL/lanes" \
   "control-http|429|200|$LAPSED|claude|max|baseline|0|$HTTP_CONTROL/lanes" \
   "control-harness|403|200|$LAPSED|codex|max|same|0|$HARNESS_CONTROL/lanes" \
@@ -105,11 +109,14 @@ for row in \
   if [[ "$name" == fallback-* ]]; then
     if [[ "$code" == 401 ]]; then DETAIL_401="$detail"; else DETAIL_403="$detail"; fi
   fi
-  status=refused
+  # A confirmed ended plan reads `plan_ended`, which the shared judge walls;
+  # every other refusal stays a reading nobody made.
+  status=refused verdict=unmeasured
   [[ "$code" != 429 ]] || status=rate_limited
   [[ "$code" != 503 ]] || status=unreachable
-  got="$(jq -r '.[0].status' <<<"$out") calls=$(awk '$1 == "profile" { n++ } END { print n+0 }' "$H/curl.log")"
-  want="$status calls=$calls"
+  [[ "$cause" != ended ]] || status=plan_ended verdict=walled
+  got="$(jq -r '"\(.[0].status) \(.[0].verdict)"' <<<"$out") calls=$(awk '$1 == "profile" { n++ } END { print n+0 }' "$H/curl.log")"
+  want="$status $verdict calls=$calls"
   if [[ "$cause" == ended ]]; then
     # Assert the response's plan values, not human sentence wording.
     old="$DETAIL_403"; [[ "$code" != 401 ]] || old="$DETAIL_401"
@@ -130,9 +137,31 @@ for row in \
     fi
     if [[ "$cause" == ended ]]; then
       cached="$(profile_run "$script" "$code" transport list --harness "$harness" --json --cache-only)"
-      assert_eq "$(jq -r '.[0].detail' <<<"$cached")" "$detail" "$name keeps the recorded cause on the cached refusal"
+      assert_eq "$(jq -r '"\(.[0].status) \(.[0].verdict) \(.[0].detail)"' <<<"$cached")" "plan_ended walled $detail" "$name keeps the recorded cause on the cached refusal"
       assert_eq "$(awk 'END { print NR }' "$H/curl.log")" 2 "$name posts no request for a cached refusal"
     fi
+  fi
+done
+# A figure cached while the plan had room, then a forced read that confirms
+# the plan ended: the default list and pick read the ended plan, never the
+# older figure.
+KEPT_CONTROL="$(mutant_scripts profile-kept lanes)"
+mutate_file "$KEPT_CONTROL/lanes" '[[ ! -f "$file" || "$4" == plan_ended ]] || kept=' '[[ ! -f "$file" ]] || kept='
+for script in "$SHIPPED" "$KEPT_CONTROL/lanes"; do
+  new_home cached-then-ended
+  ACCOUNT="$H/.claude"
+  make_lane "$H" claude 3600 max
+  printf '%s\n' "$LAPSED" > "$H/profile.json"
+  claude_usage 10 10 10 Opus > "$H/usage.json"
+  profile_run "$script" 200 200 list --harness claude --json >/dev/null
+  profile_run "$script" 403 200 list --harness claude --json --no-cache >/dev/null
+  listed="$(profile_run "$script" 403 200 list --harness claude --json)"
+  rc=0; profile_run "$script" 403 200 pick --harness claude >/dev/null || rc=$?
+  got="$(jq -r '"\(.[0].status) \(.[0].verdict)"' <<<"$listed") pick=$rc"
+  if [[ "$script" == "$SHIPPED" ]]; then
+    assert_eq "$got" "plan_ended walled pick=3" "a confirmed ended plan outranks the figure cached before it" "$H/err"
+  else
+    [[ "$got" != "plan_ended walled pick=3" ]] && pass "control-kept turns the unchanged assertion red" || fail "control-kept did not reject the planted defect"
   fi
 done
 printf 'pass: %d   fail: %d\n' "$PASS" "$FAIL"

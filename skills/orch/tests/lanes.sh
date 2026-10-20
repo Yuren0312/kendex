@@ -3175,6 +3175,38 @@ table \
   "a host row with no reading of its own leaves the named account's local reading in place|$PICK_ENV;LANE_HOST_STUB_ACCOUNTS=$TMP_ROOT/pick-dead-bare.tsv|$PICK_LANE $H/.dclaude|rc=5 status=expired measured_through=local" \
   "a dir discovery does not reach is judged on the reading the provider reports for it|$PICK_ENV;LANE_HOST_STUB_ACCOUNTS=$TMP_ROOT/pick-hostonly.tsv|$PICK_LANE $H/.hostonly|rc=0 config_dir=$H/.hostonly measured_through=host" \
   "a host row naming the account with a trailing slash stands for the local dir|$PICK_ENV;LANE_HOST_STUB_ACCOUNTS=$TMP_ROOT/pick-token-slash.tsv|$PICK_LANE $H/.tclaude|rc=0 measured_through=host"
+# A provider row reading `plan_ended`, the control VM's reading of an account
+# whose organization disabled subscription access, binds as a full wall: the
+# listing, the chooser and the named pick read walled, never unmeasured.
+printf 'account=%s\tharness=claude\tstatus=plan_ended\tdetail=http-403-oauth_not_allowed_for_organization\n' \
+  "$H/.tclaude" > "$TMP_ROOT/pick-ended.tsv"
+table \
+  "a listed plan_ended account reads walled at the plan bucket|$PICK_ENV;LANE_HOST_STUB_ACCOUNTS=$TMP_ROOT/pick-ended.tsv|list --harness claude --json|rc=0 last.alias=tclaude last.measured_through=host last.status=plan_ended last.verdict=walled last.wall=100 last.binding_bucket=plan" \
+  "a named plan_ended account is walled, never unmeasured|$PICK_ENV;LANE_HOST_STUB_ACCOUNTS=$TMP_ROOT/pick-ended.tsv|$PICK_LANE $H/.tclaude|rc=3 status=plan_ended wall=100 binding_bucket=plan measured_through=host" \
+  "the chooser counts a plan_ended account walled|$PICK_ENV;LANE_HOST_STUB_ACCOUNTS=$TMP_ROOT/pick-ended.tsv|$PICK|rc=3 key=no-candidate,harness=claude,max-pct=95,model=none,walled=1,unmeasured=2,seats=0 considered.tclaude=host"
+# Control: a judge with no ended wall reads the same account as a reading
+# nobody made, the unjudged mark the overseer watch held for hours.
+lanes_mutant mutant-plan-unended lib/lane-model.sh 'def lane_ended: \.status == "plan_ended";' 'def lane_ended: false;'
+LANES="$TMP_ROOT/mutant-plan-unended/scripts/lanes"
+table \
+  "control: without the ended wall a named plan_ended account reads unmeasured|$PICK_ENV;LANE_HOST_STUB_ACCOUNTS=$TMP_ROOT/pick-ended.tsv|$PICK_LANE $H/.tclaude|rc=5 status=plan_ended wall=null"
+LANES="$LANES_PATCHED"
+# An overseer seat on an ended plan is walled, never a seat held at its
+# reserve: the omitted-seat line tells the overseer to wait for room an ended
+# plan never regains.
+printf 'account=%s\tharness=claude\tstatus=plan_ended\tdetail=http-403-oauth_not_allowed_for_organization\tseat=1\n' \
+  "$H/.tclaude" > "$TMP_ROOT/pick-ended-seat.tsv"
+table \
+  "the chooser counts an ended seat walled and omits no seat|$PICK_ENV;LANE_HOST_STUB_ACCOUNTS=$TMP_ROOT/pick-ended-seat.tsv|$PICK|rc=3 keyed.no-candidate=no-candidate,harness=claude,max-pct=95,model=none,walled=1,unmeasured=2,seats=0 keyed.pick-seat-omitted=none" \
+  "a named ended seat is walled, never seat-reserve|$PICK_ENV;LANE_HOST_STUB_ACCOUNTS=$TMP_ROOT/pick-ended-seat.tsv|$PICK_LANE $H/.tclaude|rc=3 status=plan_ended wall=100 verdict=null"
+# Control: the seat-reserve arm ahead of the ended wall, the old arm order,
+# holds the ended seat at its reserve.
+lanes_mutant mutant-ended-seat lib/lane-model.sh '(if lane_ended then "walled"' '(if false then "walled"'
+LANES="$TMP_ROOT/mutant-ended-seat/scripts/lanes"
+table \
+  "control: without the ended arm the chooser omits the ended seat|$PICK_ENV;LANE_HOST_STUB_ACCOUNTS=$TMP_ROOT/pick-ended-seat.tsv|$PICK|rc=3 keyed.no-candidate=no-candidate,harness=claude,max-pct=95,model=none,walled=0,unmeasured=2,seats=1 keyed.pick-seat-omitted=pick-seat-omitted,lane=$H/.tclaude,projected-headroom=0,reserve=50" \
+  "control: without the ended arm a named ended seat reads seat-reserve|$PICK_ENV;LANE_HOST_STUB_ACCOUNTS=$TMP_ROOT/pick-ended-seat.tsv|$PICK_LANE $H/.tclaude|rc=3 status=plan_ended verdict=seat-reserve"
+LANES="$LANES_PATCHED"
 # Control: a named pick that never matches a host row reads the token-only
 # folder as this machine's no_credentials.
 lanes_mutant mutant-pick-lane-local-only lanes 'select(._id == \$t)' 'select(._id == "no-such-lane")'
