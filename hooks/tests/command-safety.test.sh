@@ -604,6 +604,7 @@ environment_rows() {
 [0,"bash tools/search.sh process.env","script-search-interpreter-word"]
 [0,"sh tmp/waiter.X/launch.sh tmp/waiter.X/wait rg -n 'os.environ' src/","waiter-search-interpreter-word"]
 [0,"cd src; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait rg -n 'os.environ' .","cd-then-waiter-search-main-parity"]
+[2,"cat > f.sh <<'EOF'\nset -e\nEOF\nsh W/launch.sh W/wait env -u DISPLAY bash f.sh\necho env > g.sh; bash g.sh","heredoc-waiter-then-written-dump"]
 [2,"sh A/launch.sh A/wait bash -c \"echo 'print(1)' > tmp/a.py\"; sh B/launch.sh B/wait env -u DISPLAY python3 tmp/a.py","forwarded-benign-writer-then-waiter"]
 [2,"echo printenv | tee tmp/podman-acceptance.sh\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","tee-written-then-waiter"]
 [2,"echo '<<<' printenv > tmp/podman-acceptance.sh; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","quoted-herestring-word-then-waiter"]
