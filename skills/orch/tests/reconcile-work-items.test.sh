@@ -128,7 +128,7 @@ assert_eq "$(sort -u "$LINEAR_CALLS")" "issues list --max --format=raw" "the swe
 assert_eq "$(sort -u "$LINEAR_CALLS")" "issues list --max --team kendex --format=raw" "the sweep reads the project's team where one is set"
 assert_contains "$OUT" "container-parked issue=T-1" "a container whose last child is Done or Canceled is reported for closing"
 assert_contains "$OUT" "container-parked issue=T-21" "a container whose every child is Canceled is reported for closing"
-assert_contains "$OUT" 'reconcile-work-items: verifying-empty issue=T-1' "an open child box leaves the container nothing but container-close"
+assert_contains "$OUT"$'\n' $'reconcile-work-items: verifying-empty issue=T-1\n' "an open child box leaves the container nothing but container-close"
 assert_not_contains "$OUT" 'verifying T-1 box=' "the child box is no outcome duty"
 assert_not_contains "$OUT" 'verifying-invalid issue=T-1' "an open child box is not invalid branch work"
 assert_not_contains "$OUT" 'verifying-merge-unread issue=T-1' "a container needs no invented merge time"
@@ -171,7 +171,7 @@ while IFS='|' read -r outcome description expected; do
   CASE_OUT="$(cd "$R" && RECONCILE_GH_CLI="$TMP/gh-stub" "$RW" 2>&1)" || true
   if [ "$expected" = absent ]; then
     assert_not_contains "$CASE_OUT" 'container-parked issue=T-1 ' "$outcome leaves ordinary parent work open"
-    assert_not_contains "$CASE_OUT" 'verifying-empty issue=T-1' "$outcome offers no empty verification"
+    assert_not_contains "$CASE_OUT"$'\n' $'reconcile-work-items: verifying-empty issue=T-1\n' "$outcome offers no empty verification"
     assert_not_contains "$CASE_OUT" 'verifying T-1 ' "$outcome offers no outcome read"
   else
     assert_contains "$CASE_OUT" "$expected" "$outcome container reads its duty"
