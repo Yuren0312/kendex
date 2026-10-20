@@ -581,6 +581,8 @@ environment_rows() {
 [2,"cat tmp/podman-acceptance.sh | # piped\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","piped-comment-waiter-unset-launch"]
 [2,"cat tmp/podman-acceptance.sh \u007c&\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","piped-stderr-newline-waiter-unset-launch"]
 [2,"true &&\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash -s","and-newline-waiter-unset-launch"]
+[2,"(cat <<'EOF'\nenv\nEOF\n) | sh","paren-heredoc-piped-shell"]
+[2,"(cat <<'EOF') \u007c& sh\nenv\nEOF","paren-heredoc-stderr-piped-shell"]
 [2,"cat > tmp/podman-acceptance.sh <<'EOF'\ntimeout 5 env\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","heredoc-timeout-env-body-then-waiter"]
 [2,"cat > tmp/podman-acceptance.sh <<'EOF'\ntimeout 5 printenv\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","heredoc-timeout-printenv-body-then-waiter"]
 [2,"cat > tmp/podman-acceptance.sh <<'EOF'\ngrep -a . /proc/self/environ\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","heredoc-proc-environ-body-then-waiter"]
