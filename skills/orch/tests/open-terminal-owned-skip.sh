@@ -559,7 +559,7 @@ codex_template_result() { # CAPTURED_PANE_COMMAND
   if [[ -f "$record" ]]; then cat "$record"; else printf 'child-record-missing\n'; fi
 }
 CODEX_TEMPLATE_EXPECTED="$(printf '%s\n' rc=0 "$TMP_ROOT/wt/CC-11" "$TMP_ROOT/wt/CC-11" '' \
-  "$(lane_codex_home_path "$SESSION_HOME/.codex" "$TMP_ROOT/wt/CC-11")" '')"
+  "$(lane_codex_home_path "$SESSION_HOME/.codex" "$TMP_ROOT/wt/CC-11")" '{"harness":"codex","settings":{"model_auto_compact_token_limit":"9223372036854775807","model_auto_compact_token_limit_scope":"body_after_prefix","model_post_turn_compact_threshold_percent":"0"}}')"
 assert_codex_template() { # CHILD_RESULT
   local arguments
   assert_eq "$1" "$CODEX_TEMPLATE_EXPECTED" "the custom Codex child keeps its account and launch environment"
