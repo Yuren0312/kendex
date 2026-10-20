@@ -5,7 +5,7 @@
 # matcher: Bash
 # description: On harnesses that execute hooks, refuse recognized whole-environment reads unless a proven direct pipe filters named variables. This fixed check runs outside Git and before project policy. Nested dumps and unsupported routing can refuse conservatively. It reads submitted text, not unseen programs, aliases or runtime-built commands. COMMAND_SAFETY_DENY_PATTERN replaces only the default systemd-run memory-cap pattern; `^$` disables only that project-pattern check.
 # summary: Refuses recognized whole-environment command text and gives a filter that names a variable. Also applies the project deny pattern or the default systemd-run memory-cap rule. Unreadable payloads warn and allow the call; unreadable policy support affects only the pattern check.
-# safety: Classify literal command producers and the program receiving inline code or registered heredoc input. Shells retain shell parsing, known interpreters use language-specific whole-environment evidence, literal cat bodies retain their data contract unless a forwarding launcher in a `;` or newline list can run them, where every literal input is judged as forwarded shell source and as interpreter input and other list stages keep conservative word detection, and unknown receivers retain conservative shell-word detection. Unquoted body expansions are checked independently, and unsupported forwarded contexts retain conservative refusal. Only proven direct named-variable filters grant dump permission; project-pattern matching remains independent and reads the submitted text. Unseen programs and runtime-built names are outside this text check; unreadable payloads or policy support warn and allow their affected check. Every diagnostic starts with command-safety: <key>=<value>.
+# safety: Classify literal command producers and the program receiving inline code or registered heredoc input. Shells retain shell parsing, known interpreters use language-specific whole-environment evidence, literal cat bodies retain their data contract unless a forwarding launcher in a `;` or newline list can run them, where every literal input is judged as forwarded shell source and as interpreter input and other list stages keep conservative and interpreter word detection, and unknown receivers retain conservative shell-word detection. Unquoted body expansions are checked independently, and unsupported forwarded contexts retain conservative refusal. Only proven direct named-variable filters grant dump permission; project-pattern matching remains independent and reads the submitted text. Unseen programs and runtime-built names are outside this text check; unreadable payloads or policy support warn and allow their affected check. Every diagnostic starts with command-safety: <key>=<value>.
 # timeout: 10
 # requires-skills: [commit-guards]
 # ---
@@ -654,24 +654,32 @@ environment_main_command() { # command kind; arguments are already decoded data
 
 # Receiving language is a local classification, not an exemption from the
 # independent shell expansion and unsupported forwarding checks.
+# environment_interpreters is the one interpreter set: it selects the
+# interpreter receiver and every language environment_interpreter_evidence
+# judges. A listed program without an arm below keeps an empty pattern, and
+# an empty pattern matches every input, so a missing arm refuses.
+environment_interpreters='python python3 node ruby perl'
 environment_receiver() {
   receiver=unknown; receiver_pattern=""; receiver_option=""; receiver_named=""
   case "$program" in
-    cat) receiver=data ;;
-    bash | sh | dash | zsh | ksh | eval | source | .) receiver=shell ;;
+    cat) receiver=data; return ;;
+    bash | sh | dash | zsh | ksh | eval | source | .) receiver=shell; return ;;
+  esac
+  case " $environment_interpreters " in *" $program "*) receiver=interpreter ;; *) return ;; esac
+  case "$program" in
     python | python3)
-      receiver=interpreter; receiver_option='^-c$'
+      receiver_option='^-c$'
       receiver_pattern='(^|[^A-Za-z0-9_])os[[:space:]]*\.[[:space:]]*environ'
       receiver_named='^[[:blank:]]*(\[|\.[[:blank:]]*(get|pop|setdefault|__getitem__|__contains__)[[:blank:]]*\()' ;;
     node)
-      receiver=interpreter; receiver_option='^(-e|--eval)$'
+      receiver_option='^(-e|--eval)$'
       receiver_pattern='(^|[^A-Za-z0-9_])process[[:space:]]*\.[[:space:]]*env'
       receiver_named='^[[:blank:]]*(\[|\.)' ;;
     ruby)
-      receiver=interpreter; receiver_option='^-e$'
+      receiver_option='^-e$'
       receiver_pattern='(^|[^A-Za-z0-9_])ENV[[:space:]]*\.[[:space:]]*(to_h|each)([^A-Za-z0-9_]|$)' ;;
     perl)
-      receiver=interpreter; receiver_option='^-e$'
+      receiver_option='^-e$'
       receiver_pattern='%ENV([^A-Za-z0-9_]|$)' ;;
   esac
 }
@@ -694,11 +702,10 @@ environment_receiver_evidence() {
   return 1
 }
 
-# A written file reaches whichever interpreter runs it. Each program here
-# names one language environment_receiver classifies.
+# A written file reaches whichever interpreter runs it.
 environment_interpreter_evidence() { # body
   local program receiver receiver_pattern receiver_option receiver_named
-  for program in python3 node ruby perl; do
+  for program in $environment_interpreters; do
     environment_receiver
     if environment_receiver_evidence "$1"; then return 0; fi
   done
@@ -1224,7 +1231,8 @@ environment_dump() { # command kind; arguments are already decoded data
   # forwarded shell source, and as any interpreter's input, which also covers
   # an interpreter heredoc nested in a shell body.
   # This text check cannot see which program writes a file, so every other
-  # stage's words keep main's conservative evidence.
+  # stage's words keep main's conservative evidence and the same interpreter
+  # evidence.
   if [ "${#forwarded_stages[@]}" -gt 0 ]; then
     for ((doc=0; doc<${#literal_inputs[@]}; doc++)); do
       local command_text=${literal_inputs[doc]}
@@ -1238,6 +1246,7 @@ environment_dump() { # command kind; arguments are already decoded data
         if [ "$j" -gt "${starts[$stage]}" ] && [ "${tokens[$((j - 1))]}" = '<<<' ] &&
            [[ ${kinds[$((j - 1))]} == operator* ]]; then continue; fi
         if environment_main_evidence "${tokens[$j]}"; then return 0; fi
+        if environment_interpreter_evidence "${tokens[$j]}"; then return 0; fi
       done
     done
   fi

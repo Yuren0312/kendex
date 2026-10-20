@@ -595,6 +595,9 @@ environment_rows() {
 [2,"cat > tmp/acceptance.py <<'EOF'\nimport os\nprint(dict(os.environ))\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE python3 tmp/acceptance.py","heredoc-python-file-then-waiter"]
 [0,"cat > tmp/acceptance.py <<'EOF'\nprint(1)\nEOF\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE python3 tmp/acceptance.py","heredoc-python-benign-file-then-waiter"]
 [2,"echo printenv > tmp/podman-acceptance.sh\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","echo-written-then-waiter"]
+[2,"echo 'import os; print(os.environ)' > tmp/acceptance.py; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE python3 tmp/acceptance.py","echo-written-python-then-waiter"]
+[2,"echo 'console.log(process.env)' | tee tmp/acceptance.js\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE node tmp/acceptance.js","tee-written-node-then-waiter"]
+[0,"echo 'print(1)' > tmp/acceptance.py; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE python3 tmp/acceptance.py","echo-written-benign-python-then-waiter"]
 [2,"echo printenv | tee tmp/podman-acceptance.sh\nsh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","tee-written-then-waiter"]
 [2,"echo '<<<' printenv > tmp/podman-acceptance.sh; sh tmp/waiter.X/launch.sh tmp/waiter.X/wait env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE bash tmp/podman-acceptance.sh","quoted-herestring-word-then-waiter"]
 [2,"bash wrap.sh step cat \"/proc/self/environ\"","waiter-forwarded-cat-quoted-path"]
@@ -1509,6 +1512,7 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "other-stage-unjudged" { swap("if environment_main_evidence \"${tokens[$j]}\"; then return 0; fi", ":") }
       defect == "herestring-operand-scanned" { swap("[ \"${tokens[$((j - 1))]}\" = \047<<<\047 ] &&", "false &&") }
       defect == "herestring-word-kind" { swap("[[ ${kinds[$((j - 1))]} == operator* ]]", "true") }
+      defect == "stage-words-shell-only" { swap("if environment_interpreter_evidence \"${tokens[$j]}\"; then return 0; fi", ":") }
       { print }
       END { if (changed != 1) exit 1 }
     ' "$hook_source" >"$mutant" || exit 1
@@ -1550,6 +1554,7 @@ forwarded-body-context|FAIL environment: heredoc-timeout-env-body-then-waiter: e
 heredoc-only-inputs|FAIL environment: herestring-env-then-waiter: exit=0 expected=2
 shell-only-body|FAIL environment: heredoc-python-file-then-waiter: exit=0 expected=2
 other-stage-unjudged|FAIL environment: echo-written-then-waiter: exit=0 expected=2
+stage-words-shell-only|FAIL environment: echo-written-python-then-waiter: exit=0 expected=2
 herestring-operand-scanned|FAIL environment: herestring-setup-then-waiter: exit=2 expected=0
 herestring-word-kind|FAIL environment: quoted-herestring-word-then-waiter: exit=0 expected=2
 receiver-evidence|FAIL environment: receiver-python-heredoc-whole-1: exit=0 expected=2
