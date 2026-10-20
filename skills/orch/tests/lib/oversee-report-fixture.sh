@@ -31,7 +31,9 @@ exec "$REAL_DATE" "\$@"
 EOF
 # gh: `pr list --state merged` answers merged.json narrowed to --head and
 # capped at --limit, as gh narrows it; `pr list --state open` open.json, and
-# `issue view N` issue-N.json, each from the case directory; a `--search
+# `issue view N` issue-N.json and `api repos/R/pulls/N/files` pr-N.json, a
+# pull request's files endpoint pages with --jq applied to each page as gh
+# applies it, each from the case directory; a `--search
 # merged:>=STAMP` keeps what merged at or after STAMP. A file named
 # <base>.<SLUG>.json answers that --repo alone, SLUG being the repo with `/`
 # as `_`. gh-fail fails every list, gh-fail-open the open list alone. Every
@@ -43,10 +45,10 @@ cat > "$TMP_ROOT/bin/gh" <<'EOF'
 set -uo pipefail
 printf '%s\n' "$*" >> "$CASE/gh.calls"
 verb="${1:-} ${2:-}"; number="${3:-}"
-state=""; head=""; limit=1000; repo=""; search=""
+state=""; head=""; limit=1000; repo=""; search=""; filter=.
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --state) state="$2" ;; --head) head="$2" ;; --limit) limit="$2" ;; --repo) repo="$2" ;; --search) search="$2" ;;
+    --state) state="$2" ;; --head) head="$2" ;; --limit) limit="$2" ;; --repo) repo="$2" ;; --search) search="$2" ;; --jq) filter="$2" ;;
   esac
   shift
 done
@@ -68,6 +70,8 @@ case "$verb" in
     # A merged:>= search keeps what merged at or after its stamp, as GitHub's does.
     jq -c --arg head "$head" --argjson limit "$limit" --arg since "${search#merged:>=}" \
       '[.[] | select($head == "" or .headRefName == $head) | select($since == "" or .mergedAt >= $since)] | .[:$limit]' "$src" ;;
+  api\ repos/*/pulls/*/files\?per_page=100)
+    number="${verb%/files*}"; jq -r ".[] | $filter" "$CASE/pr-${number##*/}.json" ;;
   "issue view")
     src="$(pick "issue-$number")"
     [[ -f "$src" ]] || { echo "no issue $number" >&2; exit 1; }
