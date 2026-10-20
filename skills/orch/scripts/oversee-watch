@@ -5038,8 +5038,10 @@ check_lanes() {
 # differently. The overseer's own mark judgement is a separate read. Each row is `<row key> TAB <row
 # value> TAB <fields>`, the key and value laid out with the rows above and
 # <fields> the text both the event and the roster print. `verdict` is
-# `lanes`'s own wall judgement against ORCH_LANE_MAX_PCT, so the threshold and
-# its default are read in one place. A read that failed or overran its ceiling
+# `lanes`'s own wall judgement against ORCH_LANE_MAX_PCT, or a grant's against
+# ORCH_LANE_CLOUD_CREDIT_FLOOR, so each threshold and its default are read in
+# one place. A Pi API grant is its own `pi` record, keyed apart from its
+# account's plan row. A read that failed or overran its ceiling
 # leaves ACCOUNT_ROSTER_RC non-zero, which the heartbeat reports rather than
 # printing no accounts.
 ACCOUNT_ROSTER=""
@@ -5184,8 +5186,9 @@ check_report() {
 # picks one. Every other verdict reads the accounts of the record's own host,
 # its `host` or `local` where it names none, as ORCH_LANE_HOST, since a
 # relaunch stays on that host and open-terminal judges it there: `unjudged`
-# where that host's `lanes list` failed; `queue` where it lists no account of
-# the harness; otherwise `lanes pick` for the record's harness and model
+# where that host's `lanes list` failed; `queue` where it lists no account
+# the pick would judge (`--help`, owed); otherwise `lanes pick` for the
+# record's harness and model
 # decides, the launcher's own judge: room is `queue`, a wall is `dated` until
 # the earliest reset that judgement names for its walled accounts, and
 # anything else is `unjudged`. One
@@ -5541,14 +5544,20 @@ verifying_read() { # SAFE_ITEMS
 # reading the provider's copy runs under, names each walled account's deciding
 # window and its reset, `until=-` where none states one. Exit 3 with none
 # walled is every account unmeasured, and any other exit a judgement that
-# failed, named on stderr: both are `unjudged`.
+# failed, named on stderr: both are `unjudged`. A listing holding no account
+# the pick would judge queues the item unasked; which accounts those are is
+# stated once, in `--help` under owed.
 owed_wall() { # HOST HARNESS MODEL
-  local host="$1" harness="$2" model="$3" errf="$WORK_DIR/owed-pick.err" rc=0 walled until
+  local host="$1" harness="$2" model="$3" errf="$WORK_DIR/owed-pick.err" rc=0 walled until billed pool
   local args=(pick --harness "$harness" --json)
   OWED_VERDICT="verdict=unjudged harness=$harness"
   owed_accounts "$host"
   [[ "$OWED_LISTING" != - ]] || return 0
-  if ! jq -e --arg h "$harness" 'any(.[]; .harness == $h)' <<<"$OWED_LISTING" >/dev/null 2>"$errf"; then
+  billed="$(lane_pick_harness "$harness" "$model")"
+  pool="$(lane_pick_pool "$harness" "$model")"
+  if ! jq -e --arg h "$billed" --arg pool "$pool" \
+    'any(.[]; .harness == $h and ((.pool == "api-credit") == ($pool == "api-credit")))' \
+    <<<"$OWED_LISTING" >/dev/null 2>"$errf"; then
     [[ ! -s "$errf" ]] || die owed-roster-invalid "$(cat "$errf")" "host=$host"
     OWED_VERDICT="verdict=queue"
     return 0
