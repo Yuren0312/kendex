@@ -722,8 +722,8 @@ environment_receiver_evidence() {
 # after -c. Known literal input stays conservative for every shell invocation;
 # script operands and redirects do not prove that the body is unused.
 environment_program_text() {
-  local cursor=$pos source="" options_ended="" wants_string="" value text="" unproved=""
-  stdin_program=""; source_pos=""
+  local cursor=$pos source="" options_ended="" wants_string="" wants_stdin="" value text="" unproved=""
+  stdin_program=""; source_pos=""; script_operand_pos=""
   environment_receiver
   if [ "$receiver" = interpreter ]; then
     for ((cursor=pos; cursor<${#args[@]}; cursor++)); do
@@ -755,6 +755,7 @@ environment_program_text() {
               # A short-option word can combine command-string selection and
               # an option with an operand. Consume the entire invocation word.
               [[ $value != -*c* ]] || wants_string=1
+              [[ $value != -*s* ]] || wants_stdin=1
               [[ ${value:1} =~ ^[abCefhiklmnprstuvxBDEHPTcoO]+$ ]] || unproved=1
               case "${value:1}" in
                 *[oO]*[oO]*)
@@ -771,7 +772,8 @@ environment_program_text() {
             -*) unproved=1; cursor=$((cursor + 1)); continue ;;
           esac
         fi
-        if [ -n "$wants_string" ]; then source=$value; source_pos=$cursor; fi
+        if [ -n "$wants_string" ]; then source=$value; source_pos=$cursor
+        elif [ -z "$wants_stdin" ] && [ "$value" != - ]; then script_operand_pos=$cursor; fi
         break
       done ;;
     eval)
@@ -783,7 +785,9 @@ environment_program_text() {
         [ "${arg_kinds[$cursor]}" = literal ] || unproved=1
       done
       source_pos=$pos ;;
-    source | .) stdin_program=1 ;;
+    source | .)
+      stdin_program=1
+      [[ ${args[$pos]:-} == [-+]* ]] || script_operand_pos=$pos ;;
     opaque)
       unproved=1
       # Exec can retain literal input for later list commands. Remove the
@@ -824,7 +828,8 @@ environment_dump() { # command kind; arguments are already decoded data
   local ordinary_span_re=$'^[^\'"\\\\$`# \t\r\n;|()<>&]+'
   local single_span_re="^[^']+" ansi_span_re="^[^'\\\\]+" double_span_re='^[^"\\$`]+' comment_span_re=$'^[^\n]+'
   local tokens=() kinds=() unquoted_words=() saved_quotes=() closers=() args=() arg_kinds=() arg_unquoted=() arg_roles=() stage_roles=() stage_args=() stage_kinds=() stage_unquoted=() heredocs=() heredoc_tabs=() heredoc_expand=() heredoc_bodies=() heredoc_starts=() body_ids=() stage_sources=() stage_stdin=() executable_texts=() executable_stages=()
-  local body_decisions=() written_targets=()
+  local body_decisions=() written_targets=() written_execution=() stage_execution=()
+  local script_operand_pos write_execution=unconditional prior
   local expansion_words=() arg_expansions=() stage_expansions=()
   local private_inputs=()
   local starts=() ends=() separators=() decisions=() literal_inputs=() input_bodies=() file_outputs=() executable_contexts=()
@@ -1038,7 +1043,16 @@ environment_dump() { # command kind; arguments are already decoded data
       case "${tokens[$i]}" in '|' | ';' | '&&' | '||' | '&') ;; *) continue ;; esac
     fi
     starts[stage]=$start; ends[stage]=$i
-    separators[stage]=${tokens[$i]:-end}; stage=$((stage + 1)); start=$((i + 1))
+    stage_execution[stage]=$write_execution
+    separators[stage]=${tokens[$i]:-end}
+    # List continuation can leave an empty newline stage after && or ||.
+    # It does not establish execution of the conditional command that follows.
+    case "${separators[$stage]}" in
+      "&&" | "||" | "|") write_execution=conditional ;;
+      "&") stage_execution[stage]=asynchronous; write_execution=unconditional ;;
+      *) [ "$start" -ge "$i" ] || write_execution=unconditional ;;
+    esac
+    stage=$((stage + 1)); start=$((i + 1))
   done
   # Forwarded input has no local data contract for the complete pipeline.
   if [ -n "$pipeline" ] && [ -n "$incoming_sources" ] && [ -n "$heredoc_input" ] && environment_main_evidence "$text" "${@:3}"; then return 0; fi
@@ -1120,13 +1134,11 @@ environment_dump() { # command kind; arguments are already decoded data
         esac
       done
     fi
-    if [ "$receiver" = shell ] && [ -z "$source_pos" ] &&
-       [ "${arg_kinds[$pos]:-}" = literal ] && [[ ${args[$pos]:-} != [-+]* ]]; then
-      for ((doc=${#heredocs[@]}-1; doc>=0; doc--)); do
-        [ -n "${written_targets[$doc]:-}" ] && [ "${written_targets[$doc]}" = "${args[$pos]}" ] || continue
+    if [ -n "$script_operand_pos" ] && [ "${arg_kinds[$script_operand_pos]:-}" = literal ]; then
+      for ((doc=0; doc<${#heredocs[@]}; doc++)); do
+        [ -n "${written_targets[$doc]:-}" ] && [ "${written_targets[$doc]}" = "${args[$script_operand_pos]}" ] || continue
         code=${#executable_texts[@]}
         executable_texts[code]=${heredoc_bodies[$doc]}; executable_stages[code]=$stage
-        break
       done
     fi
     # Supported shell source keeps this classification check in its queue.
@@ -1151,7 +1163,15 @@ environment_dump() { # command kind; arguments are already decoded data
          [ "$file_output" = 1 ] && [ "$file_body" = 1 ] && [ -z "$redirect_evidence" ] &&
          [ "$program_pos" = 0 ] && [ "$head_start" -eq 0 ] && [ "${arg_kinds[0]}" = literal ] &&
          [ "$data_source" = " $doc" ]; then
-        written_targets[doc]=$file_target
+        # A declaration behind a list condition may never replace the file.
+        # Background writes can still arrive after a later foreground write.
+        if [ "${stage_execution[$stage]}" = unconditional ]; then
+          for ((prior=0; prior<${#heredocs[@]}; prior++)); do
+            [ "${written_targets[$prior]:-}" = "$file_target" ] || continue
+            [ "${written_execution[$prior]:-}" = asynchronous ] || written_targets[prior]=""
+          done
+        fi
+        written_targets[doc]=$file_target; written_execution[doc]=${stage_execution[$stage]}
         body=${heredoc_bodies[$doc]}; body_start=${heredoc_starts[$doc]}; body_end=$((body_start + ${#body}))
         main_text=${main_text:0:body_start}${body//[!$'\n']/ }${main_text:body_end}
         continue

@@ -289,6 +289,37 @@ environment_rows() {
 [0,"cat > tmp/h.sh <<'EOF'\nenv -u NAME cmd\nEOF\nbash tmp/h.sh","written-shell-body-unset-launcher"]
 [0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbash tmp/other.sh","written-shell-body-other-path"]
 [0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\ncat > tmp/h.sh <<'SECOND'\nenv -u NAME cmd\nSECOND\nbash tmp/h.sh","written-shell-body-last-write"]
+[0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -es tmp/h.sh </dev/null","written-shell-operand-grouped-stdin"]
+[0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -c -e 'printf safe' tmp/h.sh","written-shell-operand-options-after-command-string"]
+[0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -s +s tmp/h.sh </dev/null","written-shell-operand-stdin-after-plus"]
+[0,"cat > tmp/h.sh <<'FIRST'\nenv -u NAME cmd\nFIRST\nbash -e tmp/h.sh","written-shell-operand-option-unset-launcher"]
+[2,"cat > tmp/h.sh <<'FIRST' &\nenv\nFIRST\ncat > tmp/h.sh <<'SECOND'\nprintf safe\nSECOND\nbash tmp/h.sh","written-shell-reaching-background-retained"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\ncat > tmp/h.sh <<'SECOND' &\nprintf safe\nSECOND\nbash tmp/h.sh","written-shell-reaching-background-replacement"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nprintf ignored | cat > tmp/h.sh <<'SECOND'\nprintf safe\nSECOND\nbash tmp/h.sh","written-shell-reaching-pipeline-replacement"]
+[0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\ncat > tmp/other.sh <<'SECOND'\nprintf safe\nSECOND\ncat > tmp/h.sh <<'THIRD'\nprintf safe\nTHIRD\nbash tmp/h.sh","written-shell-reaching-different-target"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -e tmp/h.sh","written-shell-operand-errexit"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -- tmp/h.sh","written-shell-operand-terminator"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -o errexit tmp/h.sh","written-shell-operand-option-operand"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash --rcfile tmp/unused tmp/h.sh","written-shell-operand-long-option-operand"]
+[2,"cat > -h.sh <<'FIRST'\nenv\nFIRST\nbash -- -h.sh","written-shell-operand-dash-after-terminator"]
+[0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -","written-shell-operand-stdin-dash"]
+[0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -o","written-shell-operand-missing-option-operand"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash --noprofile tmp/h.sh","written-shell-operand-long-option"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nsh -e tmp/h.sh","written-shell-operand-sh-option"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\ncommand bash -e tmp/h.sh","written-shell-operand-prefix-option"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nsource tmp/h.sh","written-shell-operand-source"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\n. tmp/h.sh","written-shell-operand-dot"]
+[0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -c 'printf safe' tmp/h.sh","written-shell-operand-command-string"]
+[0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -s tmp/h.sh </dev/null","written-shell-operand-stdin"]
+[0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -e tmp/other.sh","written-shell-operand-other-path"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nfalse && cat > tmp/h.sh <<'SECOND'\nprintf safe\nSECOND\nbash tmp/h.sh","written-shell-reaching-skipped-and"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\ntrue || cat > tmp/h.sh <<'SECOND'\nprintf safe\nSECOND\nbash tmp/h.sh","written-shell-reaching-skipped-or"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nfalse &&\ncat > tmp/h.sh <<'SECOND'\nprintf safe\nSECOND\nbash tmp/h.sh","written-shell-reaching-skipped-continued-and"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\ntrue ||\ncat > tmp/h.sh <<'SECOND'\nprintf safe\nSECOND\nbash tmp/h.sh","written-shell-reaching-skipped-continued-or"]
+[0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\ncat > tmp/h.sh <<'SECOND'\nprintf safe\nSECOND\nbash tmp/h.sh","written-shell-reaching-unconditional-safe"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nfalse && cat > tmp/h.sh <<'SECOND'\nprintf safe\nSECOND\nfalse && cat > tmp/h.sh <<'THIRD'\nprintf safe\nTHIRD\nbash tmp/h.sh","written-shell-reaching-multiple-possible"]
+[0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nfalse && cat > tmp/h.sh <<'SECOND'\nprintf safe\nSECOND\ncat > tmp/h.sh <<'THIRD'\nprintf safe\nTHIRD\nbash tmp/h.sh","written-shell-reaching-unconditional-after-possible"]
+[2,"cat > tmp/h.sh <<'FIRST'\nprintf safe\nFIRST\ntrue && cat > tmp/h.sh <<'SECOND'\nenv\nSECOND\nbash tmp/h.sh","written-shell-reaching-possible-dump"]
 [2,"FABRICATED_VALUE=fixture-private-value-4519 cat ~/.fleet/env","private-tilde"]
 [2,"cat @PRIVATE_HOME@/.fleet/env","private-inherited-home"]
 [2,"cat $HOME/.fleet/env","private-textual-home"]
@@ -1484,6 +1515,8 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "expansion-origin-cut" { swap("then expansion=$expansion$span", "then expansion=$expansion") }
       defect == "expansion-quote-mask" { swap("else expansion=\"$expansion \"; fi", "else expansion=$expansion$span; fi") }
       defect == "written-body" { swap("written_targets[doc]=$file_target", ":") }
+      defect == "written-script-operand" { swap("script_operand_pos=$cursor", "script_operand_pos=$pos") }
+      defect == "written-conditional-replacement" { swap("if [ \"${stage_execution[$stage]}\" = unconditional ]; then", "if true; then") }
       defect == "operand-word-boundary" { swap("(^|[^A-Za-z0-9_.-])(env|printenv|export|declare|typeset|show-environment)([^A-Za-z0-9_.-]|$)", "(^|[^A-Za-z0-9_])(env|printenv|export|declare|typeset|show-environment)([^A-Za-z0-9_]|$)") }
       defect == "unclassified-head-only" { swap("if [ -z \"$stdin_program\" ] && { [ -n \"$redirect_evidence\" ] || environment_main_evidence \"${args[@]}\"; }; then mode=dump-unknown; fi", "if [ -z \"$stdin_program\" ] && { [ -n \"$redirect_evidence\" ] || environment_main_evidence \"${args[$program_pos]}\"; }; then mode=dump-unknown; fi") }
       defect == "unresolved-redirect-loss" { swap("if [ -z \"$stdin_program\" ] && { [ -n \"$redirect_evidence\" ] || environment_main_evidence \"${args[@]}\"; }; then mode=dump-unknown; fi", "if [ -z \"$stdin_program\" ] && environment_main_evidence \"${args[@]}\"; then mode=dump-unknown; fi") }
@@ -1599,6 +1632,8 @@ expanded-head|FAIL environment: expanded-head-glob-printenv: exit=0 expected=2
 expansion-origin-cut|FAIL environment: expanded-head-mixed-prefix-glob: exit=0 expected=2
 expansion-quote-mask|FAIL environment: quoted-glob-head-data: exit=2 expected=0
 written-body|FAIL environment: written-shell-body-dump: exit=0 expected=2
+written-script-operand|FAIL environment: written-shell-operand-errexit: exit=0 expected=2
+written-conditional-replacement|FAIL environment: written-shell-reaching-skipped-and: exit=0 expected=2
 receiver-named-method|FAIL environment: receiver-jarvis-config-named-method: exit=2 expected=0
 receiver-named-method|FAIL environment: receiver-jarvis-heredoc-named-method: exit=2 expected=0
 receiver-line-boundary|FAIL environment: receiver-python-heredoc-whole-line-end: exit=0 expected=2
