@@ -288,6 +288,7 @@ environment_rows() {
 [2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbash tmp/h.sh","written-shell-body-dump"]
 [0,"cat > tmp/h.sh <<'EOF'\nenv -u NAME cmd\nEOF\nbash tmp/h.sh","written-shell-body-unset-launcher"]
 [0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbash tmp/other.sh","written-shell-body-other-path"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\ncat tmp/h.sh","written-shell-body-ordinary-data"]
 [0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -es tmp/h.sh </dev/null","written-shell-operand-grouped-stdin"]
 [0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -c -e 'printf safe' tmp/h.sh","written-shell-operand-options-after-command-string"]
 [0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -s +s tmp/h.sh </dev/null","written-shell-operand-stdin-after-plus"]
@@ -298,6 +299,12 @@ environment_rows() {
 [2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -e tmp/h.sh","written-shell-operand-errexit"]
 [2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -- tmp/h.sh","written-shell-operand-terminator"]
 [2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -o errexit tmp/h.sh","written-shell-operand-option-operand"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -oo errexit nounset tmp/h.sh","written-shell-operand-unresolved-grouped-options"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -oO pipefail extglob tmp/h.sh","written-shell-operand-unresolved-mixed-options"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -eoO pipefail extglob tmp/h.sh","written-shell-operand-unresolved-prefixed-options"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -oo errexit nounset tmp/other.sh","written-shell-operand-unresolved-retains-all-paths"]
+[2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash \"$SCRIPT\"","written-shell-operand-unresolved-dynamic-file"]
+[0,"cat > tmp/h.sh <<'FIRST'\nenv -u NAME cmd\nFIRST\nbash -oo errexit nounset tmp/h.sh","written-shell-operand-unresolved-unset-launcher"]
 [2,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash --rcfile tmp/unused tmp/h.sh","written-shell-operand-long-option-operand"]
 [2,"cat > -h.sh <<'FIRST'\nenv\nFIRST\nbash -- -h.sh","written-shell-operand-dash-after-terminator"]
 [0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\nbash -","written-shell-operand-stdin-dash"]
@@ -1511,7 +1518,8 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "expansion-origin-cut" { swap("then expansion=$expansion$span", "then expansion=$expansion") }
       defect == "expansion-quote-mask" { swap("else expansion=\"$expansion \"; fi", "else expansion=$expansion$span; fi") }
       defect == "written-body" { swap("written_targets[doc]=$file_target", ":") }
-      defect == "written-script-operand" { swap("script_operand_pos=$cursor", "script_operand_pos=$pos") }
+      defect == "written-script-operand" { swap("script_selection=file:$cursor", "script_selection=file:$pos") }
+      defect == "written-unresolved-selection" { swap("script_selection=unresolved", "script_selection=other") }
       defect == "written-body-history" { swap("written_targets[doc]=$file_target", "written_targets=(); written_targets[doc]=$file_target") }
       defect == "operand-word-boundary" { swap("(^|[^A-Za-z0-9_.-])(env|printenv|export|declare|typeset|show-environment)([^A-Za-z0-9_.-]|$)", "(^|[^A-Za-z0-9_])(env|printenv|export|declare|typeset|show-environment)([^A-Za-z0-9_]|$)") }
       defect == "unclassified-head-only" { swap("if [ -z \"$stdin_program\" ] && { [ -n \"$redirect_evidence\" ] || environment_main_evidence \"${args[@]}\"; }; then mode=dump-unknown; fi", "if [ -z \"$stdin_program\" ] && { [ -n \"$redirect_evidence\" ] || environment_main_evidence \"${args[$program_pos]}\"; }; then mode=dump-unknown; fi") }
@@ -1629,6 +1637,8 @@ expansion-origin-cut|FAIL environment: expanded-head-mixed-prefix-glob: exit=0 e
 expansion-quote-mask|FAIL environment: quoted-glob-head-data: exit=2 expected=0
 written-body|FAIL environment: written-shell-body-dump: exit=0 expected=2
 written-script-operand|FAIL environment: written-shell-operand-errexit: exit=0 expected=2
+written-unresolved-selection|FAIL environment: written-shell-operand-unresolved-grouped-options: exit=0 expected=2
+written-unresolved-selection|FAIL environment: written-shell-operand-unresolved-mixed-options: exit=0 expected=2
 written-body-history|FAIL environment: written-shell-reaching-foreground-replacement: exit=0 expected=2
 written-body-history|FAIL environment: written-shell-reaching-async-list: exit=0 expected=2
 receiver-named-method|FAIL environment: receiver-jarvis-config-named-method: exit=2 expected=0

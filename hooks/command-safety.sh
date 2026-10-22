@@ -723,7 +723,7 @@ environment_receiver_evidence() {
 # script operands and redirects do not prove that the body is unused.
 environment_program_text() {
   local cursor=$pos source="" options_ended="" wants_string="" wants_stdin="" value text="" unproved=""
-  stdin_program=""; source_pos=""; script_operand_pos=""
+  stdin_program=""; source_pos=""; script_selection=other
   environment_receiver
   if [ "$receiver" = interpreter ]; then
     for ((cursor=pos; cursor<${#args[@]}; cursor++)); do
@@ -742,14 +742,17 @@ environment_program_text() {
   case "$program" in
     bash | sh | dash | zsh | ksh)
       stdin_program=1
+      script_selection=unresolved
       while [ "$cursor" -lt "${#args[@]}" ]; do
         value=${args[$cursor]}
         [ "${arg_kinds[$cursor]}" = literal ] || unproved=1
         if [ -z "$options_ended" ]; then
           case "$value" in
             --) options_ended=1; cursor=$((cursor + 1)); continue ;;
+            -) options_ended=1; wants_stdin=1; cursor=$((cursor + 1)); continue ;;
             --rcfile | --init-file)
-              [ "${arg_kinds[$((cursor + 1))]:-}" = literal ] || unproved=1
+              [ "$((cursor + 1))" -ge "${#args[@]}" ] ||
+                [ "${arg_kinds[$((cursor + 1))]:-}" = literal ] || unproved=1
               cursor=$((cursor + 2)); continue ;;
             -[^-]* | +*)
               # A short-option word can combine command-string selection and
@@ -759,12 +762,13 @@ environment_program_text() {
               [[ ${value:1} =~ ^[abCefhiklmnprstuvxBDEHPTcoO]+$ ]] || unproved=1
               case "${value:1}" in
                 *[oO]*[oO]*)
-                  # Main's refusal remains for unproved grouped operands.
-                  # This cut adds no operand-counting allowance.
+                  # Bash-tool commands can group option operands. Without a
+                  # selection proof their registered file bodies stay evidence.
                   if environment_main_evidence "${args[@]:pos}"; then mode=dump-unknown; fi
                   return ;;
                 *o* | *O*)
-                  [ "${arg_kinds[$((cursor + 1))]:-}" = literal ] || unproved=1
+                  [ "$((cursor + 1))" -ge "${#args[@]}" ] ||
+                    [ "${arg_kinds[$((cursor + 1))]:-}" = literal ] || unproved=1
                   cursor=$((cursor + 2)) ;;
                 *) cursor=$((cursor + 1)) ;;
               esac
@@ -773,9 +777,13 @@ environment_program_text() {
           esac
         fi
         if [ -n "$wants_string" ]; then source=$value; source_pos=$cursor
-        elif [ -z "$wants_stdin" ] && [ "$value" != - ]; then script_operand_pos=$cursor; fi
+        elif [ -z "$wants_stdin" ] && [ "$value" != - ] && [ -z "$unproved" ]; then script_selection=file:$cursor; fi
         break
-      done ;;
+      done
+      if [ -z "$unproved" ] && [ "$script_selection" = unresolved ]; then
+        if [ -n "$wants_string" ]; then script_selection=command-string
+        else script_selection=stdin; fi
+      fi ;;
     eval)
       stdin_program=1
       # Eval can consume a leading option operand before joining its source.
@@ -827,7 +835,7 @@ environment_dump() { # command kind; arguments are already decoded data
   local single_span_re="^[^']+" ansi_span_re="^[^'\\\\]+" double_span_re='^[^"\\$`]+' comment_span_re=$'^[^\n]+'
   local tokens=() kinds=() unquoted_words=() saved_quotes=() closers=() args=() arg_kinds=() arg_unquoted=() arg_roles=() stage_roles=() stage_args=() stage_kinds=() stage_unquoted=() heredocs=() heredoc_tabs=() heredoc_expand=() heredoc_bodies=() heredoc_starts=() body_ids=() stage_sources=() stage_stdin=() executable_texts=() executable_stages=()
   local body_decisions=() written_targets=()
-  local script_operand_pos
+  local script_selection script_operand_pos
   local expansion_words=() arg_expansions=() stage_expansions=()
   local private_inputs=()
   local starts=() ends=() separators=() decisions=() literal_inputs=() input_bodies=() file_outputs=() executable_contexts=()
@@ -1123,13 +1131,20 @@ environment_dump() { # command kind; arguments are already decoded data
         esac
       done
     fi
-    if [ -n "$script_operand_pos" ] && [ "${arg_kinds[$script_operand_pos]:-}" = literal ]; then
-      for ((doc=0; doc<${#heredocs[@]}; doc++)); do
-        [ -n "${written_targets[$doc]:-}" ] && [ "${written_targets[$doc]}" = "${args[$script_operand_pos]}" ] || continue
-        code=${#executable_texts[@]}
-        executable_texts[code]=${heredoc_bodies[$doc]}; executable_stages[code]=$stage
-      done
-    fi
+    case "$script_selection" in
+      other | command-string | stdin) ;;
+      file:* | unresolved)
+        for ((doc=0; doc<${#heredocs[@]}; doc++)); do
+          [ -n "${written_targets[$doc]:-}" ] || continue
+          if [ "$script_selection" != unresolved ]; then
+            script_operand_pos=${script_selection#file:}
+            [ "${written_targets[$doc]}" = "${args[$script_operand_pos]}" ] || continue
+          fi
+          code=${#executable_texts[@]}
+          executable_texts[code]=${heredoc_bodies[$doc]}; executable_stages[code]=$stage
+        done ;;
+      *) return 0 ;;
+    esac
     # Supported shell source keeps this classification check in its queue.
     # Other unclassified forwarded argv retains the complete read evidence.
     if [ "$mode" = unclassified-forwarded ]; then
