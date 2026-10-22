@@ -680,9 +680,10 @@ environment_main_command() { # command kind; arguments are already decoded data
 # independent shell expansion and unsupported forwarding checks.
 environment_receiver() {
   receiver=unknown; receiver_pattern=""; receiver_option=""; receiver_named=""
-  case "$program" in
+  case "${1:-$program}" in
     cat) receiver=data ;;
-    bash | sh | dash | zsh | ksh | eval | source | .) receiver=shell ;;
+    bash | sh | dash | zsh | ksh) receiver=shell; written_shell=1 ;;
+    eval | source | .) receiver=shell ;;
     python | python3)
       receiver=interpreter; receiver_option='^-c$'
       receiver_pattern='(^|[^A-Za-z0-9_])os[[:space:]]*\.[[:space:]]*environ'
@@ -742,7 +743,6 @@ environment_program_text() {
   case "$program" in
     bash | sh | dash | zsh | ksh)
       stdin_program=1
-      written_shell=1
       while [ "$cursor" -lt "${#args[@]}" ]; do
         value=${args[$cursor]}
         [ "${arg_kinds[$cursor]}" = literal ] || unproved=1
@@ -1114,7 +1114,7 @@ environment_dump() { # command kind; arguments are already decoded data
       for ((j=program_pos+1; j<${#args[@]}; j++)); do arg_roles[j]=argument; done
     fi
     environment_program_text
-    if [ "$1" = shell ] && { [ "$mode" = other ] || [ "$mode" = unclassified-forwarded ]; } &&
+    if { [ "$mode" = other ] || [ "$mode" = unclassified-forwarded ]; } &&
        [ -n "$program_pos" ] && [ "${arg_kinds[$program_pos]}" = literal ]; then
       if environment_main_evidence --head "${arg_expansions[$program_pos]}"; then mode=dump-unknown; fi
       # Brace expansion can also hide the complete evidence word in a list
@@ -1204,6 +1204,11 @@ environment_dump() { # command kind; arguments are already decoded data
             # clean reads. Its retained receipt decision owns this command.
             [ "$program" != set ] || continue ;;
         esac
+        # An unsupported suffix cannot prove which literal word receives
+        # execution. Keep its existing receiver facts beside written bodies.
+        if [ -n "$unsupported" ] && [ "${stage_kinds[$candidate]}" = literal ]; then
+          environment_receiver "${value##*/}"
+        fi
         # The approved ordinary quoted-data class has the same recorded
         # receiver, role and argument bounds. It recognizes no inner words.
         if [ "$1" = shell ] && [ -z "${2:-}$compound" ] && [ "$program" = bash ] && [ -z "$source_pos" ] && [ -z "$syntax_head" ] &&

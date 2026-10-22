@@ -330,6 +330,25 @@ environment_rows() {
 [0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\npython3 -c 'print(\"bash tmp/h.sh\")'","written-body-interpreter-shell-data"]
 [0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nsource tmp/h.sh","written-body-source-file-operand-cut"]
 [0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\n. tmp/h.sh","written-body-dot-file-operand-cut"]
+[2,"python3 <<PY\nprint(\"\"\"$(e{nv,nv})\"\"\")\nPY","expanded-executable-heredoc-substitution"]
+[2,"python3 <<PY\nprint(\"\"\"`e{nv,nv}`\"\"\")\nPY","expanded-executable-heredoc-backtick"]
+[2,"python3 <<PY\nprint(\"\"\"$(\"/usr/bin\"/printen?)\"\"\")\nPY","expanded-executable-heredoc-mixed-glob"]
+[0,"python3 <<PY\nprint(\"e{nv,nv}\")\nPY","expanded-heredoc-literal-data"]
+[0,"python3 <<'PY'\nprint(\"$(e{nv,nv})\")\nPY","expanded-heredoc-quoted-data"]
+[0,"python3 <<PY\nprint(\"\"\"$(printf safe)\"\"\")\nPY","expanded-heredoc-literal-executable"]
+[0,"python3 <<PY\nprint(\"\"\"$(printf 'e{nv,nv}')\"\"\")\nPY","expanded-heredoc-quoted-argument"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec bash tmp/h.sh","written-opaque-exec-shell"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec /bin/bash tmp/h.sh","written-opaque-exec-absolute-shell"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec '/bin/bash' tmp/h.sh","written-opaque-exec-quoted-shell"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec -a fixture /bin/dash tmp/h.sh","written-opaque-exec-options-shell"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbuiltin command bash tmp/h.sh","written-opaque-builtin-shell"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec zsh tmp/h.sh","written-opaque-exec-zsh"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec ksh tmp/h.sh","written-opaque-exec-ksh"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\neval 'exec sh tmp/h.sh'","written-opaque-nested-exec-shell"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec printf '%s' 'bash tmp/h.sh'","written-opaque-quoted-command-data"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nprintf '%s' 'exec bash tmp/h.sh'","written-opaque-quoted-exec-data"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec python3 -c 'print(\"bash tmp/h.sh\")'","written-opaque-interpreter-data"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv -u NAME cmd\nEOF\nexec bash tmp/h.sh","written-opaque-exec-unset-launcher"]
 [2,"FABRICATED_VALUE=fixture-private-value-4519 cat ~/.fleet/env","private-tilde"]
 [2,"cat @PRIVATE_HOME@/.fleet/env","private-inherited-home"]
 [2,"cat $HOME/.fleet/env","private-textual-home"]
@@ -1525,6 +1544,8 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "expansion-origin-cut" { swap("then expansion=$expansion$span", "then expansion=$expansion") }
       defect == "expansion-quote-mask" { swap("else expansion=\"$expansion \"; fi", "else expansion=$expansion$span; fi") }
       defect == "written-body" { swap("written_bodies[${#written_bodies[@]}]=${heredoc_bodies[$doc]}", ":") }
+      defect == "expanded-executable-context" && /^    if / { swap("if { [ \"$mode\" = other ] || [ \"$mode\" = unclassified-forwarded ]; } &&", "if [ \"$1\" = shell ] && { [ \"$mode\" = other ] || [ \"$mode\" = unclassified-forwarded ]; } &&") }
+      defect == "opaque-receiver-evidence" { swap("environment_receiver \"${value##*/}\"", ":") }
       defect == "written-shell-evidence" { swap("written_shell=1", ":") }
       defect == "written-body-concatenation" { swap("local command_text=$body", "local command_text=${written_bodies[*]}") }
       defect == "written-body-history" { swap("written_bodies[${#written_bodies[@]}]=${heredoc_bodies[$doc]}", "written_bodies=(); written_bodies[0]=${heredoc_bodies[$doc]}") }
@@ -1643,6 +1664,8 @@ expanded-head|FAIL environment: expanded-head-glob-printenv: exit=0 expected=2
 expansion-origin-cut|FAIL environment: expanded-head-mixed-prefix-glob: exit=0 expected=2
 expansion-quote-mask|FAIL environment: quoted-glob-head-data: exit=2 expected=0
 written-body|FAIL environment: written-shell-body-dump: exit=0 expected=2
+expanded-executable-context|FAIL environment: expanded-executable-heredoc-substitution: exit=0 expected=2
+opaque-receiver-evidence|FAIL environment: written-opaque-exec-shell: exit=0 expected=2
 written-shell-evidence|FAIL environment: written-shell-nested-before-body: exit=0 expected=2
 written-body-concatenation|FAIL environment: written-shell-independent-bodies: exit=0 expected=2
 written-body-history|FAIL environment: written-shell-reaching-foreground-replacement: exit=0 expected=2
