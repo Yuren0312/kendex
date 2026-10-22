@@ -285,11 +285,22 @@ environment_head() { # command kind; updates pos, syntax_head and arg_roles
 # The directed cuts retain main's text test where executable evidence is
 # unproved. This grants no argument, body-data or direct-filter permission.
 environment_main_evidence() {
-  local value evidence continuation=$'\\\n'
+  local value evidence head="" continuation=$'\\\n'
   local opaque_re='(^|[^A-Za-z0-9_.-])(env|printenv|export|declare|typeset|show-environment)([^A-Za-z0-9_.-]|$)|(^|[^A-Za-z0-9_-])set([^A-Za-z0-9_-]|$)|/proc/[^[:space:]]*/environ'
+  if [ "${1:-}" = --head ]; then head=1; shift; fi
   for value in "$@"; do
     evidence=${value//"$continuation"/}
     evidence=${evidence//[\'\"\\]/}
+    # A submitted unquoted glob head depends on the caller's filesystem.
+    # Without expanding it, no unresolved glob can prove a safe executable.
+    if [ -n "$head" ]; then
+      # Ordinary literal heads retain the shared producer's decision.
+      case "$evidence" in
+        *[\*\?\[]*) return 0 ;;
+        *'{'*','*'}'*) ;;
+        *) continue ;;
+      esac
+    fi
     [[ ! $evidence =~ $opaque_re ]] || return 0
   done
   return 1
@@ -808,14 +819,14 @@ environment_dump() { # command kind; arguments are already decoded data
   local j start=0 end n fd redirection_kind target proc output input_redirect input_escaped pos program value named flags
   local mode pattern_count pattern filter_ok stage=0 text text_length span span_re comment_span options_ended null_output syntax_head program_pos stdin_program source_pos data_source piped_source="" pipeline="" heredoc_input=${heredoc_input:-}
   local receiver receiver_pattern receiver_option receiver_named
-  local unsupported="" scan candidate limit producer_end code incoming_sources="" file_output file_body redirect_evidence head_start main_start script_pos forwarded_argument=""
+  local unsupported="" scan candidate limit producer_end code incoming_sources="" file_output file_target file_body redirect_evidence head_start main_start script_pos forwarded_argument=""
   local heredoc_op="" heredoc_origin delimiter line remaining doc body found math_depth=0 needs_target="" main_text main_required="" body_start body_end
   local name_re='^[A-Za-z_][A-Za-z0-9_]*(=.*)?$'
   local filter_re='^([A-Za-z_][A-Za-z0-9_]*=?|\^[A-Za-z_][A-Za-z0-9_]*=|\^\([A-Za-z_][A-Za-z0-9_]*(\|[A-Za-z_][A-Za-z0-9_]*)+\)=)$'
   local ordinary_span_re=$'^[^\'"\\\\$`# \t\r\n;|()<>&]+'
   local single_span_re="^[^']+" ansi_span_re="^[^'\\\\]+" double_span_re='^[^"\\$`]+' comment_span_re=$'^[^\n]+'
   local tokens=() kinds=() unquoted_words=() saved_quotes=() closers=() args=() arg_kinds=() arg_unquoted=() arg_roles=() stage_roles=() stage_args=() stage_kinds=() stage_unquoted=() heredocs=() heredoc_tabs=() heredoc_expand=() heredoc_bodies=() heredoc_starts=() body_ids=() stage_sources=() stage_stdin=() executable_texts=() executable_stages=()
-  local body_decisions=()
+  local body_decisions=() written_targets=()
   local private_inputs=()
   local starts=() ends=() separators=() decisions=() literal_inputs=() input_bodies=() file_outputs=() executable_contexts=()
   if [ "${2:-}" = forwarded ]; then
@@ -1030,7 +1041,7 @@ environment_dump() { # command kind; arguments are already decoded data
   if [ -n "$pipeline" ] && [ -n "$incoming_sources" ] && [ -n "$heredoc_input" ] && environment_main_evidence "$text" "${@:3}"; then return 0; fi
   for ((stage=0; stage<${#starts[@]}; stage++)); do
     start=${starts[$stage]}; end=${ends[$stage]}; args=(); arg_kinds=(); arg_unquoted=(); arg_roles=()
-    private_inputs=(); proc=""; output=""; input_redirect=""; input_escaped=""; mode=other; program=""; program_pos=""; data_source=""; file_output=""; file_body=""; redirect_evidence=""
+    private_inputs=(); proc=""; output=""; input_redirect=""; input_escaped=""; mode=other; program=""; program_pos=""; data_source=""; file_output=""; file_target=""; file_body=""; redirect_evidence=""
     for ((j=start; j<end; j++)); do
       case "${kinds[$j]}" in operator | operator-stderr | operator-explicit-other)
         fd=${kinds[$j]}
@@ -1057,7 +1068,7 @@ environment_dump() { # command kind; arguments are already decoded data
             data_source="$data_source $doc" ;;
           '>')
             [ "$fd" = operator-stderr ] || output=1
-            if [ "$fd" = operator ] && [ "${kinds[$j]:-}" = literal ]; then file_output=1; fi ;;
+            if [ "$fd" = operator ] && [ "${kinds[$j]:-}" = literal ]; then file_output=1; file_target=$target; fi ;;
           '>>')
             [ "$fd" = operator-stderr ] || output=1
             if [ "$fd" = operator ] && [ "${kinds[$j]:-}" = literal ]; then file_output=append; fi ;;
@@ -1093,6 +1104,27 @@ environment_dump() { # command kind; arguments are already decoded data
       for ((j=program_pos+1; j<${#args[@]}; j++)); do arg_roles[j]=argument; done
     fi
     environment_program_text
+    if [ "$1" = shell ] && [ "$mode" = other ] && [ -n "$program_pos" ] &&
+       [ "${arg_kinds[$program_pos]}" = literal ] && [ -n "${arg_unquoted[$program_pos]}" ]; then
+      if environment_main_evidence --head "${args[$program_pos]}"; then mode=dump-unknown; fi
+      # Brace expansion can also hide the complete evidence word in a list
+      # stage's forwarded argv; plain argument words retain their data role.
+      for ((j=pos; j<${#args[@]}; j++)); do
+        [ "${arg_kinds[$j]}" = literal ] && [ -n "${arg_unquoted[$j]}" ] || continue
+        case "${args[$j]}" in *'{'*','*'}'*)
+          if environment_main_evidence "${args[$j]}"; then mode=dump-unknown; fi ;;
+        esac
+      done
+    fi
+    if [ "$receiver" = shell ] && [ -z "$source_pos" ] &&
+       [ "${arg_kinds[$pos]:-}" = literal ] && [[ ${args[$pos]:-} != [-+]* ]]; then
+      for ((doc=${#heredocs[@]}-1; doc>=0; doc--)); do
+        [ -n "${written_targets[$doc]:-}" ] && [ "${written_targets[$doc]}" = "${args[$pos]}" ] || continue
+        code=${#executable_texts[@]}
+        executable_texts[code]=${heredoc_bodies[$doc]}; executable_stages[code]=$stage
+        break
+      done
+    fi
     # Supported shell source keeps this classification check in its queue.
     # Other unclassified forwarded argv retains the complete read evidence.
     if [ "$mode" = unclassified-forwarded ]; then
@@ -1115,6 +1147,7 @@ environment_dump() { # command kind; arguments are already decoded data
          [ "$file_output" = 1 ] && [ "$file_body" = 1 ] && [ -z "$redirect_evidence" ] &&
          [ "$program_pos" = 0 ] && [ "$head_start" -eq 0 ] && [ "${arg_kinds[0]}" = literal ] &&
          [ "$data_source" = " $doc" ]; then
+        written_targets[doc]=$file_target
         body=${heredoc_bodies[$doc]}; body_start=${heredoc_starts[$doc]}; body_end=$((body_start + ${#body}))
         main_text=${main_text:0:body_start}${body//[!$'\n']/ }${main_text:body_end}
         continue

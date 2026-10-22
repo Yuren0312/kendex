@@ -234,6 +234,22 @@ environment_rows() {
     [.[0], (.[1] | tojson), .[2], (.[3] // "project")] | @tsv
   ' "$@" <<'ENVIRONMENT_ROWS'
 [2,"env","bare-env"]
+[2,"{env,}","expanded-head-brace-env"]
+[2,"true; {env,}","expanded-head-list-brace-env"]
+[2,"{printenv,}","expanded-head-brace-printenv"]
+[2,"{set,}","expanded-head-brace-set"]
+[2,"true; {set,}","expanded-head-list-brace-set"]
+[2,"/usr/bin/printen?","expanded-head-glob-printenv"]
+[2,"true; /usr/bin/printen?","expanded-head-list-glob-printenv"]
+[2,"true; tool {set,}","expanded-list-argument-retains-evidence"]
+[0,"tool '/usr/bin/printen?'","quoted-glob-argument-data"]
+[0,"tool /usr/bin/printen?","glob-argument-data"]
+[0,"'/usr/bin/printen?'","quoted-glob-head-data"]
+[0,["/usr/bin/printen?"],"argv-glob-head-data"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbash tmp/h.sh","written-shell-body-dump"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv -u NAME cmd\nEOF\nbash tmp/h.sh","written-shell-body-unset-launcher"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbash tmp/other.sh","written-shell-body-other-path"]
+[0,"cat > tmp/h.sh <<'FIRST'\nenv\nFIRST\ncat > tmp/h.sh <<'SECOND'\nenv -u NAME cmd\nSECOND\nbash tmp/h.sh","written-shell-body-last-write"]
 [2,"FABRICATED_VALUE=fixture-private-value-4519 cat ~/.fleet/env","private-tilde"]
 [2,"cat @PRIVATE_HOME@/.fleet/env","private-inherited-home"]
 [2,"cat $HOME/.fleet/env","private-textual-home"]
@@ -1425,6 +1441,8 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "no-check" { swap("if environment_dump \"$command_kind\"; then", "if false; then") }
       defect == "private-path" { swap("environment_private_path() {", "environment_private_path() { return 1") }
       defect == "main-evidence-cut" { swap("[[ ! $evidence =~ $opaque_re ]] || return 0", ":") }
+      defect == "expanded-head" { swap("if environment_main_evidence --head \"${args[$program_pos]}\"; then", "if false; then") }
+      defect == "written-body" { swap("written_targets[doc]=$file_target", ":") }
       defect == "operand-word-boundary" { swap("(^|[^A-Za-z0-9_.-])(env|printenv|export|declare|typeset|show-environment)([^A-Za-z0-9_.-]|$)", "(^|[^A-Za-z0-9_])(env|printenv|export|declare|typeset|show-environment)([^A-Za-z0-9_]|$)") }
       defect == "unclassified-head-only" { swap("if [ -z \"$stdin_program\" ] && { [ -n \"$redirect_evidence\" ] || environment_main_evidence \"${args[@]}\"; }; then mode=dump-unknown; fi", "if [ -z \"$stdin_program\" ] && { [ -n \"$redirect_evidence\" ] || environment_main_evidence \"${args[$program_pos]}\"; }; then mode=dump-unknown; fi") }
       defect == "unresolved-redirect-loss" { swap("if [ -z \"$stdin_program\" ] && { [ -n \"$redirect_evidence\" ] || environment_main_evidence \"${args[@]}\"; }; then mode=dump-unknown; fi", "if [ -z \"$stdin_program\" ] && environment_main_evidence \"${args[@]}\"; then mode=dump-unknown; fi") }
@@ -1535,6 +1553,9 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
     fi
   done <<'ENVIRONMENT_CONTROLS'
 private-path|FAIL environment: private-tilde: exit=0 expected=2
+expanded-head|FAIL environment: expanded-head-brace-env: exit=0 expected=2
+expanded-head|FAIL environment: expanded-head-glob-printenv: exit=0 expected=2
+written-body|FAIL environment: written-shell-body-dump: exit=0 expected=2
 receiver-named-method|FAIL environment: receiver-jarvis-config-named-method: exit=2 expected=0
 receiver-named-method|FAIL environment: receiver-jarvis-heredoc-named-method: exit=2 expected=0
 receiver-line-boundary|FAIL environment: receiver-python-heredoc-whole-line-end: exit=0 expected=2
