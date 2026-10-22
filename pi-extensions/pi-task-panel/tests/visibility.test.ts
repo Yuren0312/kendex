@@ -30,9 +30,44 @@ test("task panel auto-shows first task once, then user hide blocks later task mu
 	assert.equal(panel.panel, "hidden");
 	assert.equal(panel.hiddenByUser, true);
 
+	allDoneChange(panel);
 	pendingChange(panel);
 	assert.equal(panel.panel, "hidden");
 	assert.equal(panel.hiddenByUser, true);
+	assert.equal(panel.lastVisiblePanel, "compact");
+});
+
+for (const [defaultPanel, selectedPanel] of [["compact", "expanded"], ["expanded", "compact"]] as const) {
+	test(`task panel auto-reopens in ${selectedPanel} after an all-done hide with ${defaultPanel} default`, () => {
+		const panel = createTaskPanelVisibility("hidden");
+		const options = { autoShowOnFirstTask: true, defaultPanel, hasTasks: true };
+		applyTaskPanelContentVisibility(panel, { ...options, remainingTasks: 1 });
+		assert.equal(panel.panel, defaultPanel);
+
+		userShowTaskPanel(panel, selectedPanel);
+		applyTaskPanelContentVisibility(panel, { ...options, remainingTasks: 0 });
+		assert.equal(panel.panel, "hidden");
+		assert.equal(panel.lastVisiblePanel, selectedPanel);
+
+		applyTaskPanelContentVisibility(panel, { ...options, remainingTasks: 1 });
+		assert.equal(panel.panel, selectedPanel);
+		assert.equal(panel.hiddenByUser, false);
+		assert.equal(panel.lastVisiblePanel, selectedPanel);
+	});
+}
+
+test("task panel stays hidden when auto-show is disabled or its default is hidden", () => {
+	for (const options of [
+		{ autoShowOnFirstTask: false, defaultPanel: "compact" as const },
+		{ autoShowOnFirstTask: true, defaultPanel: "hidden" as const },
+	]) {
+		const panel = createTaskPanelVisibility("hidden");
+		applyTaskPanelContentVisibility(panel, { ...options, hasTasks: true, remainingTasks: 1 });
+		applyTaskPanelContentVisibility(panel, { ...options, hasTasks: true, remainingTasks: 0 });
+		applyTaskPanelContentVisibility(panel, { ...options, hasTasks: true, remainingTasks: 1 });
+		assert.equal(panel.panel, "hidden");
+		assert.equal(panel.hiddenByUser, false);
+	}
 });
 
 test("task panel replace preserves user-hidden visibility snapshot", () => {

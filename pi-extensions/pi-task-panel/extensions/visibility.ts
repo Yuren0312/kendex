@@ -73,7 +73,8 @@ export function userShowTaskPanel(state: TaskPanelVisibilityState, panel: Visibl
 
 export function autoShowTaskPanelOnce(state: TaskPanelVisibilityState, options: { autoShowOnFirstTask: boolean; defaultPanel: PanelState }): void {
 	ensureTaskPanelVisibility(state);
-	if (!options.autoShowOnFirstTask || state.hiddenByUser || state.autoShownThisSession) return;
+	if (!options.autoShowOnFirstTask || state.hiddenByUser) return;
+	const previouslyShown = state.autoShownThisSession;
 	state.autoShownThisSession = true;
 	if (state.panel !== "hidden") {
 		state.lastVisiblePanel = state.panel;
@@ -81,8 +82,9 @@ export function autoShowTaskPanelOnce(state: TaskPanelVisibilityState, options: 
 	}
 	const next = normalizePanelState(options.defaultPanel);
 	if (next !== "hidden") {
-		state.panel = next;
-		state.lastVisiblePanel = visiblePanelFor(next);
+		// Completion keeps the chosen mode; only the initial show uses the default.
+		state.panel = previouslyShown ? state.lastVisiblePanel : next;
+		state.lastVisiblePanel = state.panel;
 	}
 }
 
