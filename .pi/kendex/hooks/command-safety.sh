@@ -30,7 +30,8 @@ environment_private_path() {
 # The selector uses environment_dump's stage words and their kinds. Both
 # direct commands and unsupported suffixes need the same launcher decision.
 environment_producer() { # command kind, optional unsupported context and command-head proof
-    local env_head named_removal
+    local env_head named_removal opaque_pos="" opaque_head="" exec_option exec_end OPTIND OPTARG
+    receiver_pos=""
     # Other is unresolved. An existing arm's proof must establish clean.
     mode=other
     # Only these literal forwarding forms are part of the input contract.
@@ -46,7 +47,27 @@ environment_producer() { # command kind, optional unsupported context and comman
         exec | builtin)
           if [ "$1" = shell ] && [ "${args[$((pos - 1))]}" = "$program" ]; then
             [ -n "$unsupported" ] || main_start=$pos
+            if [ -z "$opaque_pos" ]; then opaque_pos=$pos; opaque_head=$program_pos; fi
             program=opaque; unsupported=1; compound=1
+            # Select the receiver in this prefix owner without granting the
+            # opaque command any producer or argument-data permission.
+            if [ "${args[$program_pos]}" = exec ]; then
+              OPTIND=1
+              while getopts ':a:cl' exec_option "${args[@]:pos}"; do
+                case "$exec_option" in '?' | ':') break 2 ;; esac
+              done
+              exec_end=$((pos + OPTIND - 1))
+              for ((j=pos; j<exec_end; j++)); do
+                [ "${arg_kinds[$j]:-}" = literal ] || break
+              done
+              [ "$j" -eq "$exec_end" ] || break
+              pos=$exec_end
+            else
+              [ "${args[$pos]:-}" != -- ] || pos=$((pos + 1))
+            fi
+            [ "$pos" -lt "${#args[@]}" ] || break
+            program=""; program_pos=""
+            continue
           fi
           break ;;
         command)
@@ -116,6 +137,11 @@ environment_producer() { # command kind, optional unsupported context and comman
         *) break ;;
       esac
     done
+    if [ -n "$opaque_pos" ]; then
+      if [ "$program" != opaque ] && [ -n "$program_pos" ] &&
+         [ "${arg_kinds[$program_pos]:-}" = literal ]; then receiver_pos=$program_pos; fi
+      program=opaque; pos=$opaque_pos; program_pos=$opaque_head; mode=other
+    fi
     producer_end=$pos
     # Bash expands ANSI-C escapes after the harness submits command text.
     # These producer operands cannot prove a safe name, flag or input path.
@@ -820,7 +846,7 @@ environment_dump() { # command kind; arguments are already decoded data
   local LC_ALL=C i=0 c next quote="" word="" expansion="" active="" kind=literal compound="" bare=1 quoted=""
   local j start=0 end n fd redirection_kind target proc output input_redirect input_escaped pos program value named flags
   local mode pattern_count pattern filter_ok stage=0 text text_length span span_re comment_span options_ended null_output syntax_head program_pos stdin_program source_pos data_source piped_source="" pipeline="" heredoc_input=${heredoc_input:-}
-  local receiver receiver_pattern receiver_option receiver_named
+  local receiver receiver_pattern receiver_option receiver_named receiver_pos
   local unsupported="" scan candidate limit producer_end code incoming_sources="" file_output file_body redirect_evidence head_start main_start script_pos forwarded_argument=""
   local heredoc_op="" heredoc_origin delimiter line remaining doc body found math_depth=0 needs_target="" main_text main_required="" body_start body_end
   local name_re='^[A-Za-z_][A-Za-z0-9_]*(=.*)?$'
@@ -1191,6 +1217,9 @@ environment_dump() { # command kind; arguments are already decoded data
          [ "${#starts[@]}" -eq 1 ] && [ -z "$input_redirect" ] &&
          [ "${stage_kinds[$pos]:-}" = literal ] && [[ ${stage_args[$pos]:-} != [-+]* ]] &&
          [ "${stage_roles[$pos]:-}" = argument ]; then script_pos=$pos; fi
+      if [ -n "$receiver_pos" ]; then
+        environment_receiver "${stage_args[$receiver_pos]##*/}"
+      fi
       for ((candidate=0; candidate<${#stage_args[@]}; candidate++)); do
         [ "${stage_kinds[$candidate]}" != ansi-escaped ] || return 0
         [ "$candidate" -ge "$main_start" ] || continue
@@ -1204,11 +1233,6 @@ environment_dump() { # command kind; arguments are already decoded data
             # clean reads. Its retained receipt decision owns this command.
             [ "$program" != set ] || continue ;;
         esac
-        # An unsupported suffix cannot prove which literal word receives
-        # execution. Keep its existing receiver facts beside written bodies.
-        if [ -n "$unsupported" ] && [ "${stage_kinds[$candidate]}" = literal ]; then
-          environment_receiver "${value##*/}"
-        fi
         # The approved ordinary quoted-data class has the same recorded
         # receiver, role and argument bounds. It recognizes no inner words.
         if [ "$1" = shell ] && [ -z "${2:-}$compound" ] && [ "$program" = bash ] && [ -z "$source_pos" ] && [ -z "$syntax_head" ] &&

@@ -349,6 +349,20 @@ environment_rows() {
 [0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nprintf '%s' 'exec bash tmp/h.sh'","written-opaque-quoted-exec-data"]
 [0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec python3 -c 'print(\"bash tmp/h.sh\")'","written-opaque-interpreter-data"]
 [0,"cat > tmp/h.sh <<'EOF'\nenv -u NAME cmd\nEOF\nexec bash tmp/h.sh","written-opaque-exec-unset-launcher"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec printf '%s\\n' 'bash'","written-exec-argument-bash"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec printf '%s\\n' 'sh'","written-exec-argument-sh"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec printf '%s\\n' 'dash'","written-exec-argument-dash"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec printf '%s\\n' 'zsh'","written-exec-argument-zsh"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec printf '%s\\n' 'ksh'","written-exec-argument-ksh"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec printf /bin/bash","written-exec-path-argument"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec printf bash","written-exec-unquoted-argument"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec -a bash printf '%s\\n' /bin/bash","written-exec-option-argument-data"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec -clabash printf '%s\\n' /bin/bash","written-exec-grouped-option-data"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbuiltin printf '%s\\n' bash","written-builtin-argument-data"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbuiltin command printf '%s\\n' bash","written-builtin-command-argument-data"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec -cl -- /bin/bash tmp/h.sh","written-exec-grouped-options-shell"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec -afixture bash tmp/h.sh","written-exec-attached-option-shell"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbuiltin exec -a fixture bash tmp/h.sh","written-builtin-exec-shell"]
 [2,"FABRICATED_VALUE=fixture-private-value-4519 cat ~/.fleet/env","private-tilde"]
 [2,"cat @PRIVATE_HOME@/.fleet/env","private-inherited-home"]
 [2,"cat $HOME/.fleet/env","private-textual-home"]
@@ -1545,7 +1559,8 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "expansion-quote-mask" { swap("else expansion=\"$expansion \"; fi", "else expansion=$expansion$span; fi") }
       defect == "written-body" { swap("written_bodies[${#written_bodies[@]}]=${heredoc_bodies[$doc]}", ":") }
       defect == "expanded-executable-context" && /^    if / { swap("if { [ \"$mode\" = other ] || [ \"$mode\" = unclassified-forwarded ]; } &&", "if [ \"$1\" = shell ] && { [ \"$mode\" = other ] || [ \"$mode\" = unclassified-forwarded ]; } &&") }
-      defect == "opaque-receiver-evidence" { swap("environment_receiver \"${value##*/}\"", ":") }
+      defect == "receiver-argument-promotion" { swap("if [ -n \"$receiver_pos\" ]; then", "if [ -n \"$receiver_pos\" ]; then receiver_pos=$((${#stage_args[@]} - 1))") }
+      defect == "opaque-receiver-evidence" { swap("environment_receiver \"${stage_args[$receiver_pos]##*/}\"", ":") }
       defect == "written-shell-evidence" { swap("written_shell=1", ":") }
       defect == "written-body-concatenation" { swap("local command_text=$body", "local command_text=${written_bodies[*]}") }
       defect == "written-body-history" { swap("written_bodies[${#written_bodies[@]}]=${heredoc_bodies[$doc]}", "written_bodies=(); written_bodies[0]=${heredoc_bodies[$doc]}") }
@@ -1665,6 +1680,7 @@ expansion-origin-cut|FAIL environment: expanded-head-mixed-prefix-glob: exit=0 e
 expansion-quote-mask|FAIL environment: quoted-glob-head-data: exit=2 expected=0
 written-body|FAIL environment: written-shell-body-dump: exit=0 expected=2
 expanded-executable-context|FAIL environment: expanded-executable-heredoc-substitution: exit=0 expected=2
+receiver-argument-promotion|FAIL environment: written-exec-argument-bash: exit=2 expected=0
 opaque-receiver-evidence|FAIL environment: written-opaque-exec-shell: exit=0 expected=2
 written-shell-evidence|FAIL environment: written-shell-nested-before-body: exit=0 expected=2
 written-body-concatenation|FAIL environment: written-shell-independent-bodies: exit=0 expected=2
