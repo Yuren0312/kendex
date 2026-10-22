@@ -785,9 +785,7 @@ environment_program_text() {
         [ "${arg_kinds[$cursor]}" = literal ] || unproved=1
       done
       source_pos=$pos ;;
-    source | .)
-      stdin_program=1
-      [[ ${args[$pos]:-} == [-+]* ]] || script_operand_pos=$pos ;;
+    source | .) stdin_program=1 ;;
     opaque)
       unproved=1
       # Exec can retain literal input for later list commands. Remove the
@@ -828,8 +826,8 @@ environment_dump() { # command kind; arguments are already decoded data
   local ordinary_span_re=$'^[^\'"\\\\$`# \t\r\n;|()<>&]+'
   local single_span_re="^[^']+" ansi_span_re="^[^'\\\\]+" double_span_re='^[^"\\$`]+' comment_span_re=$'^[^\n]+'
   local tokens=() kinds=() unquoted_words=() saved_quotes=() closers=() args=() arg_kinds=() arg_unquoted=() arg_roles=() stage_roles=() stage_args=() stage_kinds=() stage_unquoted=() heredocs=() heredoc_tabs=() heredoc_expand=() heredoc_bodies=() heredoc_starts=() body_ids=() stage_sources=() stage_stdin=() executable_texts=() executable_stages=()
-  local body_decisions=() written_targets=() written_execution=() stage_execution=()
-  local script_operand_pos write_execution=unconditional prior
+  local body_decisions=() written_targets=()
+  local script_operand_pos
   local expansion_words=() arg_expansions=() stage_expansions=()
   local private_inputs=()
   local starts=() ends=() separators=() decisions=() literal_inputs=() input_bodies=() file_outputs=() executable_contexts=()
@@ -1043,16 +1041,7 @@ environment_dump() { # command kind; arguments are already decoded data
       case "${tokens[$i]}" in '|' | ';' | '&&' | '||' | '&') ;; *) continue ;; esac
     fi
     starts[stage]=$start; ends[stage]=$i
-    stage_execution[stage]=$write_execution
-    separators[stage]=${tokens[$i]:-end}
-    # List continuation can leave an empty newline stage after && or ||.
-    # It does not establish execution of the conditional command that follows.
-    case "${separators[$stage]}" in
-      "&&" | "||" | "|") write_execution=conditional ;;
-      "&") stage_execution[stage]=asynchronous; write_execution=unconditional ;;
-      *) [ "$start" -ge "$i" ] || write_execution=unconditional ;;
-    esac
-    stage=$((stage + 1)); start=$((i + 1))
+    separators[stage]=${tokens[$i]:-end}; stage=$((stage + 1)); start=$((i + 1))
   done
   # Forwarded input has no local data contract for the complete pipeline.
   if [ -n "$pipeline" ] && [ -n "$incoming_sources" ] && [ -n "$heredoc_input" ] && environment_main_evidence "$text" "${@:3}"; then return 0; fi
@@ -1163,15 +1152,9 @@ environment_dump() { # command kind; arguments are already decoded data
          [ "$file_output" = 1 ] && [ "$file_body" = 1 ] && [ -z "$redirect_evidence" ] &&
          [ "$program_pos" = 0 ] && [ "$head_start" -eq 0 ] && [ "${arg_kinds[0]}" = literal ] &&
          [ "$data_source" = " $doc" ]; then
-        # A declaration behind a list condition may never replace the file.
-        # Background writes can still arrive after a later foreground write.
-        if [ "${stage_execution[$stage]}" = unconditional ]; then
-          for ((prior=0; prior<${#heredocs[@]}; prior++)); do
-            [ "${written_targets[$prior]:-}" = "$file_target" ] || continue
-            [ "${written_execution[$prior]:-}" = asynchronous ] || written_targets[prior]=""
-          done
-        fi
-        written_targets[doc]=$file_target; written_execution[doc]=${stage_execution[$stage]}
+        # Submitted text does not prove the execution order of file writes.
+        # Keep every body for a selected script path, including replaced data.
+        written_targets[doc]=$file_target
         body=${heredoc_bodies[$doc]}; body_start=${heredoc_starts[$doc]}; body_end=$((body_start + ${#body}))
         main_text=${main_text:0:body_start}${body//[!$'\n']/ }${main_text:body_end}
         continue
