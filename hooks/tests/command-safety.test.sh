@@ -241,11 +241,50 @@ environment_rows() {
 [2,"true; {set,}","expanded-head-list-brace-set"]
 [2,"/usr/bin/printen?","expanded-head-glob-printenv"]
 [2,"true; /usr/bin/printen?","expanded-head-list-glob-printenv"]
+[2,"\"/usr/bin\"/printen?","expanded-head-mixed-prefix-glob"]
+[2,"/usr/bin/\"printen\"?","expanded-head-mixed-name-glob"]
+[2,"true; \"/usr/bin\"/printen? --null","expanded-head-list-mixed-glob-argument"]
+[2,"{en\"v\",}","expanded-head-mixed-brace"]
+[2,"true; {en\"v\",}","expanded-head-list-mixed-brace"]
+[2,"e{nv,nv}","expanded-head-split-brace"]
+[2,"true; e{nv,nv}","expanded-head-list-split-brace"]
+[2,"e{n..n}v","expanded-head-range-brace"]
+[2,"exec e{n..n}v","expanded-head-exec-range-brace"]
+[2,"builtin {s\"et\",}","expanded-head-builtin-mixed-brace"]
+[2,"if e{nv,nv}; then true; fi","expanded-head-conditional-split-brace"]
+[2,"true; e{n..n}v --null","expanded-head-list-range-brace-argument"]
+[2,"e{{n,n}v,}","expanded-head-nested-brace"]
+[2,"/usr/bin/e[n]v","expanded-head-bracket-glob"]
+[2,"/usr/bin/printen*","expanded-head-star-glob"]
+[2,"$'/usr/bin'/printen?","expanded-head-ansi-prefix-glob"]
+[2,"$\"/usr/bin\"/printen?","expanded-head-locale-prefix-glob"]
+[2,"{en\\v,}","expanded-head-escaped-letter-brace"]
+[2,"command \"/usr/bin\"/printen?","expanded-head-command-prefix"]
+[2,"env -u NAME \"/usr/bin\"/printen?","expanded-head-unset-selected-target"]
+[2,"bash wrapper.sh \"/usr/bin\"/printen?","expanded-head-forwarded-mixed-glob"]
+[2,"bash wrapper.sh $'/usr/bin'/printen?","expanded-head-forwarded-ansi-prefix-glob"]
+[2,"sh LAUNCH WAIT e{nv,nv}","expanded-head-forwarded-split-brace"]
+[2,"bash -c '\"/usr/bin\"/printen?'","expanded-head-recursive-mixed-glob"]
+[2,"cat > tmp/h.sh <<'EOF'\ne{nv,nv}\nEOF\nbash tmp/h.sh","expanded-head-written-split-brace"]
 [2,"true; tool {set,}","expanded-list-argument-retains-evidence"]
 [0,"tool '/usr/bin/printen?'","quoted-glob-argument-data"]
 [0,"tool /usr/bin/printen?","glob-argument-data"]
 [0,"'/usr/bin/printen?'","quoted-glob-head-data"]
 [0,["/usr/bin/printen?"],"argv-glob-head-data"]
+[0,"/usr/bin/printen\\?","escaped-glob-head-data"]
+[0,"\"/usr/bin\"/printen'?'","mixed-protected-glob-head-data"]
+[0,"'e{nv,nv}'","quoted-brace-head-data"]
+[0,"e\\{nv,nv\\}","escaped-brace-head-data"]
+[0,"e{nv\\,nv}","escaped-comma-head-data"]
+[0,"e{nv\",\"nv}","quoted-comma-head-data"]
+[0,"'e{'nv,nv}","quoted-brace-open-head-data"]
+[0,"e{nv,nv\"}\"","quoted-brace-close-head-data"]
+[0,"e{n\\.\\.n}v","escaped-range-head-data"]
+[0,"/usr/bin/e\\[n\\]v","escaped-bracket-head-data"]
+[0,["e{nv,nv}"],"argv-brace-head-data"]
+[0,"tool e{nv,nv}","split-brace-argument-data"]
+[0,"tool \"/usr/bin\"/printen?","mixed-glob-argument-data"]
+[0,"tool '{set,}'","quoted-brace-argument-data"]
 [2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbash tmp/h.sh","written-shell-body-dump"]
 [0,"cat > tmp/h.sh <<'EOF'\nenv -u NAME cmd\nEOF\nbash tmp/h.sh","written-shell-body-unset-launcher"]
 [0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbash tmp/other.sh","written-shell-body-other-path"]
@@ -1441,7 +1480,9 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "no-check" { swap("if environment_dump \"$command_kind\"; then", "if false; then") }
       defect == "private-path" { swap("environment_private_path() {", "environment_private_path() { return 1") }
       defect == "main-evidence-cut" { swap("[[ ! $evidence =~ $opaque_re ]] || return 0", ":") }
-      defect == "expanded-head" { swap("if environment_main_evidence --head \"${args[$program_pos]}\"; then", "if false; then") }
+      defect == "expanded-head" && /^      if environment_main_evidence --head / { swap("if environment_main_evidence --head \"${arg_expansions[$program_pos]}\"; then", "if false; then") }
+      defect == "expansion-origin-cut" { swap("then expansion=$expansion$span", "then expansion=$expansion") }
+      defect == "expansion-quote-mask" { swap("else expansion=\"$expansion \"; fi", "else expansion=$expansion$span; fi") }
       defect == "written-body" { swap("written_targets[doc]=$file_target", ":") }
       defect == "operand-word-boundary" { swap("(^|[^A-Za-z0-9_.-])(env|printenv|export|declare|typeset|show-environment)([^A-Za-z0-9_.-]|$)", "(^|[^A-Za-z0-9_])(env|printenv|export|declare|typeset|show-environment)([^A-Za-z0-9_]|$)") }
       defect == "unclassified-head-only" { swap("if [ -z \"$stdin_program\" ] && { [ -n \"$redirect_evidence\" ] || environment_main_evidence \"${args[@]}\"; }; then mode=dump-unknown; fi", "if [ -z \"$stdin_program\" ] && { [ -n \"$redirect_evidence\" ] || environment_main_evidence \"${args[$program_pos]}\"; }; then mode=dump-unknown; fi") }
@@ -1555,6 +1596,8 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
 private-path|FAIL environment: private-tilde: exit=0 expected=2
 expanded-head|FAIL environment: expanded-head-brace-env: exit=0 expected=2
 expanded-head|FAIL environment: expanded-head-glob-printenv: exit=0 expected=2
+expansion-origin-cut|FAIL environment: expanded-head-mixed-prefix-glob: exit=0 expected=2
+expansion-quote-mask|FAIL environment: quoted-glob-head-data: exit=2 expected=0
 written-body|FAIL environment: written-shell-body-dump: exit=0 expected=2
 receiver-named-method|FAIL environment: receiver-jarvis-config-named-method: exit=2 expected=0
 receiver-named-method|FAIL environment: receiver-jarvis-heredoc-named-method: exit=2 expected=0
