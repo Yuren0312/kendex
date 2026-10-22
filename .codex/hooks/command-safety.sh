@@ -722,8 +722,8 @@ environment_receiver_evidence() {
 # after -c. Known literal input stays conservative for every shell invocation;
 # script operands and redirects do not prove that the body is unused.
 environment_program_text() {
-  local cursor=$pos source="" options_ended="" wants_string="" wants_stdin="" value text="" unproved=""
-  stdin_program=""; source_pos=""; script_selection=other
+  local cursor=$pos source="" options_ended="" wants_string="" value text="" unproved=""
+  stdin_program=""; source_pos=""
   environment_receiver
   if [ "$receiver" = interpreter ]; then
     for ((cursor=pos; cursor<${#args[@]}; cursor++)); do
@@ -742,14 +742,14 @@ environment_program_text() {
   case "$program" in
     bash | sh | dash | zsh | ksh)
       stdin_program=1
-      script_selection=unresolved
+      written_shell=1
       while [ "$cursor" -lt "${#args[@]}" ]; do
         value=${args[$cursor]}
         [ "${arg_kinds[$cursor]}" = literal ] || unproved=1
         if [ -z "$options_ended" ]; then
           case "$value" in
             --) options_ended=1; cursor=$((cursor + 1)); continue ;;
-            -) options_ended=1; wants_stdin=1; cursor=$((cursor + 1)); continue ;;
+            -) options_ended=1; cursor=$((cursor + 1)); continue ;;
             --rcfile | --init-file)
               [ "$((cursor + 1))" -ge "${#args[@]}" ] ||
                 [ "${arg_kinds[$((cursor + 1))]:-}" = literal ] || unproved=1
@@ -758,12 +758,10 @@ environment_program_text() {
               # A short-option word can combine command-string selection and
               # an option with an operand. Consume the entire invocation word.
               [[ $value != -*c* ]] || wants_string=1
-              [[ $value != -*s* ]] || wants_stdin=1
               [[ ${value:1} =~ ^[abCefhiklmnprstuvxBDEHPTcoO]+$ ]] || unproved=1
               case "${value:1}" in
                 *[oO]*[oO]*)
-                  # Bash-tool commands can group option operands. Without a
-                  # selection proof their registered file bodies stay evidence.
+                  # Grouped option operands cannot prove a literal source.
                   if environment_main_evidence "${args[@]:pos}"; then mode=dump-unknown; fi
                   return ;;
                 *o* | *O*)
@@ -776,14 +774,10 @@ environment_program_text() {
             -*) unproved=1; cursor=$((cursor + 1)); continue ;;
           esac
         fi
-        if [ -n "$wants_string" ]; then source=$value; source_pos=$cursor
-        elif [ -z "$wants_stdin" ] && [ "$value" != - ] && [ -z "$unproved" ]; then script_selection=file:$cursor; fi
+        if [ -n "$wants_string" ]; then source=$value; source_pos=$cursor; fi
         break
       done
-      if [ -z "$unproved" ] && [ "$script_selection" = unresolved ]; then
-        if [ -n "$wants_string" ]; then script_selection=command-string
-        else script_selection=stdin; fi
-      fi ;;
+      ;;
     eval)
       stdin_program=1
       # Eval can consume a leading option operand before joining its source.
@@ -827,15 +821,17 @@ environment_dump() { # command kind; arguments are already decoded data
   local j start=0 end n fd redirection_kind target proc output input_redirect input_escaped pos program value named flags
   local mode pattern_count pattern filter_ok stage=0 text text_length span span_re comment_span options_ended null_output syntax_head program_pos stdin_program source_pos data_source piped_source="" pipeline="" heredoc_input=${heredoc_input:-}
   local receiver receiver_pattern receiver_option receiver_named
-  local unsupported="" scan candidate limit producer_end code incoming_sources="" file_output file_target file_body redirect_evidence head_start main_start script_pos forwarded_argument=""
+  local unsupported="" scan candidate limit producer_end code incoming_sources="" file_output file_body redirect_evidence head_start main_start script_pos forwarded_argument=""
   local heredoc_op="" heredoc_origin delimiter line remaining doc body found math_depth=0 needs_target="" main_text main_required="" body_start body_end
   local name_re='^[A-Za-z_][A-Za-z0-9_]*(=.*)?$'
   local filter_re='^([A-Za-z_][A-Za-z0-9_]*=?|\^[A-Za-z_][A-Za-z0-9_]*=|\^\([A-Za-z_][A-Za-z0-9_]*(\|[A-Za-z_][A-Za-z0-9_]*)+\)=)$'
   local ordinary_span_re=$'^[^\'"\\\\$`# \t\r\n;|()<>&]+'
   local single_span_re="^[^']+" ansi_span_re="^[^'\\\\]+" double_span_re='^[^"\\$`]+' comment_span_re=$'^[^\n]+'
   local tokens=() kinds=() unquoted_words=() saved_quotes=() closers=() args=() arg_kinds=() arg_unquoted=() arg_roles=() stage_roles=() stage_args=() stage_kinds=() stage_unquoted=() heredocs=() heredoc_tabs=() heredoc_expand=() heredoc_bodies=() heredoc_starts=() body_ids=() stage_sources=() stage_stdin=() executable_texts=() executable_stages=()
-  local body_decisions=() written_targets=()
-  local script_selection script_operand_pos
+  local body_decisions=()
+  # Recursive contexts carry a classification argument. The outer submission
+  # owns evidence across those contexts and every stage, regardless of order.
+  if [ "$#" -eq 1 ]; then local written_bodies=() written_shell=""; fi
   local expansion_words=() arg_expansions=() stage_expansions=()
   local private_inputs=()
   local starts=() ends=() separators=() decisions=() literal_inputs=() input_bodies=() file_outputs=() executable_contexts=()
@@ -1055,7 +1051,7 @@ environment_dump() { # command kind; arguments are already decoded data
   if [ -n "$pipeline" ] && [ -n "$incoming_sources" ] && [ -n "$heredoc_input" ] && environment_main_evidence "$text" "${@:3}"; then return 0; fi
   for ((stage=0; stage<${#starts[@]}; stage++)); do
     start=${starts[$stage]}; end=${ends[$stage]}; args=(); arg_kinds=(); arg_unquoted=(); arg_expansions=(); arg_roles=()
-    private_inputs=(); proc=""; output=""; input_redirect=""; input_escaped=""; mode=other; program=""; program_pos=""; data_source=""; file_output=""; file_target=""; file_body=""; redirect_evidence=""
+    private_inputs=(); proc=""; output=""; input_redirect=""; input_escaped=""; mode=other; program=""; program_pos=""; data_source=""; file_output=""; file_body=""; redirect_evidence=""
     for ((j=start; j<end; j++)); do
       case "${kinds[$j]}" in operator | operator-stderr | operator-explicit-other)
         fd=${kinds[$j]}
@@ -1082,7 +1078,7 @@ environment_dump() { # command kind; arguments are already decoded data
             data_source="$data_source $doc" ;;
           '>')
             [ "$fd" = operator-stderr ] || output=1
-            if [ "$fd" = operator ] && [ "${kinds[$j]:-}" = literal ]; then file_output=1; file_target=$target; fi ;;
+            if [ "$fd" = operator ] && [ "${kinds[$j]:-}" = literal ]; then file_output=1; fi ;;
           '>>')
             [ "$fd" = operator-stderr ] || output=1
             if [ "$fd" = operator ] && [ "${kinds[$j]:-}" = literal ]; then file_output=append; fi ;;
@@ -1131,20 +1127,6 @@ environment_dump() { # command kind; arguments are already decoded data
         esac
       done
     fi
-    case "$script_selection" in
-      other | command-string | stdin) ;;
-      file:* | unresolved)
-        for ((doc=0; doc<${#heredocs[@]}; doc++)); do
-          [ -n "${written_targets[$doc]:-}" ] || continue
-          if [ "$script_selection" != unresolved ]; then
-            script_operand_pos=${script_selection#file:}
-            [ "${written_targets[$doc]}" = "${args[$script_operand_pos]}" ] || continue
-          fi
-          code=${#executable_texts[@]}
-          executable_texts[code]=${heredoc_bodies[$doc]}; executable_stages[code]=$stage
-        done ;;
-      *) return 0 ;;
-    esac
     # Supported shell source keeps this classification check in its queue.
     # Other unclassified forwarded argv retains the complete read evidence.
     if [ "$mode" = unclassified-forwarded ]; then
@@ -1167,9 +1149,9 @@ environment_dump() { # command kind; arguments are already decoded data
          [ "$file_output" = 1 ] && [ "$file_body" = 1 ] && [ -z "$redirect_evidence" ] &&
          [ "$program_pos" = 0 ] && [ "$head_start" -eq 0 ] && [ "${arg_kinds[0]}" = literal ] &&
          [ "$data_source" = " $doc" ]; then
-        # Submitted text does not prove the execution order of file writes.
-        # Keep every body for a selected script path, including replaced data.
-        written_targets[doc]=$file_target
+        # Keep independent body history. Neither argv nor a later write
+        # proves that submitted shell evidence can be discarded.
+        written_bodies[${#written_bodies[@]}]=${heredoc_bodies[$doc]}
         body=${heredoc_bodies[$doc]}; body_start=${heredoc_starts[$doc]}; body_end=$((body_start + ${#body}))
         main_text=${main_text:0:body_start}${body//[!$'\n']/ }${main_text:body_end}
         continue
@@ -1307,6 +1289,12 @@ environment_dump() { # command kind; arguments are already decoded data
       done
     fi
   done
+  if [ "$#" -eq 1 ] && [ -n "$written_shell" ]; then
+    for body in ${written_bodies[@]+"${written_bodies[@]}"}; do
+      local command_text=$body
+      if environment_dump shell conservative; then return 0; fi
+    done
+  fi
   for ((stage=0; stage<${#decisions[@]}; stage++)); do
     # The retained set decision also needs the recorded closing group and
     # status file write. Future-stage collector facts are now available.
