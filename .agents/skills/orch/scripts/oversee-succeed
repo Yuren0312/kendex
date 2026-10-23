@@ -393,7 +393,11 @@
 #                    does (step 2). `mark-reached` carries
 #                    `kind` (context, headroom, rate or qualifying), the `value` it read, the
 #                    `mark` it crossed and `succession`, the effective
-#                    ORCH_OVERSEER_SUCCESSION. A reading that could not be
+#                    ORCH_OVERSEER_SUCCESSION, and where a context judgement
+#                    ran, `context_decision`, the shared judge's decision JSON
+#                    (lib/lane-context.sh § lane_context_handoff_decision),
+#                    which the turn-end hook writes into the overseer's
+#                    handoff record. A reading that could not be
 #                    taken at all is `mark-unmeasured kind=<context|headroom|rate|qualifying>
 #                    reason=<...>`,
 #                    which is not a mark that lifted: a caller holding a
@@ -1012,6 +1016,7 @@ if (( JUDGES )); then
   CONTEXT_PCT="$(lane_context_handoff_pct "$requested_pct")" \
     || die invalid-context-mark "ORCH_HANDOFF_CONTEXT_PCT=$requested_pct"
 fi
+context_fields=()
 if (( JUDGES )) && [[ "$CONTEXT_STATE" == unmeasured ]]; then
   due_rc=0
   due="$(lane_context_handoff_due "$tokens" "$window" "$CONTEXT_PCT")" || due_rc=$?
@@ -1020,10 +1025,12 @@ if (( JUDGES )) && [[ "$CONTEXT_STATE" == unmeasured ]]; then
     1) CONTEXT_STATE=unmeasured ;;
     *) die invalid-context-mark "ORCH_HANDOFF_CONTEXT_PCT=$CONTEXT_PCT" ;;
   esac
+  # The judged reading, which the turn-end hook writes into the handoff record.
+  context_fields=("context_decision=$(lane_context_handoff_decision "$tokens" "$window" "$CONTEXT_PCT")")
 fi
 if [[ "$MODE" == check && "$CONTEXT_STATE" == due ]]; then
   message mark-reached kind=context "value=$tokens" "mark=$CONTEXT_PCT" \
-    "succession=$SUCCESSION" headroom=unreadable "window=$window"
+    "succession=$SUCCESSION" headroom=unreadable "window=$window" ${context_fields[@]+"${context_fields[@]}"}
   exit 0
 fi
 [[ -n "${TMUX:-}" ]] || die tmux-missing var=TMUX
@@ -1647,13 +1654,13 @@ if [[ "$MODE" == check ]]; then
     [[ "$CALLER_ENDED" != true ]] || reserve_fields+=(status=plan_ended)
     message mark-reached kind=headroom "value=$CALLER_HEADROOM" "mark=$HEADROOM_TRIGGER" \
       "succession=$SUCCESSION" "account=${CALLER_ACCOUNT:-unknown}" "resets=${CALLER_RESETS:-none}" \
-      ${reserve_fields[@]+"${reserve_fields[@]}"}
+      ${reserve_fields[@]+"${reserve_fields[@]}"} ${context_fields[@]+"${context_fields[@]}"}
   elif [[ "$MARK_KIND" == rate ]]; then
     message mark-reached kind=rate "value=$WALL_PROJECTED" "mark=$WALL_MINUTES" \
-      "succession=$SUCCESSION" "account=${CALLER_ACCOUNT:-unknown}"
+      "succession=$SUCCESSION" "account=${CALLER_ACCOUNT:-unknown}" ${context_fields[@]+"${context_fields[@]}"}
   else
     message mark-reached kind=qualifying "value=$QUALIFYING_TOTAL" "mark=$SUCCESSOR_ACCOUNTS" \
-      "succession=$SUCCESSION" "headroom=$HEADROOM_FIELD"
+      "succession=$SUCCESSION" "headroom=$HEADROOM_FIELD" ${context_fields[@]+"${context_fields[@]}"}
   fi
   exit 0
 fi

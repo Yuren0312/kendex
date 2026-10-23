@@ -675,7 +675,7 @@ tool_notice_told() {
 # The one exit for a refusal, KEY VALUE [CAUSE] as `message` takes them:
 # every arm above the handoff marks, the arm check, the payload readers and
 # every mailbox refusal; the handoff refusals reach it through
-# `refuse_handoff` below, the one site that builds the instruction, so no
+# `refuse_judged_handoff` below, the one site that builds the instruction, so no
 # other path pays for text it would not print. The text is rendered once,
 # written to stderr, and on Copilot handed back as the documented answer for
 # the event on stdout, since there the exit status alone holds nothing: a
@@ -1965,7 +1965,7 @@ handoff_is_mine() {
 # established by a read of the fleet item's own state file under the rule,
 # which answers nothing without that file, so the item an overseer is judged
 # under always has one there.
-handoff_instruction() {
+handoff_instruction() { # DECISION
   if [ "$ROLE" = jarvis ]; then
     printf -v HANDOFF_INSTRUCTION \
       'Reach a safe point. Follow Succession in %s/workflows/session.md. Replace the handoff as that workflow requires, then run:\n  %q succeed --home %q' \
@@ -1980,6 +1980,15 @@ handoff_instruction() {
   if [ "$ARM" = halt ]; then
     AGENT_INSTRUCTION="lane-mail-check: detached-route=orch-job-runner${NL}Use the orch job runner described in waiter-launch.md, Launch, or a separate session for work that must survive this session.$NL$AGENT_INSTRUCTION"
   fi
+  # DECISION is the context reading refuse_judged_handoff names, or null. The
+  # library binds it to this session; a library not yet loaded, or an older
+  # retained one, binds nothing, so the record's context stays unknown rather
+  # than built a second way here.
+  HANDOFF_CONTEXT=null
+  if declare -F lane_context_handoff_context >/dev/null; then
+    HANDOFF_CONTEXT=$(lane_context_handoff_context "$1" "$HARNESS" "$SESSION" "$TRANSCRIPT" \
+      "${CALLER_KEY:-}" "${SOURCE:-}" "${COMPACTED:-}") || HANDOFF_CONTEXT=null
+  fi
   if [ "$ROLE" = overseer ]; then
     # The record carries the two names of the session writing it, so the next
     # overseer of this fleet reads it as somebody else's and meets its own
@@ -1987,12 +1996,15 @@ handoff_instruction() {
     # the overseer knows neither its own tmux server pid nor the id its
     # harness put in the payload.
     printf -v OVERSEER_RECORD \
-      '{"handoff_file":"[OVERSEER_HANDOFF_PATH]","pane_key":"%s","session_id":"%s"}' \
-      "$CALLER_KEY" "$SESSION"
+      '{"handoff_file":"[OVERSEER_HANDOFF_PATH]","pane_key":"%s","session_id":"%s","context":%s}' \
+      "$CALLER_KEY" "$SESSION" "$HANDOFF_CONTEXT"
+    # Each record is one single-quoted shell word, which the session edits in
+    # place; an embedded quote is closed, escaped and reopened.
+    printf -v HANDOFF_RECORD_WORD "'%s'" "${OVERSEER_RECORD//\'/\'\\\'\'}"
     printf -v HANDOFF_INSTRUCTION \
       'Reach a safe point first, with no merged event part-handled and no lane waiting on an answer only the root can give. There, rewrite the overseer handoff file and succeed this session:\n  %q%s -- [THE PERMISSION, MODEL AND EFFORT FLAGS THIS SESSION RUNS UNDER]\nWhere that refuses, tell the user a fresh overseer session must be started by hand, then record the handoff and end this session:\n  %q set %q handoff %s\nWrite the record as it stands above: the two names in it are what end this refusal for this session and for no other. It repeats at every turn end until the succession lands or that record stands.' \
       "$SCRIPTS/oversee-succeed" "${JUDGE_ARGS[*]+ ${JUDGE_ARGS[*]}}" \
-      "$SCRIPTS/workflow-state" "$ITEM" "'$OVERSEER_RECORD'"
+      "$SCRIPTS/workflow-state" "$ITEM" "$HANDOFF_RECORD_WORD"
     HANDOFF_INSTRUCTION="$AGENT_INSTRUCTION$NL$HANDOFF_INSTRUCTION"
     return 0
   fi
@@ -2007,11 +2019,15 @@ handoff_instruction() {
       printf -v INIT_LINE '  %q%s init %q --branch %q\n' "$SCRIPTS/workflow-state" "$STATE_ARGS" "$ITEM" "$BRANCH"
     fi
   fi
+  printf -v LANE_HANDOFF_RECORD \
+    '{"merged":["[PR]"],"remaining":["[STEP]"],"branch":"[BRANCH]","worktree":"[WORKTREE_PATH]","open_pr":"[PR_NUMBER_OR_NULL]","traps":["[TRAP]"],"context":%s}' \
+    "$HANDOFF_CONTEXT"
+  printf -v HANDOFF_RECORD_WORD "'%s'" "${LANE_HANDOFF_RECORD//\'/\'\\\'\'}"
   printf -v HANDOFF_INSTRUCTION \
     'Reach the next safe point first, a pushed head, a landed merge or a held PR; never interrupt a round or leave an unpushed tree. There, write the handoff record and send the notice, then end the session:\n%s  %q%s set %q handoff %s\n  %q notice --item %q --file [FILE NAMING WHAT IS LEFT]\nThis refusal repeats at every turn end until that record stands.' \
     "$INIT_LINE" \
     "$SCRIPTS/workflow-state" "$STATE_ARGS" "$ITEM" \
-    ''\''{"merged":["[PR]"],"remaining":["[STEP]"],"branch":"[BRANCH]","worktree":"[WORKTREE_PATH]","open_pr":[PR_NUMBER_OR_NULL],"traps":["[TRAP]"]}'\''' \
+    "$HANDOFF_RECORD_WORD" \
     "$READER" "$ITEM"
   HANDOFF_INSTRUCTION="$AGENT_INSTRUCTION$NL$HANDOFF_INSTRUCTION"
 }
@@ -2350,7 +2366,10 @@ attached_launch_check() {
   # it names the handoff, whatever the roster reads.
   due=$(lane_context_handoff_due "$TOKENS" "$WINDOW" "$MARK") || due_rc=$?
   case "$due_rc:$due" in
-    0:due) refuse_handoff agent-launch "$TOOL tokens=$TOKENS" ;;
+    0:due)
+      refuse_judged_handoff "$(handoff_decision "$TOKENS" "$WINDOW" "$MARK")" \
+        agent-launch "$TOOL tokens=$TOKENS"
+      ;;
     0:room) ;;
     *) refuse_handoff agent-input context-unmeasured ;;
   esac
@@ -2371,7 +2390,10 @@ attached_launch_check() {
   case "$AGENT_STATE:$ROLE" in
     out:*) refuse agent-reserve "$TOOL tokens=$TOKENS reserve=$AGENT_RESERVE" ;;
     *:overseer) refuse agent-unobserved "$TOOL tokens=$TOKENS reserve=$AGENT_RESERVE" ;;
-    *) refuse_handoff agent-unobserved "$TOOL tokens=$TOKENS reserve=$AGENT_RESERVE" ;;
+    *)
+      refuse_judged_handoff "$(handoff_decision "$TOKENS" "$WINDOW" "$MARK" "$AGENT_RESERVE")" \
+        agent-unobserved "$TOOL tokens=$TOKENS reserve=$AGENT_RESERVE"
+      ;;
   esac
 }
 
@@ -2388,7 +2410,12 @@ attached_launch_check() {
 # goes to tool.key for overseer_tool_check to decide how often it is told, and
 # the subshell ends at 0, so the mailbox check still runs and any mail rides
 # in the same context.
-refuse_handoff() { # KEY VALUE [CAUSE]
+#
+# DECISION is a context decision record from the library, which the handoff
+# record the refusal names carries, or null.
+refuse_judged_handoff() { # DECISION KEY VALUE [CAUSE]
+  local decision=$1
+  shift
   # Jarvis clears a reached mark by succeeding its controller session. A
   # broken reader or setting survives succession, so retiring this session
   # cannot clear that gap.
@@ -2396,13 +2423,18 @@ refuse_handoff() { # KEY VALUE [CAUSE]
     message "$@"
     exit 0
   fi
-  handoff_instruction
+  handoff_instruction "$decision"
   if [ "$ARM" = deliver ]; then
     message "$@"
     printf '%s\n' "$1" >"$WORK_DIR/tool.key"
     exit 0
   fi
   refuse "$@"
+}
+
+# The same refusal with a null decision.
+refuse_handoff() { # KEY VALUE [CAUSE]
+  refuse_judged_handoff null "$@"
 }
 
 # The context mark's setting, ORCH_HANDOFF_CONTEXT_PCT, into MARK as
@@ -2418,6 +2450,18 @@ context_mark_setting() {
   return 0
 }
 
+# The record of a reading the library's judge found due, for the handoff a
+# refusal names, from the library's decision for the same judge arguments. An
+# older retained orch library has no decision to give, so the reading stays
+# unknown.
+handoff_decision() { # TOKENS WINDOW PCT [AGENT_RESERVE]
+  if declare -F lane_context_handoff_decision >/dev/null; then
+    lane_context_handoff_decision "$@" || printf 'null\n'
+  else
+    printf 'null\n'
+  fi
+}
+
 # The reading TOKENS of WINDOW judged at MARK by the library's one judge,
 # lane_context_handoff_due: a reached mark is a handoff refusal, a window the
 # adapter could not name below the independent token limit is reported under
@@ -2427,7 +2471,7 @@ context_mark_judge() {
   DUE_RC=0
   DUE=$(lane_context_handoff_due "$TOKENS" "$WINDOW" "$MARK") || DUE_RC=$?
   case "$DUE_RC" in
-    0) [ "$DUE" != due ] || refuse_handoff context "$TOKENS" ;;
+    0) [ "$DUE" != due ] || refuse_judged_handoff "$(handoff_decision "$TOKENS" "$WINDOW" "$MARK")" context "$TOKENS" ;;
     1) message window-unread "${MODEL:-$HARNESS}" ;;
     *) refuse_handoff setting-range "ORCH_HANDOFF_CONTEXT_PCT=$MARK" ;;
   esac
@@ -3008,6 +3052,7 @@ overseer_unrecorded() {
 # tested where it is taken.
 overseer_marks() {
   [ -x "$SCRIPTS/oversee-succeed" ] || refuse_handoff script "$SCRIPTS/oversee-succeed"
+  local decision=null
 
   # Bounded by BOUND_BY, for the reason stated where it is set: this judgement
   # reads the one account the overseer session runs on, through the same
@@ -3055,6 +3100,7 @@ overseer_marks() {
       mark=*) MARK=${field#mark=} ;;
       headroom=*) MARK_HEADROOM=${field#headroom=} ;;
       succession=*) SUCCESSION=${field#succession=} ;;
+      context_decision=*) decision=${field#context_decision=} ;;
     esac
   done
   # A line missing one of the three is an answer this hook cannot act on, and
@@ -3073,9 +3119,9 @@ overseer_marks() {
   # refuses it, and the refusal is reported under `marks=unjudged`.
   [ "$SUCCESSION" != off ] || [ "$MARK_KIND" = context ] || return 0
   case "$MARK_KIND" in
-    context) refuse_handoff context "$MARK_VALUE" ;;
-    headroom) PCT="$MARK"; refuse_handoff headroom "$MARK_VALUE" ;;
-    rate|qualifying) refuse_handoff "$MARK_KIND" "$MARK_VALUE" ;;
+    context) refuse_judged_handoff "$decision" context "$MARK_VALUE" ;;
+    headroom) PCT="$MARK"; refuse_judged_handoff "$decision" headroom "$MARK_VALUE" ;;
+    rate|qualifying) refuse_judged_handoff "$decision" "$MARK_KIND" "$MARK_VALUE" ;;
     *) message marks unjudged "$JUDGE_LINE" ;;
   esac
   return 0
@@ -3772,8 +3818,8 @@ overseer_tool_check() {
 
 # The judgement itself, for the session overseer_identified named, in the
 # subshell overseer_tool_check runs it in: the reading, its record, and the
-# mark. A refusal ends the subshell at 0 with its key in tool.key
-# (refuse_handoff). A Pi payload
+# mark. A refusal ends the subshell at 0 with its key in tool.key.
+# A Pi payload
 # naming no window is the lane mail wake's run, which follows a turn end that
 # judged the same reading, or a tool call from a pi-hooks carrier older than
 # the one that puts `context_window` on the tool call's payload
