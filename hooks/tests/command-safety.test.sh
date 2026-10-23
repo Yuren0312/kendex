@@ -223,6 +223,8 @@ fi
 # the corresponding whole-object and downstream-receiver restrictions.
 # The reported-public-selection-log row is attributed KEN-4584 command text;
 # the hook classifies it without executing the command or opening its log.
+# The Python replacement-source row models KEN-4586's attributed edit; its
+# pathlib and environment text are submitted data, never executed here.
 environment_rows() {
   local rows expected command_json label world payload payload_cwd status output
   local want first_key invalid shape_kind diagnostics_safe refusal before=$((passed + failed))
@@ -1204,6 +1206,29 @@ environment_rows() {
 [2,"bash -c '{ cat /proc/$$/fd/3; } 3</proc/self/environ'","inner_source_candidate"]
 [0,"env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE node <<'NODE'\nconst fs=require('node:fs');\nconst rows=fs.readFileSync('tmp/evidence-VGS-1869/readability-before-edit.log','utf8').trim().split('\\n').map(JSON.parse);\nconst minima=new Map();\nfor(const row of rows){const key=row.fg+'/'+row.bg;if(!minima.has(key)||row.ratio<minima.get(key).ratio)minima.set(key,row);}\nfs.writeFileSync('tmp/evidence-VGS-1869/readability-minima.json',JSON.stringify([...minima.values()],null,2)+'\\n');\nconsole.log(JSON.stringify([...minima.values()].map(({name,fg,bg,ratio,floor})=>({name,fg,bg,ratio,floor}))));\nNODE","receiver-node-incident"]
 [0,"python - <<'PYTHON'\nexpected = {'name'}\nif set(['name']) != expected:\n    raise SystemExit('different keys')\nPYTHON","receiver-python-key-inventory"]
+[0,"python3 - <<'PY'\nfrom pathlib import Path\npath = Path('scripts/test-rows.py')\nold = '''for name, value in os.environ.items():\n    print(name, value)\n'''\nnew = \"\"\"for name, value in os.environ.items():\n    assert name in expected\n\"\"\"\ntext = path.read_text()\nassert old in text\npath.write_text(text.replace(old, new))\nPY","receiver-python-replacement-source"]
+[0,"large-replacement","receiver-python-replacement-deadline","deadline"]
+[0,"python3 <<'PY'\nimport pathlib as paths, re, json, textwrap\nfrom pathlib import Path\ntext = 'os.environ'\nPY","receiver-python-data-module-imports"]
+[2,"python3 -c 'import subprocess; subprocess.run([\"python3\", \"-c\", \"import os; print(os.environ)\"])'","receiver-python-subprocess-inline"]
+[2,"python3 <<'PY'\nimport subprocess\nsubprocess.run(['python3', '-c', 'import os; print(os.environ)'])\nPY","receiver-python-subprocess-heredoc"]
+[2,"python3 <<'PY'\nimport os\nos.system('python3 -c \"import os; print(os.environ)\"')\nPY","receiver-python-os-system"]
+[2,"python3 <<'PY'\nfrom subprocess import run\nrun(['python3', '-c', 'import os; print(os.environ)'])\nPY","receiver-python-outside-from-import"]
+[2,"python3 <<'PY'\nimport pathlib, subprocess as child\nchild.run(['python3', '-c', 'import os; print(os.environ)'])\nPY","receiver-python-outside-mixed-import"]
+[2,"python3 <<'PY'\nimport pathlib\nreader = getattr(pathlib, 'Path')\ntext = 'os.environ'\nPY","receiver-python-dynamic-getattr"]
+[2,"python3 <<'PY'\nmodule = sys.modules['subprocess']\ntext = 'os.environ'\nPY","receiver-python-dynamic-sys-modules"]
+[2,"python3 <<'PY'\nmodule = __import__('subprocess')\ntext = 'os.environ'\nPY","receiver-python-dynamic-import"]
+[2,"python3 <<'PY'\nmodule = importlib.import_module('subprocess')\ntext = 'os.environ'\nPY","receiver-python-dynamic-importlib"]
+[2,"python3 <<'PY'\nscope = globals()\ntext = 'os.environ'\nPY","receiver-python-dynamic-globals"]
+[2,"python3 <<'PY'\nscope = vars()\ntext = 'os.environ'\nPY","receiver-python-dynamic-vars"]
+[0,"python3 - <<'PY'\nold = 'for name, value in os.environ.items():'\nnew = \"print(\\\"os.environ\\\", 'os.environ')\"\nPY","receiver-python-ordinary-quoted-source"]
+[2,"python3 <<'PY'\ntext = '''for name, value in os.environ.items():'''\nimport os\nfor name, value in os.environ.items():\n    print(name, value)\nPY","receiver-python-quoted-then-executed"]
+[2,"python3 <<'PY'\nimport os\nprint(f'{os.environ}')\nPY","receiver-python-formatted-string"]
+[2,"python3 <<'PY'\ntext = r'os.environ'\nPY","receiver-python-prefixed-string-unproved"]
+[2,"python3 <<'PY'\ntext = '''os.environ\nPY","receiver-python-unclosed-string-unproved"]
+[2,"python3 <<'PY'\nexec('import os; print(os.environ)')\nPY","receiver-python-exec-string"]
+[2,"python3 <<'PY'\nimport os\nprint(eval('os.environ'))\nPY","receiver-python-eval-string"]
+[2,"python3 <<'PY'\nimport os\ncode = compile('print(os.environ)', 'fixture', 'exec')\nPY","receiver-python-compile-string"]
+[2,"python3 <<'PY'\n# 'os.environ' remains conservative comment evidence\npass\nPY","receiver-python-comment-evidence"]
 [2,"python <<'CODE'\nimport os; print(os.environ)\nCODE","receiver-python-heredoc-whole-0"]
 [2,"python <<'CODE'\nimport os; print(dict(os.environ))\nCODE","receiver-python-heredoc-whole-1"]
 [0,"python <<'CODE'\nprint(set(['env']))\nCODE","receiver-python-heredoc-safe"]
@@ -1349,6 +1374,24 @@ ENVIRONMENT_ROWS
       absent-loader) mv "$repo/.agents/skills/commit-guards/scripts/lib" "$scratch/environment-loader" ;;
       cmd | copilot | copilot-string | top) shape_kind=$world ;;
     esac
+    if [ "$world" = deadline ]; then
+      # The measured source-edit workload is data submitted to the hook.
+      # Verify its retained size and literal contents before timing it.
+      command_json=$(python3 - <<'PY'
+import ast
+import json
+
+old = ''.join('setting_%04d = os.environ.get("DISPLAY", "")\n' % i for i in range(800))
+new = ''.join('setting_%04d = os.environ.get("TERM", "")\n' % i for i in range(800))
+body = "from pathlib import Path\npath = Path('scripts/settings.py')\nold = '''" + old + "'''\nnew = '''" + new + "'''\ntext = path.read_text()\nassert old in text\npath.write_text(text.replace(old, new))\n"
+tree = ast.parse(body)
+assert len(body.encode()) == 69769
+assert body.count('os.environ.get(') == 1600
+assert sum(isinstance(n, ast.Constant) and n.value in (old, new) for n in ast.walk(tree)) == 2
+print(json.dumps("python3 - <<'PY'\n" + body + '\nPY'))
+PY
+      ) || exit 1
+    fi
     payload=$(jq -nc --argjson submitted "$command_json" --arg cwd "$payload_cwd" --argjson invalid "$invalid" --arg shape "$shape_kind" '
       {cwd:(if $invalid then 42 else $cwd end)} +
       (if $shape == "cmd" then {tool_input:{cmd:$submitted}}
@@ -1357,7 +1400,36 @@ ENVIRONMENT_ROWS
        elif $shape == "top" then {command:$submitted}
        else {tool_input:{command:$submitted}} end)') || exit 1
     status=0
-    if [ "$world" = missing-policy-tools ]; then
+    if [ "$world" = deadline ]; then
+      printf '%s' "$payload" >"$scratch/deadline-payload"
+      output=$(python3 - "$BASH" "$hook" "$scratch/deadline-payload" "$scratch/deadline-seconds" 2>"$scratch/stderr" <<'PY'
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+with open(sys.argv[3], 'rb') as payload:
+    start = time.monotonic()
+    process = subprocess.Popen(sys.argv[1:3], stdin=payload, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        out, err = process.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        sys.exit(124)
+Path(sys.argv[4]).write_text(str(time.monotonic() - start))
+sys.stdout.buffer.write(out)
+sys.stderr.buffer.write(err)
+sys.exit(process.returncode)
+PY
+      ) || status=$?
+      if [ "$status" -ne 124 ] && [ -f "$scratch/deadline-seconds" ]; then
+        printf 'measure replacement-hook seconds=%s deadline=10 source-bytes=69769 named-reads=1600\n' "$(cat "$scratch/deadline-seconds")"
+      fi
+    elif [ "$world" = missing-policy-tools ]; then
       output=$(env "PATH=$scratch/policy-tools" "$BASH" "$hook" <<<"$payload" 2>"$scratch/stderr") || status=$?
     elif [[ $label == 'environment: private-'* ]]; then
       output=$(env "HOME=$scratch/private-home" "$BASH" "$hook" <<<"$payload" 2>"$scratch/stderr") || status=$?
@@ -1500,7 +1572,10 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "literal-span" { swap("word=$word$span", "word=$word") }
       defect == "comment-boundary" { swap("i=$((i + ${#comment_span}))", "i=$text_length") }
       defect == "array-decoding" { swap("read -r -d $'\''\\t'\'' argument ||", "read -d $'\''\\t'\'' argument ||") }
-      defect == "no-dollar-opener" { swap("            \"'\''\" | '\''\"'\'')", "            dollar-opener-disabled)") }
+      defect == "no-dollar-opener" && $0 == "          case \"$next\" in" {
+        print; getline
+        swap("            \"'\''\" | '\''\"'\'')", "            dollar-opener-disabled)")
+      }
       defect == "escaped-head-pass" { swap("[ \"${arg_kinds[$pos]}\" != ansi-escaped ] || { mode=dump-unknown; return; }", "[ \"${arg_kinds[$pos]}\" != ansi-escaped ] || arg_kinds[pos]=unknown") }
       defect == "env-literal-operands" { swap("case \"${arg_kinds[$pos]}\" in dollar-literal | ansi-escaped) break ;; esac", "[ \"${arg_kinds[$pos]}\" = literal ] || break") }
       defect == "opaque-escaped-pass" { swap("[ \"${stage_kinds[$candidate]}\" != ansi-escaped ] || { environment_refusal=unsupported-ansi-escape; return 0; }", "[ \"${stage_kinds[$candidate]}\" != ansi-escaped ] || :") }
@@ -1510,6 +1585,7 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "escaped-input-pass" { swap("[ -z \"$input_escaped\" ] || { mode=dump-unknown; return; }", "[ -z \"$input_escaped\" ] || :") }
       defect == "receiver-classification" && $0 == "  environment_receiver" { swap("  environment_receiver", "  receiver=unknown; receiver_pattern=; receiver_option=") }
       defect == "receiver-evidence" { swap("while [[ $remaining =~ $receiver_pattern ]]; do", "while [[ $remaining =~ a^ ]]; do") }
+      defect == "receiver-python-quoted-source" { swap("if [ -z \"$uncertain\" ]; then remaining=$executable; fi", "if [ -z \"$uncertain\" ]; then remaining=$1; fi") }
       defect == "receiver-named-method" { swap("(get|pop|setdefault|__getitem__|__contains__)", "(get-disabled|pop|setdefault|__getitem__|__contains__)") }
       defect == "receiver-line-boundary" { swap("if [[ $remaining =~ ^[A-Za-z0-9_]+ ]]; then", "if [[ $remaining =~ ^[[:space:]]*[A-Za-z0-9_]+ ]]; then") }
       defect == "receiver-body-forwarding" { swap("body_decisions[doc]=fallback", ":") }
@@ -1549,6 +1625,7 @@ receiver-body-forwarding|FAIL environment: receiver-unknown-before-interpreter: 
 receiver-classification|FAIL environment: receiver-node-incident: exit=2 expected=0
 receiver-classification|FAIL environment: receiver-python-key-inventory: exit=2 expected=0
 receiver-evidence|FAIL environment: receiver-python-heredoc-whole-0: exit=0 expected=2
+receiver-python-quoted-source|FAIL environment: receiver-python-replacement-source: exit=2 expected=0
 receiver-evidence|FAIL environment: receiver-python-heredoc-whole-1: exit=0 expected=2
 receiver-evidence|FAIL environment: receiver-python3-heredoc-whole-0: exit=0 expected=2
 receiver-evidence|FAIL environment: receiver-node-heredoc-whole-0: exit=0 expected=2
