@@ -705,10 +705,22 @@ for row in "${MODE_ROWS[@]}"; do
   assert_eq "$(start_line "$mode_dir" validate-mode) base=$got_base" "$want_mode base=$want_base" \
     "$label — the start record names the mode and base that ran" "$ERR"
   run_script "$RUN" --record --run-dir "$mode_dir"
+  recorded_tree="$(start_line "$mode_dir" tree)"
   assert_eq "$(sed -E 's/ seconds=[0-9]+ started-at=[^ ]+ ended-at=[^ ]+$/ seconds=N started-at=T ended-at=T/' <<<"$OUT")" \
-    "validate-mode=$want_mode selection=unreported verdict=pass head=$head_sha start=$(start_of "$mode_dir")$want_class_base seconds=N started-at=T ended-at=T" \
+    "validate-mode=$want_mode selection=unreported verdict=pass head=$head_sha start=$(start_of "$mode_dir")$want_class_base${recorded_tree:+ tree=$recorded_tree} seconds=N started-at=T ended-at=T" \
     "$label — the run's record names that mode, the pass, the HEAD and second it started at, any class base and its wall time" "$ERR"
 done
+# dev-return-write consumes the stored snapshot through --record in every mode.
+record_tree=1234567890123456789012345678901234567890
+for native_mode in full range ci; do
+  record_dir="$(validate_run_dir "$TMP_ROOT/record-tree-$native_mode" "$native_mode")"
+  printf 'tree=%s\n' "$record_tree" >> "$record_dir/start"
+  run_script "$RUN" --record --run-dir "$record_dir"
+  assert_eq "$RC $(record_field tree "$OUT")" "0 $record_tree" "$native_mode record exposes the stored snapshot" "$ERR"
+done
+mutant mutant-record-tree 'record_tree="$(start_field "$run_dir/start" tree)"' 'record_tree=""'
+run_script "$MUTANT" --record --run-dir "$TMP_ROOT/record-tree-full"
+assert_eq "$RC $(record_field tree "$OUT")" '0 ' 'control: dropping the stored snapshot breaks native record proof' "$ERR"
 # A missing notice must turn the carried-base assertion while the run still passes.
 mutant mutant-full-base-notice 'if [[ "$base_given" == true ]]; then' 'if [[ "$base_given" == false ]]; then'
 proj="$(make_mode_proj proj-full-base-control "$RANGE_CMD")"
@@ -3067,13 +3079,14 @@ assert_eq "$RC $(sed -n 1p <"$ERR")" "2 dev-validate-run: option-unused option=-
 # A run the evidence ended records a zero wall time, and --record reads it as
 # no-verdict, which a receipt's no-verdict needs.
 proj_bound_rec="$(ci_proj proj-bound-rec CI)"
+bound_rec_tree="$(git -C "$proj_bound_rec" rev-parse 'HEAD^{tree}')"
 plant_run "$proj_bound_rec" 20000101T000000Z-1 full docs/a.md 20
 RUN_PATH="$GH_STUB_BIN:$PATH" STUB_ANSWER=change_class=micro STUB_DOCS=false STUB_MEASURED=true \
   run_script "$CI_SCRIPT" --worktree "$proj_bound_rec" --poll 1
 bound_rec_dir="$(run_dir_of "$OUT")"
 run_script "$CI_SCRIPT" --record --run-dir "$bound_rec_dir"
 assert_eq "$(sed -E 's/ head=[^ ]* start=[0-9]+ / /; s/started-at=[^ ]+ ended-at=[^ ]+$/T/' <<<"$OUT")" \
-  "validate-mode=full selection=unreported verdict=no-verdict seconds=0 T" \
+  "validate-mode=full selection=unreported verdict=no-verdict tree=$bound_rec_tree seconds=0 T" \
   "a run an earlier run's bound ended records no verdict and no wall time" "$ERR"
 
 # --- A pass over the same tree answers a later run of the same command -------
