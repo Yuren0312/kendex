@@ -239,6 +239,22 @@ environment_rows() {
 [0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nf=$(printf safe)$(printf value); printf \"%s\\n\" \"$f\"","ordinary-assignment-adjacent-substitutions"]
 [0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nprintf \"%s\\n\" \"$(printf safe)\" \"$REVIEW_ARG\"","ordinary-substitution-then-variable-argument"]
 [0,"case foo in f*) printf safe;; esac","ordinary-case-pattern"]
+[2,"shopt -s extglob\ncase foo in @(foo|f*)) env;; esac","grammar-case-nested-dump"]
+[0,"shopt -s extglob\ncase foo in @(foo|f*)) printf safe;; esac","grammar-case-nested-safe"]
+[2,"printf \"%s\" \"$(case x in (x|esac) env;; esac)\"","grammar-case-alternative-dump"]
+[0,"printf \"%s\" \"$(case x in (x|esac) printf safe;; esac)\"","grammar-case-alternative-safe"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nprintf \"%s\" \"$(case x in (x|esac) bash tmp/h.sh;; esac)\"","grammar-case-alternative-written"]
+[0,"for ((n=1;n<4;n*=2)); do printf safe; done","grammar-for-multiply-safe"]
+[0,"for ((n=1;n?0:1;n++)); do printf safe; done","grammar-for-ternary-safe"]
+[0,"printf \"%s\" \"$(for ((n=1;n<4;n*=2)); do printf safe; done)\"","grammar-for-substitution-safe"]
+[0,"for ((n=1;n<4;n*=$(printf 2))); do printf safe; done","grammar-for-child-safe"]
+[2,"for ((n=1;n<4;n*=$(env))); do printf safe; done","grammar-for-child-dump"]
+[2,"printf '%s' \"$((printf '%s' '))'); env)\"","grammar-arithmetic-quoted-dump"]
+[2,"printf '%s' \"$((printf '%s' '))'); printenv)\"","grammar-arithmetic-quoted-printenv"]
+[0,"printf '%s' \"$((printf '%s' '))'); printf safe)\"","grammar-arithmetic-quoted-safe"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nprintf '%s' \"$((printf '%s' '))'); bash tmp/h.sh)\"","grammar-arithmetic-quoted-written"]
+[2,"printf '%s' \u0060printf safe > tmp/h.sh\u0060; bash tmp/h.sh","grammar-backtick-child-written"]
+[0,"printf '%s' \u0060printf safe\u0060","grammar-backtick-child-safe"]
 [0,"printf \"%s\" \"$(( $(cat > tmp/h.sh <<'EOF'\nprintf done\nEOF\n) ); bash tmp/h.sh)\"","ordinary-ambiguous-nested-heredoc"]
 [2,"printf \"%s\" \"$(( $(cat > tmp/h.sh <<'EOF'\nenv\nEOF\n) ); bash tmp/h.sh)\"","written-ambiguous-nested-heredoc"]
 [0,"time -p case foo in foo|f*) printf safe;; esac","ordinary-timed-case-pattern"]
@@ -1575,7 +1591,7 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "expanded-head" && /^       environment_main_evidence --head/ { swap("; then", "; then :; elif false; then") }
       defect == "expansion-origin-cut" { swap("then expansion=$expansion$span", "then expansion=$expansion") }
       defect == "expansion-quote-mask" { swap("else expansion=$expansion'\'' '\''; fi", "else expansion=$expansion$span; fi") }
-      defect == "case-role-loss" { swap("arg_syntax[n]=${token_syntax[$j]:-}", "arg_syntax[n]=") }
+      defect == "case-role-loss" { swap("word_syntax=$syntax", "word_syntax=$syntax; if [ \"$frame\" -ge 0 ] && [ \"${nesting[$frame]:-}\" = case ] && [ \"${case_phases[$frame]:-}\" = pattern ]; then word_syntax=; fi") }
       defect == "written-reference" { swap("command_receivers[owner]=$receiver;", "command_receivers[owner]=data;") }
       defect == "written-unread" { swap("[ \"${write_states[$write]}\" = readable ] || {", "[ \"${write_states[$write]}\" = readable ] || continue; false && {") }
       defect == "identity-role" && /^        unset/ { swap("unset '\''closers[n]'\'' '\''nesting[n]'\''", "unset '\''closers[n]'\'' '\''nesting[n]'\''; command_id=$command_count; command_count=$((command_count + 1)); word=; kind=literal; active=") }
@@ -1646,7 +1662,7 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "descriptor-body" { swap("doc=${body_ids[$((j - 1))]:-}", "[ -z \"$fd\" ] || continue; doc=${body_ids[$((j - 1))]:-}") }
       defect == "heredoc-pipe" { swap("data_source=\"$data_source$piped_source\"", "data_source=\"$data_source\"") }
       defect == "missing-identifier-cut" { swap("doc=${body_ids[$((j - 1))]:-}", "doc=${body_ids[$((j - 1))]}") }
-      defect == "body-separation" { swap("local command_text=${literal_inputs[$doc]}", "local command_text=${literal_inputs[0]}${literal_inputs[$doc]}") }
+      defect == "body-separation" { swap("local command_text=${literal_inputs[$doc]}", "local command_text=${literal_inputs[0]}") }
       defect == "empty-copies" { swap("stage_args=(${args[@]+\"${args[@]}\"})", "stage_args=(\"${args[@]}\")") }
       defect == "set-unknown" { swap("then mode=dump-unknown; else mode=dump-lines; fi", "then mode=other; else mode=dump-lines; fi") }
       defect == "set-literal-proof" && /^        for \(\(j=pos;/ { swap("[ \"${arg_kinds[$j]}\" != literal ] || named=1", "named=1") }
@@ -1793,10 +1809,10 @@ syntax-routing|FAIL environment: brace-conservative-filter: exit=0 expected=2
 here-string|FAIL environment: quoted-here-string-data: exit=2 expected=0
 delimiter-proof|FAIL environment: encoded-heredoc-delimiter: exit=0 expected=2
 heredoc-program|FAIL environment: shell-heredoc-bodies-have-independent-quotes: exit=0 expected=2
-body-evidence|FAIL environment: unread-shell-heredoc-body-without-marker: exit=0 expected=2
+body-evidence|FAIL environment: unread-shell-heredoc-body-without-marker: exit=2 expected=2
 descriptor-body|FAIL environment: shell-duplicated-heredoc-program: exit=0 expected=2
 heredoc-pipe|FAIL environment: piped-here-string-program: exit=0 expected=2
-missing-identifier-cut|FAIL environment: dump-before-unregistered-heredoc-redirect: exit=0 expected=2
+missing-identifier-cut|FAIL environment: dump-before-unregistered-heredoc-redirect: exit=2 expected=2
 body-separation|FAIL environment: shell-heredoc-bodies-have-independent-quotes: exit=0 expected=2
 empty-copies|FAIL environment: empty-case-stage-before-dump: exit=0 expected=2
 set-unknown|FAIL environment: set-unquoted-variable-can-disappear: exit=0 expected=2

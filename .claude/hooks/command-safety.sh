@@ -12,6 +12,7 @@
 
 set -euo pipefail
 environment_registry_active=""
+environment_collecting=""
 environment_refusal=(environment-read)
 
 # The reported private file is checked as text, without opening it or
@@ -819,10 +820,103 @@ environment_program_text() {
   fi
 }
 
-# Word roles belong to the collector, including across command records.
-# Case frames share the delimiter stack so a pattern cannot close its caller.
-environment_collect_word() {
+# Only the top grammar frame can consume an event. Lexical quoting has
+# already excluded data events; arithmetic remains provisional until close.
+environment_collect_transition() { # word, symbol or arithmetic
   local frame=$((${#closers[@]} - 1)) syntax=""
+  transition=ordinary
+  if [ "$1" = arithmetic ]; then
+    if [ "$frame" -lt 0 ] || [ "${nesting[$frame]}" != arithmetic ]; then collection_result=failed; transition=failed; return 0; fi
+    if { [ "$c" = '$' ] && [ "$next" = '(' ]; } || [ "$c" = '`' ]; then return 0; fi
+    transition=consumed
+    case "$c" in
+      "'" | '"' | '\') collection_result=unsupported; transition=retry ;;
+      ';') [ "${saved_heads[$frame]}" = for ] || transition=retry ;;
+      '(') arithmetic_levels[frame]=$((arithmetic_levels[frame] + 1)) ;;
+      ')')
+        arithmetic_levels[frame]=$((arithmetic_levels[frame] - 1))
+        if [ "${arithmetic_levels[$frame]}" -eq 0 ]; then
+          if [ "$next" != ')' ]; then transition=retry
+          else
+            word=$word'))'; i=$((i + 1)); quote=${saved_quotes[$frame]}
+            if [ "${arithmetic_forms[$frame]}" = '(' ]; then
+              environment_collect_word; token_syntax[${#tokens[@]}-1]=1
+              word=""; expansion=""; active=""; kind=literal; command_head=""
+            fi
+            unset 'closers[frame]' 'nesting[frame]'
+            return 0
+          fi
+        fi ;;
+    esac
+    if [ "$transition" = retry ]; then
+      # Reparse the original source with the same collector. Provisional
+      # operands and children cannot survive as facts from the rejected arm.
+      i=${arithmetic_starts[$frame]}; rejected_arithmetic[i]=1; index=${arithmetic_tokens[$frame]}
+      tokens=("${tokens[@]:0:index}"); kinds=("${kinds[@]:0:index}")
+      token_commands=("${token_commands[@]:0:index}"); expansion_words=("${expansion_words[@]:0:index}")
+      unquoted_words=("${unquoted_words[@]:0:index}"); token_syntax=("${token_syntax[@]:0:index}")
+      for j in "${!body_ids[@]}"; do [ "$j" -lt "$index" ] || unset 'body_ids[j]'; done
+      doc=${arithmetic_docs[$frame]}
+      heredocs=("${heredocs[@]:0:doc}"); heredoc_tabs=("${heredoc_tabs[@]:0:doc}")
+      heredoc_expand=("${heredoc_expand[@]:0:doc}"); heredoc_bodies=("${heredoc_bodies[@]:0:doc}")
+      heredoc_starts=("${heredoc_starts[@]:0:doc}")
+      command_count=${arithmetic_counts[$frame]}; command_id=${saved_commands[$frame]}; quote=${saved_quotes[$frame]}
+      word=${saved_words[$frame]}; expansion=${saved_expansions[$frame]}; kind=${saved_kinds[$frame]}
+      bare=${saved_bare[$frame]}; quoted=${saved_quoted[$frame]}; needs_target=${saved_targets[$frame]}; command_head=${saved_heads[$frame]}
+      active=${arithmetic_active[$frame]}
+      unset 'closers[frame]' 'nesting[frame]'
+    else word=$word$c; fi
+    return 0
+  fi
+  if [ "$1" = symbol ]; then
+    if [ "$c" = '`' ]; then
+      if [ "$frame" -ge 0 ] && [ "${nesting[$frame]}" = substitution ] && [ "${closers[$frame]}" = '`' ]; then
+        transition=substitution-close
+      fi
+      return 0
+    fi
+    if [ "$frame" -ge 0 ]; then
+      case "${nesting[$frame]}" in
+        case | pattern)
+          case "${case_phases[$frame]:-pattern}" in
+            item | pattern)
+              case "$c" in
+                '(')
+                  if [ "${case_phases[$frame]:-pattern}" = item ]; then case_phases[frame]=pattern
+                  else frame=$((frame + 1)); nesting[frame]=pattern; closers[frame]=')'; fi
+                  transition=consumed ;;
+                ')')
+                  case "${nesting[$frame]}" in
+                    pattern) unset 'closers[frame]' 'nesting[frame]' ;;
+                    case) case_phases[frame]=arm; command_head=1; transition=boundary ;;
+                  esac
+                  [ "$transition" = boundary ] || transition=consumed ;;
+                '|') case_phases[frame]=pattern; transition=consumed ;;
+                ' ' | $'\t' | $'\r' | $'\n') transition=consumed ;;
+                *) collection_result=unsupported; transition=consumed ;;
+              esac
+              return 0 ;;
+            arm)
+              if [ "$c$next" = ';;' ] || { [ "$c" = ';' ] && [ "$next" = '&' ]; }; then
+                case_phases[frame]=item; i=$((i + 1))
+                [ "${text:$i:1}" != '&' ] || i=$((i + 1))
+                transition=boundary; return 0
+              fi ;;
+          esac ;;
+        substitution)
+          if [ "$c" = "${closers[$frame]}" ]; then transition=substitution-close; return 0; fi ;;
+        group)
+          if [ "$c" = ')' ]; then compound=1; unset 'closers[frame]' 'nesting[frame]'; transition=boundary; return 0; fi ;;
+        arithmetic) collection_result=failed; transition=failed; return 0 ;;
+        *) collection_result=failed; transition=failed; return 0 ;;
+      esac
+    fi
+    case "$c" in
+      '(') compound=1; frame=$((frame + 1)); nesting[frame]=group; closers[frame]=')'; transition=boundary ;;
+      ')' | '`') collection_result=unsupported; transition=boundary ;;
+    esac
+    return 0
+  fi
   [ -n "$active" ] || return 0
   case "$command_head" in
     time)
@@ -832,16 +926,20 @@ environment_collect_word() {
       syntax=1
       [ "$word:$kind:$bare" != '{:literal:1' ] || command_head=1 ;;
   esac
-  if [ "$frame" -ge 0 ] && [ "${nesting[$frame]}" = case ]; then
-    case "${case_phases[$frame]}" in
+  if [ "$frame" -ge 0 ] && { [ "${nesting[$frame]}" = case ] || [ "${nesting[$frame]}" = pattern ]; }; then
+    case "${case_phases[$frame]:-pattern}" in
       subject) syntax=1; case_phases[frame]=in ;;
-      in) syntax=1; [ "$word:$kind:$bare" != in:literal:1 ] || case_phases[frame]=pattern ;;
+      in) syntax=1; if [ "$word:$kind:$bare" = in:literal:1 ]; then case_phases[frame]=item; else collection_result=unsupported; fi ;;
+      item)
+        syntax=1
+        if [ "$word:$kind:$bare" = esac:literal:1 ]; then unset 'closers[frame]' 'nesting[frame]' 'case_phases[frame]'
+        else case_phases[frame]=pattern; fi ;;
       pattern) syntax=1 ;;
+      arm)
+        if [ "$word:$kind:$bare" = esac:literal:1 ] && [ -n "$command_head" ]; then
+          syntax=1; unset 'closers[frame]' 'nesting[frame]' 'case_phases[frame]'
+        fi ;;
     esac
-    if [ "$word:$kind:$bare" = esac:literal:1 ] &&
-       { [ "${case_phases[$frame]}" = pattern ] || [ -n "$command_head" ]; }; then
-      syntax=1; unset 'closers[frame]' 'nesting[frame]' 'case_phases[frame]'
-    fi
   fi
   if [ -z "$syntax" ] && [ -n "$command_head" ] && [ -z "$needs_target" ]; then
     if [ "$word:$kind:$bare" = case:literal:1 ]; then
@@ -853,12 +951,19 @@ environment_collect_word() {
         if:literal:1 | then:literal:1 | elif:literal:1 | else:literal:1 | while:literal:1 | until:literal:1 | do:literal:1 | '{:literal:1' | '!:literal:1') ;;
         time:literal:1) syntax=1; command_head=time ;;
         function:literal:1) syntax=1; command_head=name ;;
+        for:literal:1) command_head=for ;;
         *) command_head="" ;;
       esac
     fi
   fi
+  word_syntax=$syntax
+}
+
+environment_collect_word() {
+  [ -n "$active" ] || return 0
+  environment_collect_transition word
   index=${#tokens[@]}; token_commands[index]=$command_id; expansion_words[index]=$expansion
-  unquoted_words[index]=$bare; tokens[index]=$word; kinds[index]=$kind; token_syntax[index]=$syntax
+  unquoted_words[index]=$bare; tokens[index]=$word; kinds[index]=$kind; token_syntax[index]=$word_syntax
 }
 
 environment_dump() { # command kind; arguments are already decoded data
@@ -878,6 +983,7 @@ environment_dump() { # command kind; arguments are already decoded data
   local token_commands=() expansion_words=() arg_expansions=() stage_expansions=()
   local command_domains=() token_syntax=() ordered_syntax=() arg_syntax=()
   local command_head=1 saved_heads=() case_phases=()
+  local transition=ordinary collection_result=proved word_syntax=""
   local arithmetic_starts=() arithmetic_tokens=() arithmetic_counts=() arithmetic_forms=() arithmetic_active=() arithmetic_docs=() rejected_arithmetic=()
   local record_first=() record_last=() token_next=()
   local saved_commands=() saved_words=() saved_expansions=() saved_kinds=() saved_bare=() saved_quoted=() saved_targets=() nesting=() arithmetic_levels=()
@@ -912,7 +1018,7 @@ environment_dump() { # command kind; arguments are already decoded data
         "'") span_re=$single_span_re ;;
         ansi) span_re=$ansi_span_re ;;
         '"') span_re=$double_span_re ;;
-        arithmetic) span_re='^[^$()`]+' ;;
+        arithmetic) span_re=$'^[^$()`\'"\\\\;]+' ;;
         *) span_re=$ordinary_span_re ;;
       esac
       # Copy literal spans once. Marker handlers keep the quote and routing
@@ -924,6 +1030,10 @@ environment_dump() { # command kind; arguments are already decoded data
         continue
       fi
       c=${text:$i:1}; i=$((i + 1)); next=${text:$i:1}
+      if [ "$quote" = arithmetic ]; then
+        environment_collect_transition arithmetic
+        case "$transition" in consumed | retry) continue ;; failed) break ;; esac
+      fi
       if [ "$quote" = ansi ]; then
         case "$c" in
           "'") quote="" ;;
@@ -954,12 +1064,12 @@ environment_dump() { # command kind; arguments are already decoded data
         word=""; expansion=""; active=""; kind=literal; bare=1; quoted=""
       fi
       n=${#closers[@]}
-      if [ "$n" -gt 0 ] && [ "${nesting[$((n - 1))]:-}" = case ] &&
-         [ "${case_phases[$((n - 1))]}" = pattern ] && [ "$c" = ')' ] && [ -z "$quote" ]; then
-        case_phases[n-1]=arm; command_head=1; c=';'
+      transition=ordinary
+      if [ -z "$quote" ]; then
+        case "$c" in ')' | '`') environment_collect_transition symbol ;; esac
       fi
-      if [ "$n" -gt 0 ] && [ "${nesting[$((n - 1))]:-}" = substitution ] &&
-         [ "$c" = "${closers[$((n - 1))]}" ] && [ -z "$quote" ]; then
+      case "$transition" in consumed) continue ;; boundary) c=';' ;; failed) break ;; esac
+      if [ "$transition" = substitution-close ]; then
         token_commands[${#tokens[@]}]=$command_id; expansion_words[${#tokens[@]}]=""; token_syntax[${#tokens[@]}]=""; unquoted_words[${#tokens[@]}]=""; tokens[${#tokens[@]}]=';'; kinds[${#kinds[@]}]=operator
         n=$((n - 1)); command_id=${saved_commands[$n]}; quote=${saved_quotes[$n]}
         word=${saved_words[$n]}; expansion=${saved_expansions[$n]}; kind=${saved_kinds[$n]}
@@ -986,43 +1096,6 @@ environment_dump() { # command kind; arguments are already decoded data
         if [ "$c" = '$' ]; then closers[n]=')'; i=$((i + 1)); else closers[n]='`'; fi
         command_id=$command_count; command_count=$((command_count + 1))
         word=""; expansion=""; active=""; kind=literal; bare=1; quoted=""; quote=""; needs_target=""; command_head=1; compound=1
-        continue
-      fi
-      if [ "$quote" = arithmetic ]; then
-        n=$((n - 1)); word=$word$c
-        case "$c" in
-          '(') arithmetic_levels[n]=$((arithmetic_levels[n] + 1)) ;;
-          ')')
-            arithmetic_levels[n]=$((arithmetic_levels[n] - 1))
-            if [ "${arithmetic_levels[$n]}" -eq 0 ]; then
-              if [ "$next" = ')' ]; then
-                word=$word')'; i=$((i + 1)); quote=${saved_quotes[$n]}
-                if [ "${arithmetic_forms[$n]}" = '(' ]; then
-                  environment_collect_word; token_syntax[${#tokens[@]}-1]=1
-                  word=""; expansion=""; active=""; kind=literal; command_head=""
-                fi
-                unset 'closers[n]' 'nesting[n]'
-              else
-                # Bash retries this opener as a subshell in substitution.
-                # Rewind the same collector; speculative operand roles prove nothing.
-                i=${arithmetic_starts[$n]}; rejected_arithmetic[i]=1; index=${arithmetic_tokens[$n]}
-                tokens=("${tokens[@]:0:index}"); kinds=("${kinds[@]:0:index}")
-                token_commands=("${token_commands[@]:0:index}"); expansion_words=("${expansion_words[@]:0:index}")
-                unquoted_words=("${unquoted_words[@]:0:index}")
-                token_syntax=("${token_syntax[@]:0:index}")
-                for j in "${!body_ids[@]}"; do [ "$j" -lt "$index" ] || unset 'body_ids[j]'; done
-                doc=${arithmetic_docs[$n]}
-                heredocs=("${heredocs[@]:0:doc}"); heredoc_tabs=("${heredoc_tabs[@]:0:doc}")
-                heredoc_expand=("${heredoc_expand[@]:0:doc}"); heredoc_bodies=("${heredoc_bodies[@]:0:doc}")
-                heredoc_starts=("${heredoc_starts[@]:0:doc}")
-                command_count=${arithmetic_counts[$n]}; command_id=${saved_commands[$n]}; quote=${saved_quotes[$n]}
-                word=${saved_words[$n]}; expansion=${saved_expansions[$n]}; kind=${saved_kinds[$n]}
-                bare=${saved_bare[$n]}; quoted=${saved_quoted[$n]}; needs_target=${saved_targets[$n]}; command_head=${saved_heads[$n]}
-                active=${arithmetic_active[$n]}
-                unset 'closers[n]' 'nesting[n]'
-              fi
-            fi ;;
-        esac
         continue
       fi
       if [ "$quote" = '"' ]; then
@@ -1074,22 +1147,9 @@ environment_dump() { # command kind; arguments are already decoded data
           fi
           word=""; expansion=""; active=""; kind=literal; bare=1; quoted=""
           case "$c" in ' ' | $'\t' | $'\r') continue ;; esac
-          n=${#closers[@]}
-          if [ "$n" -gt 0 ] && [ "${nesting[$((n - 1))]}" = case ]; then
-            if [ "${case_phases[$((n - 1))]}" = pattern ]; then
-              case "$c" in '|' | '(') continue ;; esac
-            elif [ "$c$next" = ';;' ] || { [ "$c" = ';' ] && [ "$next" = '&' ]; }; then
-              case_phases[n-1]=pattern; i=$((i + 1))
-              [ "${text:$i:1}" != '&' ] || i=$((i + 1))
-            fi
-          fi
+          environment_collect_transition symbol
+          case "$transition" in consumed) continue ;; boundary) c=';' ;; failed) break ;; esac
           case "$c" in
-            '(') compound=1; n=${#closers[@]}; saved_quotes[n]=""; closers[n]=')'; nesting[n]=group; c=';' ;;
-            ')')
-              compound=1; n=${#closers[@]}
-              if [ "$n" -gt 0 ]; then quote=${saved_quotes[$((n - 1))]}; unset 'closers[n-1]' 'nesting[n-1]'; fi
-              [ -z "$quote" ] || bare=""
-              c=';' ;;
             $'\n')
               c=';'
               # Keep every declared body in order. Quoting controls outer
@@ -1129,9 +1189,23 @@ environment_dump() { # command kind; arguments are already decoded data
         *) word=$word$c; expansion=$expansion$c; active=1 ;;
       esac
     done
-    [ -z "$quote" ] && [ "${#closers[@]}" -eq 0 ] || compound=1
-    environment_collect_word
+    if [ "$collection_result" != failed ]; then
+      if [ "${#closers[@]}" -ne 0 ] ||
+         { [ -n "$quote" ] && { [ "$1" != expansions ] || [ "$quote" != '"' ]; }; }; then
+        compound=1; collection_result=unsupported
+      fi
+      environment_collect_word
+    fi
   fi
+  case "$collection_result" in
+    failed) environment_refusal=(collection-failed); return 0 ;;
+    unsupported)
+      for value in ${kinds[@]+"${kinds[@]}"}; do [ "$value" != ansi-escaped ] || return 0; done
+      if environment_main_evidence "$text" ${tokens[@]+"${tokens[@]}"} "${@:3}"; then return 0; fi
+      return 1 ;;
+    proved) ;;
+    *) environment_refusal=(collection-failed); return 0 ;;
+  esac
   # A shell can end a submission before a registered body is read. Evidence
   # must exist before its identifier reaches either expansion or input checks.
   [ -z "$heredoc_op" ] || return 0
@@ -1533,6 +1607,7 @@ environment_dump() { # command kind; arguments are already decoded data
 # writer's status rather than the refusal's, which the harness runs past.
 refuse() { # KEY VALUE [CAUSE]
   loading=""
+  environment_collecting=""
   {
     printf 'command-safety: %s=%s\n' "$1" "$2"
     case "$1=$2" in
@@ -1551,6 +1626,9 @@ refuse() { # KEY VALUE [CAUSE]
       refused=policy) echo "the command text matches this project's COMMAND_SAFETY_DENY_PATTERN" ;;
       refused=environment-dump)
         case "${environment_refusal[0]}" in
+          collection-failed)
+            echo "the submitted command could not be collected because its grammar frame state failed"
+            echo "split the command into simpler submissions and report the hook failure" ;;
           unread-write)
             printf 'the submitted command may execute written file [%s], whose contents could not be established from this submission\n' "${environment_refusal[1]}"
             echo "use a literal cat heredoc so the submitted contents can be checked, or write and run the file in separate submissions" ;;
@@ -1597,6 +1675,10 @@ trap '
   $detail"
     done
     refuse support unreadable "$cause" 2>&3
+  fi
+  if [ -n "$environment_collecting" ]; then
+    environment_refusal=(collection-failed)
+    refuse refused environment-dump "collector exit status: $rc"
   fi
   case $rc in 0 | 2) ;; *) refuse exit "$rc" ;; esac
 ' EXIT
@@ -1652,9 +1734,11 @@ fields="$(jq -er '
     command_argv[argument_index]=$argument
   done
 } <<<"$fields"$'\t'
+environment_collecting=1
 if environment_dump "$command_kind"; then
   refuse refused environment-dump
 fi
+environment_collecting=""
 [ "$cwd_state" != invalid-cwd ] || refuse payload invalid-cwd
 [ -z "$MISSING" ] || refuse missing-tools "${MISSING#,}"
 [ -n "$cwd" ] || cwd="$PWD"
