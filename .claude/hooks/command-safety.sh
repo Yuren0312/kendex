@@ -257,6 +257,7 @@ environment_head() { # command kind; updates pos, syntax_head and arg_roles
   while [ "$head_start" -lt "${#args[@]}" ] && [[ ${args[$head_start]} =~ $name_re ]] && [[ ${args[$head_start]} == *=* ]]; do head_start=$((head_start + 1)); done
   for ((cursor=0; cursor<${#args[@]}; cursor++)); do
     value=${args[$cursor]}
+    if [ -n "${arg_syntax[$cursor]:-}" ]; then syntax_head=1; arg_roles[cursor]=syntax; continue; fi
     case "$state" in
       name) arg_roles[cursor]=syntax; state=body; continue ;;
       body | loop | conditional)
@@ -320,7 +321,7 @@ environment_main_command() { # command kind; arguments are already decoded data
   local filter_re='^([A-Za-z_][A-Za-z0-9_]*=?|\^[A-Za-z_][A-Za-z0-9_]*=|\^\([A-Za-z_][A-Za-z0-9_]*(\|[A-Za-z_][A-Za-z0-9_]*)+\)=)$'
   local ordinary_span_re=$'^[^\'"\\\\$`# \t\r\n;|()<>&]+'
   local single_span_re="^[^']+" ansi_span_re="^[^'\\\\]+" double_span_re='^[^"\\$`]+' comment_span_re=$'^[^\n]+'
-  local tokens=() kinds=() unquoted_words=() saved_quotes=() closers=() args=() arg_kinds=() arg_unquoted=() origins=() evidence=()
+  local tokens=() kinds=() unquoted_words=() saved_quotes=() closers=() args=() arg_kinds=() arg_unquoted=() arg_syntax=() origins=() evidence=()
   local private_inputs=()
   local starts=() ends=() separators=() decisions=()
   if [ "$1" = argv ]; then
@@ -818,6 +819,48 @@ environment_program_text() {
   fi
 }
 
+# Word roles belong to the collector, including across command records.
+# Case frames share the delimiter stack so a pattern cannot close its caller.
+environment_collect_word() {
+  local frame=$((${#closers[@]} - 1)) syntax=""
+  [ -n "$active" ] || return 0
+  case "$command_head" in
+    time)
+      case "$word" in -*) syntax=1 ;; *) command_head=1 ;; esac ;;
+    name) syntax=1; command_head=body ;;
+    body)
+      syntax=1
+      [ "$word:$kind:$bare" != '{:literal:1' ] || command_head=1 ;;
+  esac
+  if [ "$frame" -ge 0 ] && [ "${nesting[$frame]}" = case ]; then
+    case "${case_phases[$frame]}" in
+      subject) syntax=1; case_phases[frame]=in ;;
+      in) syntax=1; [ "$word:$kind:$bare" != in:literal:1 ] || case_phases[frame]=pattern ;;
+      pattern) syntax=1 ;;
+    esac
+    if [ "$word:$kind:$bare" = esac:literal:1 ] &&
+       { [ "${case_phases[$frame]}" = pattern ] || [ -n "$command_head" ]; }; then
+      syntax=1; unset 'closers[frame]' 'nesting[frame]' 'case_phases[frame]'
+    fi
+  fi
+  if [ -z "$syntax" ] && [ -n "$command_head" ] && [ -z "$needs_target" ]; then
+    if [ "$word:$kind:$bare" = case:literal:1 ]; then
+      frame=${#closers[@]}; nesting[frame]=case; closers[frame]=esac; case_phases[frame]=subject
+      syntax=1
+    elif [[ $word =~ $name_re ]] && [[ $word == *=* ]]; then :
+    else
+      case "$word:$kind:$bare" in
+        if:literal:1 | then:literal:1 | elif:literal:1 | else:literal:1 | while:literal:1 | until:literal:1 | do:literal:1 | '{:literal:1' | '!:literal:1') ;;
+        time:literal:1) syntax=1; command_head=time ;;
+        function:literal:1) syntax=1; command_head=name ;;
+        *) command_head="" ;;
+      esac
+    fi
+  fi
+  index=${#tokens[@]}; token_commands[index]=$command_id; expansion_words[index]=$expansion
+  unquoted_words[index]=$bare; tokens[index]=$word; kinds[index]=$kind; token_syntax[index]=$syntax
+}
+
 environment_dump() { # command kind; arguments are already decoded data
   local LC_ALL=C i=0 c next quote="" word="" expansion="" active="" kind=literal compound="" bare=1 quoted=""
   local j start=0 end n fd redirection_kind target proc output input_redirect input_escaped pos program value named flags
@@ -833,7 +876,9 @@ environment_dump() { # command kind; arguments are already decoded data
   local body_decisions=()
   local command_id=0 command_count=1 owner record index redirect write reference
   local token_commands=() expansion_words=() arg_expansions=() stage_expansions=()
-  local command_domains=()
+  local command_domains=() token_syntax=() ordered_syntax=() arg_syntax=()
+  local command_head=1 saved_heads=() case_phases=()
+  local arithmetic_starts=() arithmetic_tokens=() arithmetic_counts=() arithmetic_forms=() arithmetic_active=() arithmetic_docs=() rejected_arithmetic=()
   local record_first=() record_last=() token_next=()
   local saved_commands=() saved_words=() saved_expansions=() saved_kinds=() saved_bare=() saved_quoted=() saved_targets=() nesting=() arithmetic_levels=()
   local ordered_tokens=() ordered_kinds=() ordered_unquoted=() ordered_expansions=() ordered_bodies=()
@@ -892,7 +937,7 @@ environment_dump() { # command kind; arguments are already decoded data
         continue
       fi
       if [ "$c" = '\' ]; then
-        if [ "$i" -ge "$text_length" ]; then kind=unknown; break; fi
+        if [ "$i" -ge "$text_length" ]; then [ "$kind" = ansi-escaped ] || kind=unknown; break; fi
         i=$((i + 1))
         [ "$next" = $'\n' ] || { bare=""; quoted=1; }
         if [ "$quote" = '"' ]; then
@@ -904,28 +949,43 @@ environment_dump() { # command kind; arguments are already decoded data
       # A child command has its own record. The enclosing word, including a
       # pending redirect operand, resumes without treating child output as text.
       n=${#closers[@]}
+      if [ -z "$quote" ] && { [ "$c" = ')' ] || { [ "$n" -gt 0 ] && [ "$c" = '`' ] && [ "${closers[$((n - 1))]}" = '`' ]; }; }; then
+        environment_collect_word
+        word=""; expansion=""; active=""; kind=literal; bare=1; quoted=""
+      fi
+      n=${#closers[@]}
+      if [ "$n" -gt 0 ] && [ "${nesting[$((n - 1))]:-}" = case ] &&
+         [ "${case_phases[$((n - 1))]}" = pattern ] && [ "$c" = ')' ] && [ -z "$quote" ]; then
+        case_phases[n-1]=arm; command_head=1; c=';'
+      fi
       if [ "$n" -gt 0 ] && [ "${nesting[$((n - 1))]:-}" = substitution ] &&
          [ "$c" = "${closers[$((n - 1))]}" ] && [ -z "$quote" ]; then
-        if [ -n "$active" ]; then token_commands[${#tokens[@]}]=$command_id; expansion_words[${#tokens[@]}]=$expansion; unquoted_words[${#tokens[@]}]=$bare; tokens[${#tokens[@]}]=$word; kinds[${#kinds[@]}]=$kind; fi
-        token_commands[${#tokens[@]}]=$command_id; expansion_words[${#tokens[@]}]=""; unquoted_words[${#tokens[@]}]=""; tokens[${#tokens[@]}]=';'; kinds[${#kinds[@]}]=operator
+        token_commands[${#tokens[@]}]=$command_id; expansion_words[${#tokens[@]}]=""; token_syntax[${#tokens[@]}]=""; unquoted_words[${#tokens[@]}]=""; tokens[${#tokens[@]}]=';'; kinds[${#kinds[@]}]=operator
         n=$((n - 1)); command_id=${saved_commands[$n]}; quote=${saved_quotes[$n]}
         word=${saved_words[$n]}; expansion=${saved_expansions[$n]}; kind=${saved_kinds[$n]}
-        bare=${saved_bare[$n]}; quoted=${saved_quoted[$n]}; needs_target=${saved_targets[$n]}; active=1
+        bare=${saved_bare[$n]}; quoted=${saved_quoted[$n]}; needs_target=${saved_targets[$n]}; command_head=${saved_heads[$n]}; active=1
         unset 'closers[n]' 'nesting[n]'
         continue
       fi
-      if [ "$c" = '$' ] && [ "$next" = '(' ] && [ "${text:$((i + 1)):1}" = '(' ]; then
+      if [ -z "${rejected_arithmetic[$((i - 1))]:-}" ] &&
+         { { [ "$c" = '$' ] && [ "$next" = '(' ] && [ "${text:$((i + 1)):1}" = '(' ]; } ||
+           { [ "$c" = '(' ] && [ "$next" = '(' ] && [ -z "$quote$active" ] && [ -n "$command_head" ]; }; }; then
         saved_quotes[n]=$quote; closers[n]=arithmetic; nesting[n]=arithmetic; arithmetic_levels[n]=1
-        quote=arithmetic; word=$word'$(('; expansion=$expansion' '; kind=unknown; active=1; i=$((i + 2))
+        arithmetic_starts[n]=$((i - 1)); arithmetic_tokens[n]=${#tokens[@]}; arithmetic_counts[n]=$command_count
+        saved_words[n]=$word; saved_expansions[n]=$expansion; saved_kinds[n]=$kind
+        saved_bare[n]=$bare; saved_quoted[n]=$quoted; saved_commands[n]=$command_id
+        saved_targets[n]=$needs_target; saved_heads[n]=$command_head; arithmetic_forms[n]=$c; arithmetic_active[n]=$active; arithmetic_docs[n]=${#heredocs[@]}
+        quote=arithmetic; expansion=$expansion' '; [ "$kind" = ansi-escaped ] || kind=unknown; active=1
+        if [ "$c" = '$' ]; then word=$word'$(('; i=$((i + 2)); else word='(('; i=$((i + 1)); fi
         continue
       fi
       if { [ "$c" = '$' ] && [ "$next" = '(' ]; } || [ "$c" = '`' ]; then
         saved_commands[n]=$command_id; saved_quotes[n]=$quote; saved_words[n]=$word'$(...)'
-        saved_expansions[n]=$expansion' '; saved_kinds[n]=unknown; saved_bare[n]=$bare
-        saved_quoted[n]=$quoted; saved_targets[n]=$needs_target; nesting[n]=substitution
+        saved_expansions[n]=$expansion' '; saved_kinds[n]=$kind; [ "$kind" = ansi-escaped ] || saved_kinds[n]=unknown; saved_bare[n]=$bare
+        saved_quoted[n]=$quoted; saved_targets[n]=$needs_target; saved_heads[n]=$command_head; nesting[n]=substitution
         if [ "$c" = '$' ]; then closers[n]=')'; i=$((i + 1)); else closers[n]='`'; fi
         command_id=$command_count; command_count=$((command_count + 1))
-        word=""; expansion=""; active=""; kind=literal; bare=1; quoted=""; quote=""; needs_target=""; compound=1
+        word=""; expansion=""; active=""; kind=literal; bare=1; quoted=""; quote=""; needs_target=""; command_head=1; compound=1
         continue
       fi
       if [ "$quote" = arithmetic ]; then
@@ -934,8 +994,33 @@ environment_dump() { # command kind; arguments are already decoded data
           '(') arithmetic_levels[n]=$((arithmetic_levels[n] + 1)) ;;
           ')')
             arithmetic_levels[n]=$((arithmetic_levels[n] - 1))
-            if [ "${arithmetic_levels[$n]}" -eq 0 ] && [ "$next" = ')' ]; then
-              word=$word')'; i=$((i + 1)); quote=${saved_quotes[$n]}; unset 'closers[n]' 'nesting[n]'
+            if [ "${arithmetic_levels[$n]}" -eq 0 ]; then
+              if [ "$next" = ')' ]; then
+                word=$word')'; i=$((i + 1)); quote=${saved_quotes[$n]}
+                if [ "${arithmetic_forms[$n]}" = '(' ]; then
+                  environment_collect_word; token_syntax[${#tokens[@]}-1]=1
+                  word=""; expansion=""; active=""; kind=literal; command_head=""
+                fi
+                unset 'closers[n]' 'nesting[n]'
+              else
+                # Bash retries this opener as a subshell in substitution.
+                # Rewind the same collector; speculative operand roles prove nothing.
+                i=${arithmetic_starts[$n]}; rejected_arithmetic[i]=1; index=${arithmetic_tokens[$n]}
+                tokens=("${tokens[@]:0:index}"); kinds=("${kinds[@]:0:index}")
+                token_commands=("${token_commands[@]:0:index}"); expansion_words=("${expansion_words[@]:0:index}")
+                unquoted_words=("${unquoted_words[@]:0:index}")
+                token_syntax=("${token_syntax[@]:0:index}")
+                for j in "${!body_ids[@]}"; do [ "$j" -lt "$index" ] || unset 'body_ids[j]'; done
+                doc=${arithmetic_docs[$n]}
+                heredocs=("${heredocs[@]:0:doc}"); heredoc_tabs=("${heredoc_tabs[@]:0:doc}")
+                heredoc_expand=("${heredoc_expand[@]:0:doc}"); heredoc_bodies=("${heredoc_bodies[@]:0:doc}")
+                heredoc_starts=("${heredoc_starts[@]:0:doc}")
+                command_count=${arithmetic_counts[$n]}; command_id=${saved_commands[$n]}; quote=${saved_quotes[$n]}
+                word=${saved_words[$n]}; expansion=${saved_expansions[$n]}; kind=${saved_kinds[$n]}
+                bare=${saved_bare[$n]}; quoted=${saved_quoted[$n]}; needs_target=${saved_targets[$n]}; command_head=${saved_heads[$n]}
+                active=${arithmetic_active[$n]}
+                unset 'closers[n]' 'nesting[n]'
+              fi
             fi ;;
         esac
         continue
@@ -984,11 +1069,20 @@ environment_dump() { # command kind; arguments are already decoded data
             active=""
           fi
           if [ -n "$active" ]; then
-            token_commands[${#tokens[@]}]=$command_id; expansion_words[${#tokens[@]}]=$expansion; unquoted_words[${#tokens[@]}]=$bare; tokens[${#tokens[@]}]=$word; kinds[${#kinds[@]}]=$kind
+            environment_collect_word
             needs_target=""
           fi
           word=""; expansion=""; active=""; kind=literal; bare=1; quoted=""
           case "$c" in ' ' | $'\t' | $'\r') continue ;; esac
+          n=${#closers[@]}
+          if [ "$n" -gt 0 ] && [ "${nesting[$((n - 1))]}" = case ]; then
+            if [ "${case_phases[$((n - 1))]}" = pattern ]; then
+              case "$c" in '|' | '(') continue ;; esac
+            elif [ "$c$next" = ';;' ] || { [ "$c" = ';' ] && [ "$next" = '&' ]; }; then
+              case_phases[n-1]=pattern; i=$((i + 1))
+              [ "${text:$i:1}" != '&' ] || i=$((i + 1))
+            fi
+          fi
           case "$c" in
             '(') compound=1; n=${#closers[@]}; saved_quotes[n]=""; closers[n]=')'; nesting[n]=group; c=';' ;;
             ')')
@@ -1028,15 +1122,15 @@ environment_dump() { # command kind; arguments are already decoded data
                 heredoc_op=$c; heredoc_origin=${#tokens[@]}
               fi ;;
           esac
-          token_commands[${#tokens[@]}]=$command_id; expansion_words[${#tokens[@]}]=""; unquoted_words[${#tokens[@]}]=""; tokens[${#tokens[@]}]=$c
+          token_commands[${#tokens[@]}]=$command_id; expansion_words[${#tokens[@]}]=""; token_syntax[${#tokens[@]}]=""; unquoted_words[${#tokens[@]}]=""; tokens[${#tokens[@]}]=$c
           kinds[${#kinds[@]}]=$redirection_kind
           case "$c" in '<'* | '>'* | '&>'*) needs_target=1 ;; *) needs_target="" ;; esac
-          case "$c" in ';' | '|' | '&&' | '||' | '&') command_id=$command_count; command_count=$((command_count + 1)) ;; esac ;;
+          case "$c" in ';' | '|' | '&&' | '||' | '&') command_id=$command_count; command_count=$((command_count + 1)); command_head=1 ;; esac ;;
         *) word=$word$c; expansion=$expansion$c; active=1 ;;
       esac
     done
     [ -z "$quote" ] && [ "${#closers[@]}" -eq 0 ] || compound=1
-    if [ -n "$active" ]; then token_commands[${#tokens[@]}]=$command_id; expansion_words[${#tokens[@]}]=$expansion; unquoted_words[${#tokens[@]}]=$bare; tokens[${#tokens[@]}]=$word; kinds[${#kinds[@]}]=$kind; fi
+    environment_collect_word
   fi
   # A shell can end a submission before a registered body is read. Evidence
   # must exist before its identifier reaches either expansion or input checks.
@@ -1080,16 +1174,16 @@ environment_dump() { # command kind; arguments are already decoded data
         esac
       fi
       index=${#ordered_tokens[@]}; ordered_tokens[index]=${tokens[$i]}; ordered_kinds[index]=${kinds[$i]}
-      ordered_unquoted[index]=${unquoted_words[$i]}; ordered_expansions[index]=${expansion_words[$i]:-}
+      ordered_unquoted[index]=${unquoted_words[$i]}; ordered_expansions[index]=${expansion_words[$i]:-}; ordered_syntax[index]=${token_syntax[$i]:-}
       [ -z "${body_ids[$i]+present}" ] || ordered_bodies[index]=${body_ids[$i]}
     done
     starts[record]=$start; ends[record]=${#ordered_tokens[@]}; separators[record]=$redirect
     [ "$redirect" != '|' ] || pipeline=1
     index=${#ordered_tokens[@]}; ordered_tokens[index]=$redirect; ordered_kinds[index]=operator
-    ordered_unquoted[index]=""; ordered_expansions[index]=""
+    ordered_unquoted[index]=""; ordered_expansions[index]=""; ordered_syntax[index]=""
   done
   tokens=("${ordered_tokens[@]}"); kinds=("${ordered_kinds[@]}"); unquoted_words=("${ordered_unquoted[@]}")
-  expansion_words=("${ordered_expansions[@]}"); body_ids=()
+  expansion_words=("${ordered_expansions[@]}"); token_syntax=("${ordered_syntax[@]}"); body_ids=()
   for ((index=0; index<${#ordered_tokens[@]}; index++)); do
     [ -z "${ordered_bodies[$index]+present}" ] || body_ids[index]=${ordered_bodies[$index]}
   done
@@ -1104,7 +1198,7 @@ environment_dump() { # command kind; arguments are already decoded data
       decisions[stage]=other; stage_sources[stage]=""; stage_stdin[stage]=""
       continue
     fi
-    start=${starts[$stage]}; end=${ends[$stage]}; args=(); arg_kinds=(); arg_unquoted=(); arg_expansions=(); arg_roles=()
+    start=${starts[$stage]}; end=${ends[$stage]}; args=(); arg_kinds=(); arg_unquoted=(); arg_expansions=(); arg_roles=(); arg_syntax=()
     private_inputs=(); proc=""; output=""; input_redirect=""; input_escaped=""; mode=other; program=""; program_pos=""; data_source=""; file_output=""; file_body=""; redirect_evidence=""; command_writes=()
     for ((j=start; j<end; j++)); do
       case "${kinds[$j]}" in operator | operator-stderr | operator-explicit-other)
@@ -1160,7 +1254,7 @@ environment_dump() { # command kind; arguments are already decoded data
         continue ;;
       esac
       n=${#args[@]}
-      args[n]=${tokens[$j]}; arg_kinds[n]=${kinds[$j]}; arg_unquoted[n]=${unquoted_words[$j]}; arg_expansions[n]=${expansion_words[$j]:-}
+      args[n]=${tokens[$j]}; arg_kinds[n]=${kinds[$j]}; arg_unquoted[n]=${unquoted_words[$j]}; arg_expansions[n]=${expansion_words[$j]:-}; arg_syntax[n]=${token_syntax[$j]:-}
     done
     # An empty recorded stage cannot prove how literal input will execute.
     # Existing boundaries select this main-refusal path before head parsing.

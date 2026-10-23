@@ -239,6 +239,45 @@ environment_rows() {
 [0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nf=$(printf safe)$(printf value); printf \"%s\\n\" \"$f\"","ordinary-assignment-adjacent-substitutions"]
 [0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nprintf \"%s\\n\" \"$(printf safe)\" \"$REVIEW_ARG\"","ordinary-substitution-then-variable-argument"]
 [0,"case foo in f*) printf safe;; esac","ordinary-case-pattern"]
+[0,"printf \"%s\" \"$(( $(cat > tmp/h.sh <<'EOF'\nprintf done\nEOF\n) ); bash tmp/h.sh)\"","ordinary-ambiguous-nested-heredoc"]
+[2,"printf \"%s\" \"$(( $(cat > tmp/h.sh <<'EOF'\nenv\nEOF\n) ); bash tmp/h.sh)\"","written-ambiguous-nested-heredoc"]
+[0,"time -p case foo in foo|f*) printf safe;; esac","ordinary-timed-case-pattern"]
+[0,"function f { case foo in foo|f*) printf safe;; esac; }; f","ordinary-function-case-pattern"]
+[0,"time ((2*3))","ordinary-timed-arithmetic-command"]
+[2,"printf \"%s\" \"$(time case foo in foo) env;; esac)\"","case-timed-substitution-dump"]
+[0,"case foo in foo) printf safe;; f*) printf safe;; esac","ordinary-case-later-pattern"]
+[0,"case foo in foo|f*) printf safe;; esac","ordinary-case-alternative-pattern"]
+[0,"case foo in (foo|f*) printf safe;; esac","ordinary-case-parenthesized-pattern"]
+[0,"case foo in foo) printf safe ;\u0026 f*) printf safe ;; esac","ordinary-case-fallthrough-pattern"]
+[0,"case foo in foo) printf safe ;;\u0026 f*) printf safe ;; esac","ordinary-case-retest-pattern"]
+[0,"printf \"%s\" \"$(case foo in foo|f*) printf safe;; z*) printf safe;; esac)\"","ordinary-case-substitution-patterns"]
+[0,"case foo in \"$(printf safe)\"|f*) printf safe;; esac","ordinary-case-pattern-substitution"]
+[0,"printf \"%s\" \"$(case x in x) case y in y|f*) printf safe;; esac;; esac)\"","ordinary-case-nested-substitution"]
+[2,"printf \"%s\\n\" \"$(case x in x) env;; esac)\"","case-quoted-substitution-dump"]
+[2,"value=$(case x in x) env;; esac)","case-assignment-substitution-dump"]
+[2,"printf \"%s\" \"$(case x in x) printf \"%s\" \"$(env)\";; esac)\"","case-arm-nested-substitution-dump"]
+[2,"printf \"%s\" \"$(case x in x) case y in y) env;; esac;; esac)\"","case-nested-arm-dump"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nprintf '%s\\n' \"$(case x in x) bash tmp/h.sh;; esac)\"","written-case-arm-shell"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nprintf '%s\\n' \"$(case x in x) printf safe;; esac)\"","written-case-arm-data"]
+[0,"((2*3))","ordinary-arithmetic-command-multiply"]
+[0,"((1?2:3))","ordinary-arithmetic-command-conditional"]
+[0,"n=2; ((n*=3))","ordinary-arithmetic-command-assignment"]
+[0,"((n=(2*3)))","ordinary-arithmetic-command-parentheses"]
+[0,"((2*$(printf 3)))","ordinary-arithmetic-command-substitution"]
+[2,"((2*$(env)))","arithmetic-command-dump-substitution"]
+[0,"printf \"%s\" \"$((printf safe); printf safe)\"","ordinary-ambiguous-subshell-substitution"]
+[2,"printf \"%s\" \"$((env); printf safe)\"","ambiguous-subshell-dump"]
+[2,"printf \"%s\" \"$((printf safe); env)\"","ambiguous-subshell-later-dump"]
+[2,"printf \"%s\" \"$(((env)); printf safe)\"","ambiguous-nested-subshell-dump"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nprintf '%s' \"$((bash tmp/h.sh); printf safe)\"","written-ambiguous-subshell-shell"]
+[2,"$'\\x65nv'$(printf '')","ansi-escaped-head-substitution"]
+[2,"$(printf '')$'\\x65nv'","ansi-escaped-head-after-substitution"]
+[2,"$'\\x65nv'`printf ''`","ansi-escaped-head-backtick"]
+[2,"$'\\x65nv'$(printf '')$(printf '')","ansi-escaped-head-adjacent-substitutions"]
+[2,"systemctl $'show-\\x65nvironment'$(printf '')","ansi-escaped-operand-substitution"]
+[2,"systemctl $(printf '')$'show-\\x65nvironment'","ansi-escaped-operand-after-substitution"]
+[2,"systemctl $'show-\\x65nvironment'`printf ''`","ansi-escaped-operand-backtick"]
+[0,"printf '%s' $'\\x65nv'$(printf '')","ansi-escaped-joined-argument-data"]
 [0,"[[ foo == f* ]] && printf safe","ordinary-conditional-pattern"]
 [0,"for file in *.rs; do printf safe; done","ordinary-file-loop"]
 [2,"true; {env,}","expanded-head-list-brace-env"]
@@ -1536,6 +1575,7 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "expanded-head" && /^       environment_main_evidence --head/ { swap("; then", "; then :; elif false; then") }
       defect == "expansion-origin-cut" { swap("then expansion=$expansion$span", "then expansion=$expansion") }
       defect == "expansion-quote-mask" { swap("else expansion=$expansion'\'' '\''; fi", "else expansion=$expansion$span; fi") }
+      defect == "case-role-loss" { swap("arg_syntax[n]=${token_syntax[$j]:-}", "arg_syntax[n]=") }
       defect == "written-reference" { swap("command_receivers[owner]=$receiver;", "command_receivers[owner]=data;") }
       defect == "written-unread" { swap("[ \"${write_states[$write]}\" = readable ] || {", "[ \"${write_states[$write]}\" = readable ] || continue; false && {") }
       defect == "identity-role" && /^        unset/ { swap("unset '\''closers[n]'\'' '\''nesting[n]'\''", "unset '\''closers[n]'\'' '\''nesting[n]'\''; command_id=$command_count; command_count=$((command_count + 1)); word=; kind=literal; active=") }
@@ -1653,6 +1693,7 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
 private-path|FAIL environment: private-tilde: exit=0 expected=2
 written-reference|FAIL environment: written-heredoc-shell: exit=0 expected=2
 written-unread|FAIL environment: written-substituted-printf-shell: exit=0 expected=2
+case-role-loss|FAIL environment: ordinary-case-later-pattern: exit=2 expected=0
 identity-role|FAIL environment: ordinary-substitution-glob-argument: exit=2 expected=0
 identity-owner|FAIL environment: written-same-command-own-output: exit=2 expected=0
 heredoc-data-role|FAIL environment: written-heredoc-data-role: exit=2 expected=0
