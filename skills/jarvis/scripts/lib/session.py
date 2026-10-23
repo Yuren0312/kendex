@@ -568,10 +568,16 @@ class Session:
                 stopped = self.backend("stop-process", identity["pid"], identity["started_at"], record["harness"], check=False)
                 if stopped.returncode:
                     sys.stderr.write(stopped.stderr)
-                    raise Refusal("handover-failed", "The owned process could not be stopped. Check the stop-process diagnostic before retrying.", "failed")
+                    # An abandoned successor can end itself after the pane
+                    # check. A stale identity alone also covers a reused PID.
+                    if stopped.returncode != 3 or self.backend("process-ended", identity["pid"], check=False).returncode != 0:
+                        raise Refusal("handover-failed", "The owned process could not be stopped. Check the stop-process diagnostic before retrying.", "failed")
                 if not self.terminal(record):
                     return
-                condition = "#{&&:" + condition + ",#{==:#{pane_pid}," + str(identity["pid"]) + "}}"
+                # tmux clears pane_pid at EOF, while a retained dead pane
+                # still has this server and generation's ownership marks.
+                process_binding = "#{||:#{pane_dead},#{==:#{pane_pid}," + str(identity["pid"]) + "}}"
+                condition = "#{&&:" + condition + "," + process_binding + "}"
             action = "kill-window" if window else "kill-session"
             self.tmux("if-shell", "-F", "-t", pane, condition, action + " -t " + pane, socket=record["terminal"]["server"])
             if window and self.terminal(record):
