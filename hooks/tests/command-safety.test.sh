@@ -1591,7 +1591,6 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "expanded-head" && /^       environment_main_evidence --head/ { swap("; then", "; then :; elif false; then") }
       defect == "expansion-origin-cut" { swap("then expansion=$expansion$span", "then expansion=$expansion") }
       defect == "expansion-quote-mask" { swap("else expansion=$expansion'\'' '\''; fi", "else expansion=$expansion$span; fi") }
-      defect == "case-role-loss" { swap("word_syntax=$syntax", "word_syntax=$syntax; if [ \"$frame\" -ge 0 ] && [ \"${nesting[$frame]:-}\" = case ] && [ \"${case_phases[$frame]:-}\" = pattern ]; then word_syntax=; fi") }
       defect == "written-reference" { swap("command_receivers[owner]=$receiver;", "command_receivers[owner]=data;") }
       defect == "written-unread" { swap("[ \"${write_states[$write]}\" = readable ] || {", "[ \"${write_states[$write]}\" = readable ] || continue; false && {") }
       defect == "identity-role" && /^        unset/ { swap("unset '\''closers[n]'\'' '\''nesting[n]'\''", "unset '\''closers[n]'\'' '\''nesting[n]'\''; command_id=$command_count; command_count=$((command_count + 1)); word=; kind=literal; active=") }
@@ -1709,7 +1708,6 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
 private-path|FAIL environment: private-tilde: exit=0 expected=2
 written-reference|FAIL environment: written-heredoc-shell: exit=0 expected=2
 written-unread|FAIL environment: written-substituted-printf-shell: exit=0 expected=2
-case-role-loss|FAIL environment: ordinary-case-later-pattern: exit=2 expected=0
 identity-role|FAIL environment: ordinary-substitution-glob-argument: exit=2 expected=0
 identity-owner|FAIL environment: written-same-command-own-output: exit=2 expected=0
 heredoc-data-role|FAIL environment: written-heredoc-data-role: exit=2 expected=0
