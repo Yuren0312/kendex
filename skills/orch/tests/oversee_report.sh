@@ -1099,19 +1099,25 @@ summary_write() { # CASE_SUFFIX
   new_case "summary_${name}_$1"
   fleet ''
   printf '%s\n%s\n\n\n' "$lead" "$rows" > "$CASE/summary.txt"
-  run OVERSEE_REPORT_LANE_MAIL="$TMP_ROOT/bin/lane-mail-saving" ${envs[@]+"${envs[@]}"} -- \
-    write --state "$CASE/state.json" --repo owner/repo --summary-file "$CASE/summary.txt"
-  local file="$CASE/progress-reports/${NAME%-succession.md}.md"
-  assert_eq "$RC|$(awk '/^oversee-report: summary-shape=/ {print}' "$CASE/err")" "0|$want" \
-    "summary $name sends and prints each keyed finding" "$CASE/err"
-  assert_eq "$([[ -f "$file" && -n "$OUT" && "$OUT" == "$(cat "$file")" ]] && echo written)|$(jq -sr '[.[] | select(.kind == "notice" and .to == "owner") | .attach] | join("|")' "$CASE/events.jsonl" 2>/dev/null || true)" \
-    "written|$file" "summary $name writes, prints and sends the report once" "$CASE/err"
-  assert_eq "$(cat "$CASE/notice.txt" 2>/dev/null || true)" "$(cat "$CASE/summary.txt")" \
-    "summary $name reaches the notice unchanged" "$CASE/err"
-  run ${envs[@]+"${envs[@]}"} -- check-summary --summary-file "$CASE/summary.txt"
-  assert_eq "$RC|$OUT|$(awk '/^oversee-report: summary-shape=/ {print}' "$CASE/err")" "0||$want" \
-    "summary $name check-only has the same findings and no report" "$CASE/err"
-  assert_eq "$(wc -l < "$CASE/events.jsonl" | tr -d ' ')" 1 "summary $name check-only sends no second notice"
+  local notices=0
+  if [[ "$verbs" == *write* ]]; then
+    notices=1
+    run OVERSEE_REPORT_LANE_MAIL="$TMP_ROOT/bin/lane-mail-saving" ${envs[@]+"${envs[@]}"} -- \
+      write --state "$CASE/state.json" --repo owner/repo --summary-file "$CASE/summary.txt"
+    local file="$CASE/progress-reports/${NAME%-succession.md}.md"
+    assert_eq "$RC|$(awk '/^oversee-report: summary-shape=/ {print}' "$CASE/err")" "0|$want" \
+      "summary $name sends and prints each keyed finding" "$CASE/err"
+    assert_eq "$([[ -f "$file" && -n "$OUT" && "$OUT" == "$(cat "$file")" ]] && echo written)|$(jq -sr '[.[] | select(.kind == "notice" and .to == "owner") | .attach] | join("|")' "$CASE/events.jsonl" 2>/dev/null || true)" \
+      "written|$file" "summary $name writes, prints and sends the report once" "$CASE/err"
+    assert_eq "$(cat "$CASE/notice.txt" 2>/dev/null || true)" "$(cat "$CASE/summary.txt")" \
+      "summary $name reaches the notice unchanged" "$CASE/err"
+  fi
+  if [[ "$verbs" == *check* ]]; then
+    run ${envs[@]+"${envs[@]}"} -- check-summary --summary-file "$CASE/summary.txt"
+    assert_eq "$RC|$OUT|$(awk '/^oversee-report: summary-shape=/ {print}' "$CASE/err")" "0||$want" \
+      "summary $name check-only prints each keyed finding and no report" "$CASE/err"
+  fi
+  assert_eq "$({ cat -- "$CASE/events.jsonl" 2>/dev/null || true; } | wc -l | tr -d ' ')" "$notices" "summary $name sends a notice through write alone"
 
 }
 # Keep link payloads in the table: Bash 3.2 retains slash escapes written
@@ -1119,6 +1125,8 @@ summary_write() { # CASE_SUFFIX
 while IFS='~' read -r name mode setting want replacement; do
   rows="$OWNER_ROWS"
   lead='Work continues.'
+  # write always posts mrkdwn; only check-summary also reads a Markdown post.
+  verbs='write check'
   case "$mode" in
     normal) ;;
     tiered)
@@ -1185,6 +1193,75 @@ _I changed the reminder._
 `Next report: 8 am`
 REPORT
 )" ;;
+    markdown|markdown-item|markdown-write)
+      # The same report as a post without a file renders it: Standard
+      # Markdown bold labels and bold, visibly bracketed linked keys.
+      verbs='check'
+      [[ "$mode" != markdown-write ]] || verbs='write'
+      lead='> **Overall:** Work reaches people within the day.'
+      rows="$(cat <<'REPORT'
+
+> **What's going well:** Reports reach the owner.
+
+> **What's not going well:** Two reports arrived late; **[\[KEN-41\]](https://linear.app/vanillagreen/issue/KEN-41)** sends them earlier.
+
+```
+Readings
+```
+
+- Reports arrive on time.
+  - **[\[KEN-42\]](https://linear.app/vanillagreen/issue/KEN-42)** _(17 h)_
+    - _The morning report includes overnight work._
+
+_**[\[KEN-44\]](https://linear.app/vanillagreen/issue/KEN-44)** cuts the wait; I read it after it merges._
+
+```
+Completed
+```
+
+- **[\[KEN-43\]](https://linear.app/vanillagreen/issue/KEN-43)** Clearer reports
+
+```
+In progress
+```
+
+- The next report is being written.
+
+```
+Blocked
+```
+
+- One report needs its source.
+
+```
+Waiting on you
+```
+
+- Choose the report time.
+
+_The morning report needs this choice._
+
+```
+Headroom remaining
+```
+
+- **Claude:** 40% _(2 accounts)_
+- **Codex:** 27% _(3 accounts)_
+- **Copilot:** 9% _(1 account)_
+
+```
+Overseer self-analysis
+```
+
+- **Good:** I read the reports before sending.
+- **Bad:** I sent one report late.
+
+_I changed the reminder._
+
+`Next report: 8 am`
+REPORT
+)"
+      [[ "$mode" != markdown-item ]] || rows="${rows/- The next report is being written./$replacement}" ;;
     sub-words|sub-id)
       item='KEN-42'
       if [[ "$mode" == sub-words ]]; then
@@ -1247,7 +1324,7 @@ REPORT
         header)
           mutate_file "$mutant" 'if (!($0 in sections) && !session_header)' 'if (0 && !($0 in sections) && !session_header)' ;;
         opening)
-          mutate_file "$mutant" 'if (!(key in labels) || index($0, labels[key]) != 1)' 'if (0 && (!(key in labels) || index($0, labels[key]) != 1))' ;;
+          mutate_file "$mutant" 'if (!(key in labels) || index($0, bold(labels[key])) != 1)' 'if (0 && (!(key in labels) || index($0, bold(labels[key])) != 1))' ;;
       esac
       if (FAIL=0; REPORT_UNDER_TEST="$mutant" summary_write disabled; [[ "$FAIL" -eq 0 ]]) > "$TMP_ROOT/shape-original-$name.out"; then
         fail "disabled checker passed the changed $name row"
@@ -1256,6 +1333,39 @@ REPORT
           "the $name row rejects removed production behavior"
       fi ;;
   esac
+  # Each control restores one wrong reading of a summary's form; its row,
+  # judged by the verb that row runs, must reject it. Fields split on `~`,
+  # so a target names no awk match operator.
+  while IFS='~' read -r row control old new; do
+    [[ "$row" == "$name" ]] || continue
+    mutant="$(mutant_scripts "shape-form-$control/orch" oversee-report)/oversee-report" || exit 1
+    ln -s "$(cd "$TEST_DIR/../../github" && pwd)" "${mutant%/orch/scripts/*}/github"
+    mutate_file "$mutant" "$old" "$new"
+    assertion="summary $name check-only prints each keyed finding and no report"
+    [[ "$verbs" == check ]] || assertion="summary $name sends and prints each keyed finding"
+    if (FAIL=0; REPORT_UNDER_TEST="$mutant" summary_write "form-$control"; [[ "$FAIL" -eq 0 ]]) > "$TMP_ROOT/shape-form-$control.out"; then
+      fail "the $control reading passed the $name row"
+    else
+      assert_file_contains "$TMP_ROOT/shape-form-$control.out" "  FAIL  $assertion" \
+        "the $name row rejects the $control reading"
+    fi
+  done <<'CONTROLS'
+markdown-summary~mrkdwn-only~markdown = markdown_ok && index($0, markdown_bold(labels[opening])) == 1~markdown = 0
+markdown-summary~markdown-unstripped~if (markdown) gsub(/\[~if (0) gsub(/\[
+markdown-key-last~item-match~|\\[(\\\\\\[)?[A-Z]+-[0-9]+(\\\\\\])?\\]\\(https?://[^()[:space:]]+\\)"~"
+markdown-write~write-markdown~[[ "$VERB" != check-summary ]] || MARKDOWN_OK=1~MARKDOWN_OK=1
+markdown-mixed-label~either-label~index($0, bold(labels[key])) != 1~index($0, labels[key]) != 1 && index($0, markdown_bold(labels[key])) != 1
+markdown-mixed-key~either-strip~    else gsub(/<https~    gsub(/<https
+markdown-italic-header~bold-only~\*\*?[^*]+\*\*?:?$/~\*\*[^*]+\*\*:?$/
+mrkdwn-bold-header~mrkdwn-only-header~\*\*?[^*]+\*\*?:?$/~\*[^*]+\*:?$/
+mrkdwn-markdown-label~mrkdwn-only-label~[[:space:]]*\*\*?[^*<>]+:~[[:space:]]*\*[^*<>]+:
+markdown-star-label~two-star-close~[^*<>]+:\*\*?/~[^*<>]+:\*\*/
+mrkdwn-star-label~two-star-close-mrkdwn~[^*<>]+:\*\*?/~[^*<>]+:\*\*/
+mrkdwn-other-key~held-links-only~key_link) finding("bare-id"~/$^/) finding("bare-id"
+markdown-suffix~mrkdwn-suffix~substr(after, 1, length(bold(item_suffix))) != bold(item_suffix)~substr(after, 1, length(item_suffix)) != item_suffix
+markdown-half-bracket~open-bracket~/^\[\\\[[A-Z]+-[0-9]+\\\]\]\(/ :~/^\[\\\[/ :
+item-suffix~no-suffix~ || substr(after, 1, length(bold(item_suffix))) != bold(item_suffix)~
+CONTROLS
   if [[ "$name" == tiered-summary ]]; then
     mutant="$(mutant_scripts shape-nested-cap/orch oversee-report)/oversee-report" || exit 1
     ln -s "$(cd "$TEST_DIR/../../github" && pwd)" "$TMP_ROOT/shape-nested-cap/github"
@@ -1300,6 +1410,11 @@ commit-link~commit-link~~oversee-report: summary-shape=github-link line=1
 waiting-on-you~missing~~oversee-report: summary-shape=waiting-on-you
 conforming~normal~~
 key-last~item-line~~oversee-report: summary-shape=item-line line=6~- Outcome (*<https://linear.app/vanillagreen/issue/KEN-42|[KEN-42]>*)
+item-suffix~item-line~~oversee-report: summary-shape=item-line line=6~- *<https://linear.app/vanillagreen/issue/KEN-42|[KEN-42]> Outcome
+mrkdwn-bold-header~item-line~~oversee-report: summary-shape=label line=6~**Next steps**
+mrkdwn-markdown-label~item-line~~oversee-report: summary-shape=label line=6~> **Whats not going well:** Two reports arrived late.
+mrkdwn-star-label~item-line~~oversee-report: summary-shape=label line=6~> *Whats not going well:* Two reports arrived late.
+mrkdwn-other-key~item-line~~oversee-report: summary-shape=bare-id line=6~_**[\[HT-1\]](https://linear.app/vanillagreen/issue/HT-1)** cuts it._
 two-keys~item-line~~oversee-report: summary-shape=item-line line=6~- *<https://linear.app/vanillagreen/issue/KEN-42|[KEN-42]>* waits on *<https://linear.app/vanillagreen/issue/KEN-43|[KEN-43]>*
 header~header~~oversee-report: summary-shape=label line=4
 inline-header~inline-header~~oversee-report: summary-shape=label line=3
@@ -1307,6 +1422,21 @@ unclosed-header~unclosed-header~~oversee-report: summary-shape=label line=22
 opening~opening~~oversee-report: summary-shape=label line=1
 bullet-label~bullet-label~~oversee-report: summary-shape=label line=22
 tiered-summary~tiered~ORCH_REPORT_SUMMARY_LINES=10~
+markdown-summary~markdown~~
+markdown-write~markdown-write~~oversee-report: summary-shape=label line=1;oversee-report: summary-shape=label line=3;oversee-report: summary-shape=bare-id line=5;oversee-report: summary-shape=label line=5;oversee-report: summary-shape=bare-id line=12;oversee-report: summary-shape=item-line line=12;oversee-report: summary-shape=bare-id line=15;oversee-report: summary-shape=bare-id line=21;oversee-report: summary-shape=item-line line=21;oversee-report: summary-shape=label line=47;oversee-report: summary-shape=label line=48;oversee-report: summary-shape=label line=49;oversee-report: summary-shape=label line=55;oversee-report: summary-shape=label line=56
+markdown-mixed-label~markdown-item~~oversee-report: summary-shape=label line=27~- *Claude:* 40% _(2 accounts)_
+markdown-mixed-key~markdown-item~~oversee-report: summary-shape=bare-id line=27;oversee-report: summary-shape=item-line line=27~- *<https://linear.app/vanillagreen/issue/KEN-43|[KEN-43]>* Clearer reports
+markdown-misspelled~markdown-item~~oversee-report: summary-shape=label line=27~> **Whats not going well:** Two reports arrived late.
+markdown-header~markdown-item~~oversee-report: summary-shape=label line=27~**Next steps**
+markdown-italic-header~markdown-item~~oversee-report: summary-shape=label line=27~*Next steps*
+markdown-star-label~markdown-item~~oversee-report: summary-shape=label line=27~> *Whats not going well:* Two reports arrived late.
+markdown-other-key~markdown-item~~oversee-report: summary-shape=bare-id line=27~_*<https://linear.app/vanillagreen/issue/HT-1|[HT-1]>* cuts it._
+markdown-suffix~markdown-item~~oversee-report: summary-shape=item-line line=27~- **[\[KEN-43\]](https://linear.app/vanillagreen/issue/KEN-43)* Clearer reports
+markdown-half-bracket~markdown-item~~oversee-report: summary-shape=bare-id line=27;oversee-report: summary-shape=item-line line=27~- **[\[HT-3](https://linear.app/vanillagreen/issue/HT-3)** Clearer reports
+markdown-key-last~markdown-item~~oversee-report: summary-shape=item-line line=27~- Clearer reports (**[\[KEN-43\]](https://linear.app/vanillagreen/issue/KEN-43)**)
+markdown-unbracketed~markdown-item~~oversee-report: summary-shape=bare-id line=27;oversee-report: summary-shape=item-line line=27~- **[KEN-43](https://linear.app/vanillagreen/issue/KEN-43)** Clearer reports
+markdown-words~markdown-item~~oversee-report: summary-shape=layout line=27 words=21~- **[\[KEN-43\]](https://linear.app/vanillagreen/issue/KEN-43)** one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty
+markdown-cap~markdown~ORCH_REPORT_SUMMARY_LINES=9~oversee-report: summary-shape=layout item-lines=10 cap=9
 sub-bullet-words~sub-words~~oversee-report: summary-shape=layout line=22 words=21
 sub-bullet-id~sub-id~~oversee-report: summary-shape=bare-id line=22
 label-spacing~spacing~~
