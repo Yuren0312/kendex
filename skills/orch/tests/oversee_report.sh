@@ -180,6 +180,13 @@ Running:
 | KEN-7 (no PR, preparing) | Title 7 | Outcome 7 \\| kept |
 | KEN-10 (#14, parked) | Title 10 | Outcome 10 \\| kept |
 
+Parked time (UTC calendar days; retained lane records only, archives unread):
+| Day | Parked lane hours | Confirmed 60-minute idle stops |
+| --- | ---: | --- |
+2026-09-20 | 24 | unavailable
+2026-09-21 | 14.222 | unavailable
+Idle-stop counts are unavailable: reaped mailbox notes precede stop and may be followed by reap-not-stopped.
+
 Validation:
 - KEN-2: no validation run recorded
 - KEN-3: 62 min over 4 runs: implement full 55 selection=all lanes=lint,test, fix range 5 selection=subset lanes=lint, restack range 1 selection=unreported, restack range 1 selection=unreported; restack re-test skipped 2 times
@@ -203,10 +210,7 @@ Waiting on you:
 - KEN-2 waits on red checks on #12: test, lint
 - KEN-3 waits on a stopped review gate, review-round-cap: one unresolved review thread"
 assert_eq "$(parked_numeric_rows <<<"$OUT")" $'2026-09-20 | 24 | unavailable\n2026-09-21 | 14.222 | unavailable' 'daily parked hours include the confirmed open interval'
-# The existing whole-report assertion keeps its original rows; numeric park
-# rows above own the added display contract.
-CORE_OUT="$(awk '/^Parked time \(/ {skip=1;next} skip && /^Idle-stop counts/ {skip=0;getline;next} !skip {print}' <<<"$OUT")"
-assert_eq "$RC|$CORE_OUT" "0|$WANT" \
+assert_eq "$RC|$OUT" "0|$WANT" \
   "Landed holds only the fleet item merged since the last report, Running each live, preparing or parked lane with its PR, the parked one's from its record, Validation each running lane's minutes in total and per run, Next the queue, Waiting on you the open owner ask with its recommendation and deadline then each running lane's blockers"
 
 echo "=== render: round counts use the shared reader ==="
@@ -312,6 +316,12 @@ assert_eq "$RC|$OUT" "0|Landed: none
 $ESCAPES_UNREAD
 
 Running: none
+
+Parked time (UTC calendar days; retained lane records only, archives unread):
+| Day | Parked lane hours | Confirmed 60-minute idle stops |
+| --- | ---: | --- |
+| No confirmed intervals | 0 | unavailable |
+Idle-stop counts are unavailable: reaped mailbox notes precede stop and may be followed by reap-not-stopped.
 
 Validation: none
 

@@ -257,6 +257,7 @@ READ_MANY
   # A start answers sandbox-started for a sandbox already up as for a stopped
   # one, as the protocol requires.
   start)
+    [[ -z "${LANE_HOST_STUB_START_EFFECT:-}" ]] || printf 'started\n' > "$LANE_HOST_STUB_START_EFFECT"
     [[ "${LANE_HOST_STUB_START_STATUS:-0}" -eq 0 ]] \
       || { printf 'lane-host-fixture: start-failed item=%s\n' "$3" >&2; exit "$LANE_HOST_STUB_START_STATUS"; }
     printf '%s\n' "${LANE_HOST_STUB_START_OUT-sandbox-started item=$3}" ;;

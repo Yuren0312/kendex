@@ -714,7 +714,7 @@ assert_eq "rc=$(rc one) $(key one) opened=$([[ -e "$ROW/opened.one" ]] && echo y
 # refusal ROW KIND — one launch of CC-1 by the open-terminal OT names, the
 # row's state path printed as STATE so a control's row reads the same.
 refusal() {
-  local ws line
+  local ws line real_flock fault_scripts
   ws="$(dirname "$OT")/workflow-state"
   row "$1"
   "$ws" --state-dir "$STATE" init oversee >/dev/null
@@ -723,25 +723,20 @@ refusal() {
       mkdir -p "$STATE/workflow-state-oversee.json.launch.lock"
       launch one 5 --lane "$LANE_A" CC-1 ;;
     failed)
-      # A flock that fails at once is a holder past the bound with no clock:
-      # both takes fail with no wait. The state exists first, since its init
-      # locks too.
+      # Fail both cap takes without delaying the lifecycle or state locks.
       mkdir -p "$ROW/bin"
-      printf '#!/usr/bin/env bash\nexit 1\n' > "$ROW/bin/flock"
+      real_flock="$(command -v flock)" || exit 1
+      printf '#!/usr/bin/env bash\n[[ "${!#}" != 7 ]] || exit 1\nexec %q "$@"\n' "$real_flock" > "$ROW/bin/flock"
       chmod +x "$ROW/bin/flock"
       PATH="$ROW/bin:$PATH" launch one 5 --lane "$LANE_A" CC-1 ;;
     path)
-      # workflow-state answers every verb but `path oversee`, so the fleet
-      # state exists and only its path cannot be had. The state records the
-      # overseer's directory, so the overseer binding judges that directory
-      # and leaves the path read to the cap.
+      # Fault only cap_take's path read; lifecycle and binding reads stay real.
       "$ws" --state-dir "$STATE" update oversee --arg cwd "$REPO" '.overseer = {cwd: $cwd}' >/dev/null
-      # shellcheck disable=SC2016  # the stub's own text, never expanded here.
-      mv -- "$ws" "$ws.real"
-      printf '%s\n' '#!/usr/bin/env bash' '[[ " $* " != *" path oversee "* ]] || exit 1' 'exec "$0.real" "$@"' > "$ws"
-      chmod +x "$ws"
-      launch one 5 --lane "$LANE_A" CC-1
-      mv -- "$ws.real" "$ws" ;;
+      fault_scripts="$(mutant_scripts "$1-path-fault" lib/lane-cap.sh)" || exit 1
+      orch_fixture_shared_libs "${fault_scripts%/scripts}"
+      cp -p -- "${OT%/*}/lib/lane-cap.sh" "$fault_scripts/lib/lane-cap.sh"
+      mutate_file "$fault_scripts/lib/lane-cap.sh" '    if ! state="$("$WORKFLOW_STATE" ${WORKFLOW_STATE_ARGS[@]+"${WORKFLOW_STATE_ARGS[@]}"} path oversee)"; then' '    if ! state="$(false)"; then'
+      OT="$fault_scripts/open-terminal" launch one 5 --lane "$LANE_A" CC-1 ;;
   esac
   line="rc=$(rc one) $(key one) opened=$([[ -e "$ROW/opened.one" ]] && echo yes || echo no)"
   line+=" created=$([[ -e "$ROW/reached.create.one" ]] && echo yes || echo no) lock-waits=$(lock_waits one)"

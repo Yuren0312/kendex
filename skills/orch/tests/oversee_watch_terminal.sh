@@ -169,6 +169,7 @@ PYRECOVERY
       if [[ "$1" == create ]]; then printf 'fixture-provider: create-failed item=KEN-1\n' >&2; return 1; fi
       "$REPO_ROOT/skills/orch/scripts/lane-host" "$@"
     }
+    DEPENDENCY_RECORD="" DEPENDENCY_SESSION=""
     parked_rc=0 wt_id=KEN-1 LANE_HOST="$FIXTURE_HOST" HOST_PANE=local RELAUNCH=true repo=owner/repo HARNESS=codex LANE_ENV= CMD_TEMPLATE=
     keep_tree=false host_line= create_rc=0 skipped=0 failed=0 LANE_HOST_BUSY_EXIT=69 WORKTREE_REUSE_UNREBASED_EXIT=76
     source "$STUB_DIR/recovery.sh"

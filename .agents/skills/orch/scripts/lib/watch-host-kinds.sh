@@ -22,7 +22,9 @@ LANE_INTERVALS_JQ='  def covered_seconds($spans; $from; $to):
     | [$union[] | .b - .a] | add // 0;
 
   def lane_pauses($park_only):
-    if .parked.timing_unread == true or (.parked.wait != null and (.parked.phase // "" | startswith("start-")))
+    if .parked.timing_unread == true or .dependency_wait.timing_unread == true
+       or (.parked.wait != null and (.parked.phase // "" | . == "stop-unconfirmed" or startswith("start-")))
+       or (.dependency_wait.wait != null and .dependency_wait.phase == "stop-unconfirmed")
        or any(.pauses[]?; .timing_unread == true) then error("pause-ack-unread") else . end
     | ([ (.pauses // [])[] | select(($park_only | not) or .cause == "parked")
        | {from:(.from | fromdateiso8601),to:(if .to == null then null else .to | fromdateiso8601 end)} ]

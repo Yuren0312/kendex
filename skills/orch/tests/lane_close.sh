@@ -20,6 +20,7 @@ cleanup() {
 trap cleanup EXIT
 # shellcheck source=lib/assertions.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assertions.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/growth-state.sh"
 
 host_call_count() { awk 'END { print NR + 0 }' "$HOST_CALLS"; }
 close_call_count() { grep -c '^close ' "$HOST_CALLS" || true; }
@@ -729,6 +730,20 @@ for row in \
   run_close "$SCRIPT" --park --wait-file "$TMP_ROOT/wait.json"
   assert_eq "rc=$RC status=$(jq -r '.lanes[0].status' "$STATE") stop=$(stop_count KEN-1 codex) at=$(jq -r '.lanes[0].parked.at != null' "$STATE")" \
     "rc=1 status=$want_status stop=$want_stop at=$want_at" "$label refuses without a false confirmed pause" "$TMP_ROOT/err"
+  if [[ "$label" == missing-stop-ack ]]; then
+    source "$TEST_DIR/../scripts/lib/watch-host-kinds.sh"
+    pause_rc=0
+    jq "$LANE_INTERVALS_JQ .lanes[0] | lane_pauses(true)" "$STATE" > "$TMP_ROOT/pause.out" 2> "$TMP_ROOT/pause.err" || pause_rc=$?
+    assert_eq "$pause_rc" 5 'the produced missing-stop acknowledgment record has unavailable timing'
+    cp -p -- "$TEST_DIR/../scripts/lib/watch-host-kinds.sh" "$TMP_ROOT/stop-ack-reader.sh"
+    mutate_file "$TMP_ROOT/stop-ack-reader.sh" '. == "stop-unconfirmed" or startswith("start-")' 'startswith("start-")'
+    control_intervals="$(source "$TMP_ROOT/stop-ack-reader.sh"; printf '%s' "$LANE_INTERVALS_JQ")"
+    control_rc=0
+    jq "$control_intervals .lanes[0] | lane_pauses(true)" "$STATE" > "$TMP_ROOT/pause.control.out" 2> "$TMP_ROOT/pause.control.err" || control_rc=$?
+    assert_eq "$control_rc" 0 'the disabled stop-uncertainty reader reaches a successful interval result'
+    CONTROL_RED="$(FAIL=0; assert_eq "$control_rc" 5 control >/dev/null; printf '%s' "$FAIL")"
+    assert_eq "$CONTROL_RED" 1 'control: dropping stop uncertainty reddens the produced-record timing assertion'
+  fi
   unset "$name"
   export LANE_CLOSE_HOST_LIST_JSON='[{"repo":"repo","item":"KEN-1","id":"immutable-1","name":"reusable-name"}]' LANE_CLOSE_PARK_READ=1
 done
@@ -1187,15 +1202,15 @@ if proc_table_readable; then
     start_local_harness claude
     PATH="$LOCAL_PATH" LANE_CLOSE_LANE_PID="$LANE_PID" run_close "$1"
   }
-  MUTANT="$(lib_mutant empty-start '' '' "lane_process_start() { printf '\\n'; }")"
+  MUTANT="$(lib_mutant empty-start 'lane_process_start() { # PID' $'lane_process_start() { # PID\n  [[ "$1" != "${LANE_CLOSE_LANE_PID:-}" ]] || { printf "\\n"; return 0; }')"
   empty_start_row "$MUTANT"
   assert_eq "rc=$RC failed=$(grep -c "^lane-close: stop-failed item=KEN-1 harness=claude pid=$LANE_PID cause=start-read-failed\$" <<<"$ERR" || true) lane=$(proc_state_after "$LANE_PID") status=$(jq -r '.lanes[0].status' "$STATE")" \
     'rc=1 failed=1 lane=alive status=running' 'an empty start read on a live recorded pid refuses as start-read-failed'
   kill "$LANE_PID" 2>/dev/null || true
   # Control: without the second state read the empty start reads as a pid that
   # exited, a stale identity.
-  MUTANT="$(lib_mutant empty-start-stale '      [[ -z "$state" || "$state" == Z ]] || { LANE_IDENTITY_CAUSE=start-read-failed; return 1; }' '      :' \
-    "lane_process_start() { printf '\\n'; }")"
+  MUTANT="$(lib_mutant empty-start-stale 'lane_process_start() { # PID' $'lane_process_start() { # PID\n  [[ "$1" != "${LANE_CLOSE_LANE_PID:-}" ]] || { printf "\\n"; return 0; }')"
+  mutate_file "${MUTANT%/*}/lib/lane-state.sh" '      [[ -z "$state" || "$state" == Z ]] || { LANE_IDENTITY_CAUSE=start-read-failed; return 1; }' '      :'
   empty_start_row "$MUTANT"
   assert_eq "rc=$RC failed=$(grep -c "^lane-close: stop-failed item=KEN-1 harness=claude pid=$LANE_PID cause=identity-stale\$" <<<"$ERR" || true) lane=$(proc_state_after "$LANE_PID")" \
     'rc=1 failed=1 lane=alive' 'control: without the second state read an empty start reads as a stale identity'
@@ -1757,12 +1772,12 @@ for tracker_type in completed canceled; do
   assert_eq "rc=$RC close=$(close_call_count) mail=$(awk 'END {print NR+0}' "$MAIL_CALLS") status=$(jq -r '.lanes[0].status' "$STATE")" \
     'rc=0 close=1 mail=0 status=done' 'a terminal stopped record closes without its unavailable mailbox'
 done
-MUTANT="$(mutant stopped-terminal-mail '  [[ "$tracker_rc" -eq 0 ]] || refuse_unanswered_ask' '  [[ "$tracker_rc" -eq 0 ]] && tracker_rc=1; refuse_unanswered_ask')"
+MUTANT="$(mutant stopped-terminal-mail '  [[ "$tracker_rc" -eq 0 || -n "$PARK_WAIT_FILE" ]] || refuse_unanswered_ask' '  [[ "$tracker_rc" -eq 0 ]] && tracker_rc=1; refuse_unanswered_ask')"
 write_state stopped claude /host; : >"$ROWS"
 LANE_CLOSE_MAIL_STATUS=2 run_close "$MUTANT"
 assert_eq "rc=$RC close=$(close_call_count) mail=$(awk 'END {print NR+0}' "$MAIL_CALLS") status=$(jq -r '.lanes[0].status' "$STATE")" \
   'rc=1 close=0 mail=1 status=stopped' 'control: restoring the mailbox read strands the terminal stopped record'
-MUTANT="$(mutant stopped-open-ask '  [[ "$tracker_rc" -eq 0 ]] || refuse_unanswered_ask' '  [[ "$tracker_rc" -eq 0 ]] || { true || refuse_unanswered_ask; }')"
+MUTANT="$(mutant stopped-open-ask '  [[ "$tracker_rc" -eq 0 || -n "$PARK_WAIT_FILE" ]] || refuse_unanswered_ask' '  [[ "$tracker_rc" -eq 0 ]] || { true || refuse_unanswered_ask; }')"
 write_state stopped claude /host; : >"$ROWS"
 ASK_CONTROL="$(pending_ask 0)"
 LANE_CLOSE_TRACKER_STATE_TYPE=started LANE_CLOSE_MAIL_PENDING="$ASK_CONTROL" run_close "$MUTANT"
@@ -2079,16 +2094,16 @@ MUTANT="$(mutant selection-live '  *) message lane-live "item=$ITEM" "state=$sta
 selection_close "$MUTANT" live
 assert_eq "$SELECTION_GOT" 'rc=0 stop=0 close=1 kill=1 status=done' 'control: the live-lane guard prevents selection close'
 # shellcheck disable=SC2016
-MUTANT="$(mutant selection-ask '  refuse_unanswered_ask
+MUTANT="$(mutant selection-ask '  [[ -n "$PARK_WAIT_FILE" ]] || refuse_unanswered_ask
   close_secs=' '  : # refuse_unanswered_ask
   close_secs=')"
 selection_close "$MUTANT" ask
 assert_eq "$SELECTION_GOT" 'rc=0 stop=1 close=1 kill=1 status=done' 'control: the ask guard prevents selection close'
 # shellcheck disable=SC2016
 MUTANT="$(mutant selection-stop '  stop_harness
-  [[ "$STOP_SKIPPED"' '  : # stop_harness
+  if [[ -n "$PARK_WAIT_FILE" ]]; then' '  : # stop_harness
   finish_close
-  [[ "$STOP_SKIPPED"')"
+  if [[ -n "$PARK_WAIT_FILE" ]]; then')"
 selection_close "$MUTANT" idle --keep-sandbox
 assert_eq "$SELECTION_GOT" 'rc=0 stop=0 close=0 kill=1 status=stopped' 'control: the kept selection must stop its hosted harness'
 

@@ -827,7 +827,8 @@ echo "=== a process table that cannot be read stops the launch under its own lin
 # under the shell is unknown: neither an exited CLI nor one to nudge.
 PS_BIN="$TMP_ROOT/ps-bin"
 mkdir -p "$PS_BIN"
-printf '#!/usr/bin/env bash\nexit 1\n' > "$PS_BIN/ps"
+REAL_PS="$(command -v ps)" || exit 1
+printf '#!/usr/bin/env bash\n[[ "$*" != "-A -o pid= -o ppid= -o comm=" ]] || exit 1\nexec %q "$@"\n' "$REAL_PS" > "$PS_BIN/ps"
 chmod +x "$PS_BIN/ps"
 process_row() { # SCRIPT ITEM — the launch, its result in PROCESS
   run_ot SCRIPT="$1" PATH="$PS_BIN:$BIN:$OT_BIN:$PATH" OT_HARNESS_EXITS=1 OT_COMPOSER_ON_ENTER=99 -- "${CLOUD[@]}" "$2"

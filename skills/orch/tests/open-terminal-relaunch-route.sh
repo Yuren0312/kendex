@@ -91,12 +91,12 @@ chmod +x "$HARNESS_BIN/claude"
 
 RUN_SEQ=0
 # run_ot RECORDED SCREEN HARNESS — one hosted relaunch of KEN-1 on HARNESS into
-# a fleet whose record for KEN-1 names RECORDED and reads running, with the
-# entries SEED_LANES holds after it; RECORDED `-` runs on the fleet state the
+# a fleet whose record for KEN-1 names RECORDED and reads running.
+# RECORDED `-` runs on the fleet state the
 # previous run left. SCREEN is the harness screen file, `-` for a pane that
 # never draws one. RUN_ENV holds any further stub settings for the run. Sets
 # OUT, RC and RUN.
-RUN_ENV=() RUN_ARGS=() SEED_LANES='[]' SELECT_KIND=- HANDOFF_CASE=neutral RUN_CMD="" REQUIRE_PREPARED=false
+RUN_ENV=() RUN_ARGS=() SELECT_KIND=- HANDOFF_CASE=neutral RUN_CMD="" REQUIRE_PREPARED=false
 run_ot() {
   local recorded="$1" screen="$2" harness="$3" flags="${4:---model opus --effort high}" prev="${RUN:-}" lane=work pool=""
   [[ "$harness" != codex ]] || flags='-m gpt-6-astra -c model_reasoning_effort=high'
@@ -122,8 +122,8 @@ run_ot() {
   if [[ "$recorded" == - ]]; then
     cp -R "$prev/state" "$RUN/state" || { echo "open-terminal-relaunch-route: seed-failed run=$RUN" >&2; exit 1; }
   elif ! mkdir -p "$RUN/state" || ! "$SCRIPTS_DIR/workflow-state" --state-dir "$RUN/state" init oversee >/dev/null \
-    || ! "$SCRIPTS_DIR/workflow-state" --state-dir "$RUN/state" update oversee --arg h "$recorded" --argjson extra "$SEED_LANES" --arg cwd "$PWD" \
-      '.overseer = {cwd: $cwd} | .lanes = [{item: "KEN-1", harness: $h, model: "last-model", account: "last-account", session_id: "last-session", status: "running"}] + $extra' >/dev/null; then
+    || ! "$SCRIPTS_DIR/workflow-state" --state-dir "$RUN/state" update oversee --arg h "$recorded" --arg cwd "$PWD" \
+      '.overseer = {cwd: $cwd} | .lanes = [{item: "KEN-1", harness: $h, model: "last-model", account: "last-account", session_id: "last-session", status: "running"}]' >/dev/null; then
     echo "open-terminal-relaunch-route: seed-failed run=$RUN" >&2
     exit 1
   fi
@@ -320,6 +320,16 @@ RUN_ENV=()
 assert_eq "rc=$RC launched=$(launched) failed=$(said '^open-terminal: tmux-failed operation=capture-pane item=KEN-1') missing=$(said 'harness-screen-missing')" \
   "rc=1 launched=0 failed=1 missing=0" \
   "a harness-screen read that fails reports tmux-failed, not harness-screen-missing"
+record_write_failure() {
+  local scripts current="$OPEN_TERMINAL"
+  scripts="$(mutant_scripts "record-write-$RUN_SEQ/orch" workflow-state)" || exit 1
+  orch_fixture_shared_libs "${scripts%/scripts}"
+  rm -- "${scripts:?}/open-terminal"
+  cp -p -- "$current" "$scripts/open-terminal"
+  mutate_file "$scripts/workflow-state" '    update-report) shift; cmd_update_report "$@" ;;' '    update-report) exit 1 ;;'
+  OPEN_TERMINAL="$scripts/open-terminal" run_ot claude "$HARNESS_SCREEN" claude
+}
+
 # A window that cannot be closed may still run a harness, so its record keeps
 # what it read. A relaunch that took and could not be recorded keeps its window.
 RUN_ENV=(OT_TMUX_FAIL=kill-window)
@@ -328,9 +338,7 @@ RUN_ENV=()
 assert_eq "rc=$RC failed=$(said '^open-terminal: tmux-failed operation=kill-window item=KEN-1') status=$(status)" \
   "rc=1 failed=1 status=running" \
   "a failed relaunch whose window close fails leaves its record running"
-SEED_LANES='[42]'
-run_ot claude "$HARNESS_SCREEN" claude
-SEED_LANES='[]'
+record_write_failure
 assert_eq "rc=$RC unrecorded=$(said '^open-terminal: record-write-failed item=KEN-1 ') closed=$(closed) status=$(status)" \
   "rc=1 unrecorded=1 closed=0 status=running" \
   "a relaunch that took and could not be recorded keeps its window and its record"
@@ -605,7 +613,9 @@ SELECT_KIND=matching run_ot codex "$HARNESS_SCREEN" codex
 assert_eq "$(cat "$RUN/inline/replay.out") lineless=$(said '^open-terminal: resume-lineless item=KEN-1 harness=codex$')" \
   'rc=0 runs=1 resume=1 fresh=0 target=1 lineless=0' \
   'control: a suppressed resume result loses the continuation handoff'
-control automatic-continuation 'launch_write continuation "$title" "$LAUNCH_PANE" ssh text "$continuation" || return 1' ':'
+control automatic-continuation '          launch_write continuation "$title" "$LAUNCH_PANE" ssh text "$continuation" || return 1
+        else ot_message resume-lineless' '          :
+        else ot_message resume-lineless'
 RUN_ARGS=(--continue-resume)
 SELECT_KIND=matching run_ot codex "$HARNESS_SCREEN" codex
 RUN_ARGS=()
@@ -708,9 +718,7 @@ run_ot claude - claude
 RUN_ENV=()
 assert_eq "status=$(status)" "status=stopped" "control: a stop past a failed close writes stopped over a live window"
 control untaken 'if [[ "${HOST_PANE:-local}" != verb && -n "$UNTAKEN_PANE" && "$FLEET" == true && "$RELAUNCH" == true ]]; then' 'if [[ "${HOST_PANE:-local}" != verb && -n "${UNTAKEN_PANE:=$LAUNCH_PANE}" && "$FLEET" == true && "$RELAUNCH" == true ]]; then'
-SEED_LANES='[42]'
-run_ot claude "$HARNESS_SCREEN" claude
-SEED_LANES='[]'
+record_write_failure
 assert_eq "closed=$(closed)" "closed=1" "control: a stop on every failure closes a relaunch that took"
 OPEN_TERMINAL="$SHIPPED"
 # run_ot without its TMUX_PANE setting, run from the pane the stub names the

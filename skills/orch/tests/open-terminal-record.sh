@@ -30,6 +30,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/question-off.sh"
 # mutant_scripts and mutate_file, the two halves of the control below.
 # shellcheck source=lib/growth-state.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/growth-state.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/open-terminal-stubs.sh"
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$TEST_DIR/.." && pwd)/scripts"
@@ -135,7 +136,10 @@ case "${1:-}" in
       printf '%%1\t%s\t%s\n' "${STUB_PANE_PID:-$$}" "$running"
     else echo %1; fi ;;
   load-buffer) cat -- "${@: -1}" > "$STUB_PANE_BUFFER" || exit 1
-    [[ -z "${STUB_BUFFER_LOG:-}" ]] || cat -- "$STUB_PANE_BUFFER" >> "$STUB_BUFFER_LOG" ;;
+    if [[ -n "${STUB_BUFFER_LOG:-}" ]]; then
+      cat -- "$STUB_PANE_BUFFER" >> "$STUB_BUFFER_LOG" || exit 1
+      printf '\n' >> "$STUB_BUFFER_LOG" || exit 1
+    fi ;;
   paste-buffer) [[ -z "${STUB_PASTED:-}" ]] || : > "$STUB_PASTED" ;;
   capture-pane)
     if [[ -n "${STUB_HARNESS_TEXT:-}" && -f "$STUB_PANE_BUFFER" ]] && grep -q '^exec bash -lc ' "$STUB_PANE_BUFFER"; then printf '%s\n' "$STUB_HARNESS_TEXT"
@@ -280,21 +284,38 @@ FLEET_CMD=(--harness claude --cmd "true --model opus --effort high $QUESTION_OFF
   }
   dependency_resume() {
     local create_line="${DEP_CREATE_LINE:-}"
+    local command=(--launch-flags "$DEP_FLAGS")
+    [[ -z "${DEP_CMD:-}" ]] || command=(--cmd "$DEP_CMD")
     [[ -n "$create_line" ]] || create_line=$'ssh-target=lane.example\tpath=/srv/lane\tremote-prefix=exec bash -lc'
     STUB_PANE_CMD=ssh STUB_PANE_TEXT='dev@lane:~$' STUB_HARNESS_TEXT="${DEP_SCREEN:-Working (esc to interrupt)}" \
       LANE_HOST_STUB_LOG="$TMP_ROOT/host.log" LANE_HOST_STUB_DIR="$HOSTED_DISK" \
       LANE_HOST_STUB_CREATE_LINE="$create_line" \
       LANE_HOST_STUB_LIST_JSON='[{"repo":"r","item":"CC-70","id":"immutable-70","name":"reusable-name"}]' \
-      RUN_TMUX=stub,1,0 run_ot --relaunch --continue-resume --tmux --harness "${DEP_HARNESS:-codex}" --launch-flags "$DEP_FLAGS" --lane "$LANE_DIR" --host "$HOST_STUB" --repo o/r CC-70
+      RUN_TMUX=stub,1,0 run_ot SCRIPT="${DEP_SCRIPT:-$OT}" --relaunch --continue-resume --tmux --harness "${DEP_HARNESS:-codex}" ${command[@]+"${command[@]}"} --lane "$LANE_DIR" --host "$HOST_STUB" --repo o/r CC-70
+  }
+  dependency_argv() {
+    local line
+    line="$(awk '/^exec bash -lc / {print; exit}' "$TMP_ROOT/typed-buffers")" || return 1
+    ot_replay_relaunch "$line" "$SCRIPTS_DIR" "$TMP_ROOT/typed-argv" codex matching 0 CC-70 > "$TMP_ROOT/typed-replay.out" || return 1
+    python3 - "$TMP_ROOT/typed-argv/harness.log" <<'PYARGV'
+import json, pathlib, sys
+args = pathlib.Path(sys.argv[1]).read_bytes().split(b'\0')[:-1]
+targets = [args[i + 1].decode() for i, arg in enumerate(args[:-1]) if arg == b'resume']
+print(json.dumps({"runs": args.count(b'__run__'), "targets": targets,
+                  "fallback": any(arg in (b'--last', b'--continue') for arg in args)}, separators=(',', ':')))
+PYARGV
   }
   export STUB_DEPENDENCY_ISSUE='{"id":"immutable-issue-2","number":2,"state":"CLOSED","stateReason":"COMPLETED"}'
   export STUB_DEPENDENCY_VIEW='{"number":9,"state":"MERGED","headRefName":"dependency-2","headRepositoryOwner":{"login":"o"},"mergedAt":"2026-10-22T12:00:00Z","mergeCommit":{"oid":"actual-landed-commit"}}'
   if [[ "${1:-}" != --native-only ]]; then
   dependency_resume_state
   before="$($WS --state-dir "$STATE" get oversee '.lanes[0].recovery' | jq -c .)"
-  dependency_resume
+  : > "$TMP_ROOT/typed-buffers"
+  STUB_BUFFER_LOG="$TMP_ROOT/typed-buffers" dependency_resume
   assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status') session=$($WS --state-dir "$STATE" get oversee '.lanes[0].session_id') recovery=$($WS --state-dir "$STATE" get oversee '.lanes[0].recovery' | jq -c .)" \
     "rc=0 status=running session=native-70 recovery=$before" 'exact native resume preserves the spent recovery object' "$TMP_ROOT/err"
+  EXACT_ARGV='{"runs":1,"targets":["native-70"],"fallback":false}'
+  assert_eq "$(dependency_argv)" "$EXACT_ARGV" 'typed continuation executes exactly the recorded native session' "$TMP_ROOT/typed-argv/replay.err"
   assert_eq "$($WS --state-dir "$STATE" get oversee '[(.lanes[0].pauses|length),.lanes[0].dependency_wait.outcome]' | jq -c .)" '[1,"running"]' 'confirmed resume closes the pause exactly once'
   dependency_resume
   assert_eq "rc=$RC starts=$(grep -c '^start ' "$TMP_ROOT/host.log" || true) creates=$(grep -c '^create ' "$TMP_ROOT/host.log" || true)" 'rc=1 starts=1 creates=1' 'a replay starts no second harness or sandbox'
@@ -302,6 +323,37 @@ FLEET_CMD=(--harness claude --cmd "true --model opus --effort high $QUESTION_OFF
   dependency_resume
   assert_eq "rc=$RC starts=$(grep -c '^start ' "$TMP_ROOT/host.log" || true) pauses=$($WS --state-dir "$STATE" get oversee '.lanes[0].pauses|length')" \
     'rc=0 starts=2 pauses=2' 'a new park can resume after a completed running wait' "$TMP_ROOT/err"
+  WRONG_NATIVE="$(mutant_scripts wrong-native-target open-terminal)/open-terminal" || exit 1
+  orch_fixture_shared_libs "$TMP_ROOT/wrong-native-target"
+  mutate_file "$WRONG_NATIVE" 'codex %sresume %q\n' 'codex %sresume --last # %q\n'
+  dependency_resume_state
+  : > "$TMP_ROOT/typed-buffers"
+  DEP_SCRIPT="$WRONG_NATIVE" STUB_BUFFER_LOG="$TMP_ROOT/typed-buffers" dependency_resume
+  WRONG_ARGV="$(dependency_argv)"
+  assert_eq "$RC|$WRONG_ARGV" '0|{"runs":1,"targets":["--last"],"fallback":true}' 'the wrong-target control reaches its generated harness arguments' "$TMP_ROOT/typed-argv/replay.err"
+  if (FAIL=0; assert_eq "$WRONG_ARGV" "$EXACT_ARGV" wrong-target; [[ "$FAIL" -eq 0 ]]) > "$TMP_ROOT/wrong-target.control"; then
+    fail 'the exact-native assertion accepted a latest-session fallback'
+  else
+    pass 'control: the exact-native assertion rejects a latest-session fallback'
+  fi
+  for route in native custom; do
+    dependency_resume_state
+    "$WS" --state-dir "$STATE" update oversee '.lanes[0].allow_all=true' >/dev/null
+    dependency_resume
+    current_flags='--model opus --effort high --permission-mode dontAsk'
+    custom=""
+    [[ "$route" != custom ]] || custom="true --model opus --effort high $QUESTION_OFF_ALL $COMPACTION_OFF_ALL"
+    LANE_HOST_STUB_HARNESS_STATE=exited DEP_HARNESS=claude DEP_FLAGS="$current_flags" DEP_CMD="$custom" dependency_resume
+    if [[ "$route" == native ]]; then
+      expected_recovery="$(jq -cn --arg flags "$current_flags" '{flags:$flags,allow_all:null}')"
+      observed_recovery="$($WS --state-dir "$STATE" get oversee '.lanes[0] | {flags:.recovery.flags,allow_all}' | jq -c .)"
+    else
+      expected_recovery=null
+      observed_recovery="$($WS --state-dir "$STATE" get oversee '.lanes[0].recovery' | jq -c .)"
+    fi
+    assert_eq "rc=$RC recovery=$observed_recovery history=$($WS --state-dir "$STATE" get oversee '.lanes[0].dependency_wait.wait.kind')" \
+      "rc=0 recovery=$expected_recovery history=item" "$route launch after completed wait writes its current recovery fields" "$TMP_ROOT/err"
+  done
   dependency_resume_state
   "$WS" --state-dir "$STATE" update oversee '.lanes[0].repo=null' >/dev/null
   dependency_resume
@@ -317,6 +369,21 @@ FLEET_CMD=(--harness claude --cmd "true --model opus --effort high $QUESTION_OFF
   dependency_resume_state
   LANE_HOST_STUB_START_OUT=unacknowledged dependency_resume
   assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status') creates=$(grep -c '^create ' "$TMP_ROOT/host.log" || true) pauses=$($WS --state-dir "$STATE" get oversee '.lanes[0].pauses|length')" 'rc=1 status=parked creates=0 pauses=0' 'a missing start acknowledgment keeps the open pause and parked disk'
+  dependency_resume_state
+  LANE_HOST_STUB_START_EFFECT="$TMP_ROOT/start-effect" LANE_HOST_STUB_START_STATUS=7 dependency_resume
+  assert_eq "rc=$RC effect=$(cat "$TMP_ROOT/start-effect") state=$($WS --state-dir "$STATE" get oversee '.lanes[0].parked | [.phase,.timing_unread,.failure.exit]' | jq -c .) creates=$(grep -c '^create ' "$TMP_ROOT/host.log" || true)" \
+    'rc=1 effect=started state=["start-unconfirmed",true,7] creates=0' 'a provider effect followed by failed acknowledgment leaves start timing unread' "$TMP_ROOT/err"
+  source "$SCRIPTS_DIR/lib/watch-host-kinds.sh"
+  pause_rc=0
+  jq "$LANE_INTERVALS_JQ .lanes[0] | lane_pauses(true)" "$STATE/workflow-state-oversee.json" > "$TMP_ROOT/pause.out" 2> "$TMP_ROOT/pause.err" || pause_rc=$?
+  assert_eq "$pause_rc" 5 'unacknowledged provider start cannot become measured parked time'
+  dependency_resume_state
+  "$WS" --state-dir "$STATE" update oversee '.lanes[0] |= (.status="stopped" | .parked.phase="stop-unconfirmed" | del(.parked.at))' >/dev/null
+  dependency_resume
+  pause_rc=0
+  jq "$LANE_INTERVALS_JQ .lanes[0] | lane_pauses(true)" "$STATE/workflow-state-oversee.json" > "$TMP_ROOT/pause.out" 2> "$TMP_ROOT/pause.err" || pause_rc=$?
+  assert_eq "rc=$RC timing=$pause_rc retained=$($WS --state-dir "$STATE" get oversee '.lanes[0] | [.dependency_wait.timing_unread,.pauses[0].timing_unread]' | jq -c .)" \
+    'rc=0 timing=5 retained=[true,true]' 'resume retains missing stop acknowledgment as unread timing' "$TMP_ROOT/err"
   dependency_resume_state
   LANE_HOST_STUB_CREATE_OWNED=CC-70 dependency_resume
   assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status') outcome=$($WS --state-dir "$STATE" get oversee '.lanes[0].dependency_wait.outcome')" 'rc=75 status=stopped outcome=failed' 'failed create keeps the accepted wait and failure after confirmed start' "$TMP_ROOT/err"
