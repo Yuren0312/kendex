@@ -622,7 +622,7 @@ check "must-fail: a queue job ignoring the event runs on a pull request" "$open_
 # The shard key expands to the published list, and to the whole roster where
 # nothing was published; that literal is the roster ci-job-set selects from,
 # in its order, which the ALL_ON row's list is.
-check "the shard matrix expands the selected shards" "[$ORCH,\"guards-scans\",\"rest\"]" \
+check "the shard matrix expands the selected shards" "$ORCH_SHARDS" \
   "$(legs "$WORKFLOW" "$ORCH_CODE_ROW" success merge_group shard)"
 check "the shard matrix expands ci-job-set's roster, in order, when nothing classified" \
   "$(selection standard false .github/workflows/skill-tests.yml | sed -n 's/.* shards=\([^ ]*\).*/\1/p')" \
@@ -1301,6 +1301,25 @@ selected-linux|merge_group|$one_skill|true|1
 selected-both|merge_group|$ORCH_CODE_ROW|true|1
 unselected|merge_group|$CODE_ROW|false|0
 ROWS
+value="$(gh_eval value "$(context_json merge_group success "$one_skill" "$TMP/published-map")" "$expr")"
+for result in failure cancelled skipped missing; do
+  RESULTS="$(jq -cn --arg result "$result" '{changes: {result: "success"}} +
+    (if $result == "missing" then {} else {"skill-suites-shard": {result: $result}} end)')"
+  check "$CI_JOB rejects $result evidence for the selected shell job" 1 \
+    "$(aggregate "$AGGREGATE" --lane "$value:skill-suites-shard")"
+done
+# The missing fixture removes the whole matrix job's needs key. A graph
+# omission leaves the independently selected matrix running outside CI's needs.
+mkdir -p "$TMP/selected-control/tools" "$TMP/selected-control/skills/harness-ci"
+ln -s "$ROOT/skills/harness-ci/scripts" "$TMP/selected-control/skills/harness-ci/scripts"
+plant "$AGGREGATE" 'true) selected="$selected $job" ;;' 'true) : ;;' \
+  "$TMP/selected-control/tools/ci-aggregate"
+chmod +x "$TMP/selected-control/tools/ci-aggregate"
+check "must-fail: ignoring selected presence accepts the omitted matrix result" 0 \
+  "$(aggregate "$TMP/selected-control/tools/ci-aggregate" --lane "$value:skill-suites-shard")"
+check "an unselected absent job retains its existing waiver contract" 0 \
+  "$(aggregate "$AGGREGATE" --lane 'false:skill-suites-shard')"
+RESULTS='{"changes":{"result":"success"},"skill-suites-shard":{"result":"skipped"}}'
 plant "$WORKFLOW" "SHELL_SHARDS: \${{ $expr }}" "SHELL_SHARDS: \${{ $expr && false }}" \
   "$TMP/wf-shell-false-$CI_JOB.yml" "$CI_JOB"
 false_expr="$(aggregate_lanes "$TMP/wf-shell-false-$CI_JOB.yml" "$CI_JOB" | awk -F '\t' '$2 == "skill-suites-shard" { print $3 }')"
