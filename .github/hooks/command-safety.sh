@@ -31,7 +31,6 @@ environment_private_path() {
 # direct commands and unsupported suffixes need the same launcher decision.
 environment_producer() { # command kind, optional unsupported context and command-head proof
     local env_head named_removal
-    launcher=""
     # Other is unresolved. An existing arm's proof must establish clean.
     mode=other
     # Only these literal forwarding forms are part of the input contract.
@@ -47,16 +46,14 @@ environment_producer() { # command kind, optional unsupported context and comman
         exec | builtin)
           if [ "$1" = shell ] && [ "${args[$((pos - 1))]}" = "$program" ]; then
             [ -n "$unsupported" ] || main_start=$pos
-            program=opaque; unsupported=1; compound=1; launcher=1
+            program=opaque; unsupported=1; compound=1
           fi
           break ;;
         command)
           case "${args[$pos]:-}" in -v | -V) pos=${#args[@]}; break ;; -p) pos=$((pos + 1)) ;; esac
-          launcher=1
           [ "${args[$pos]:-}" != -- ] || pos=$((pos + 1))
           continue ;;
         sudo)
-          launcher=1
           while [ "$pos" -lt "${#args[@]}" ]; do
             case "${args[$pos]}" in
               -u | -g | --user | --group) pos=$((pos + 2)) ;;
@@ -114,11 +111,7 @@ environment_producer() { # command kind, optional unsupported context and comman
           [ "$program" = env ] && [ "$mode" = other ] || break
           # Keep this launcher role through conservative suffix scanning. Its
           # explicit target is still selected and checked by this producer.
-          if [ "${3:-}" = command-head ] && [ -n "$named_removal" ]; then
-            arg_roles[env_head]=unset-launcher
-          else
-            launcher=1
-          fi
+          if [ "${3:-}" = command-head ] && [ -n "$named_removal" ]; then arg_roles[env_head]=unset-launcher; fi
           continue ;;
         *) break ;;
       esac
@@ -686,26 +679,23 @@ environment_main_command() { # command kind; arguments are already decoded data
 # Receiving language is a local classification, not an exemption from the
 # independent shell expansion and unsupported forwarding checks.
 environment_receiver() {
-  receiver=unknown; written_judge=unknown; receiver_pattern=""; receiver_option=""; receiver_named=""
-  case "${1:-$program}" in
-    cat) receiver=data; written_judge=data ;;
-    bash | sh | dash | zsh | ksh) receiver=shell; written_judge=shell ;;
-    # Their supplied input and eval source retain the existing recursive
-    # checks; source/dot file operands do not read registered file bodies.
-    eval | source | .) receiver=shell; written_judge=data ;;
+  receiver=unknown; receiver_pattern=""; receiver_option=""; receiver_named=""
+  case "$program" in
+    cat) receiver=data ;;
+    bash | sh | dash | zsh | ksh | eval | source | .) receiver=shell ;;
     python | python3)
-      receiver=interpreter; written_judge=interpreter; receiver_option='^-c$'
+      receiver=interpreter; receiver_option='^-c$'
       receiver_pattern='(^|[^A-Za-z0-9_])os[[:space:]]*\.[[:space:]]*environ'
       receiver_named='^[[:blank:]]*(\[|\.[[:blank:]]*(get|pop|setdefault|__getitem__|__contains__)[[:blank:]]*\()' ;;
     node)
-      receiver=interpreter; written_judge=interpreter; receiver_option='^(-e|--eval)$'
+      receiver=interpreter; receiver_option='^(-e|--eval)$'
       receiver_pattern='(^|[^A-Za-z0-9_])process[[:space:]]*\.[[:space:]]*env'
       receiver_named='^[[:blank:]]*(\[|\.)' ;;
     ruby)
-      receiver=interpreter; written_judge=interpreter; receiver_option='^-e$'
+      receiver=interpreter; receiver_option='^-e$'
       receiver_pattern='(^|[^A-Za-z0-9_])ENV[[:space:]]*\.[[:space:]]*(to_h|each)([^A-Za-z0-9_]|$)' ;;
     perl)
-      receiver=interpreter; written_judge=interpreter; receiver_option='^-e$'
+      receiver=interpreter; receiver_option='^-e$'
       receiver_pattern='%ENV([^A-Za-z0-9_]|$)' ;;
   esac
 }
@@ -758,10 +748,8 @@ environment_program_text() {
         if [ -z "$options_ended" ]; then
           case "$value" in
             --) options_ended=1; cursor=$((cursor + 1)); continue ;;
-            -) options_ended=1; cursor=$((cursor + 1)); continue ;;
             --rcfile | --init-file)
-              [ "$((cursor + 1))" -ge "${#args[@]}" ] ||
-                [ "${arg_kinds[$((cursor + 1))]:-}" = literal ] || unproved=1
+              [ "${arg_kinds[$((cursor + 1))]:-}" = literal ] || unproved=1
               cursor=$((cursor + 2)); continue ;;
             -[^-]* | +*)
               # A short-option word can combine command-string selection and
@@ -770,12 +758,12 @@ environment_program_text() {
               [[ ${value:1} =~ ^[abCefhiklmnprstuvxBDEHPTcoO]+$ ]] || unproved=1
               case "${value:1}" in
                 *[oO]*[oO]*)
-                  # Grouped option operands cannot prove a literal source.
+                  # Main's refusal remains for unproved grouped operands.
+                  # This cut adds no operand-counting allowance.
                   if environment_main_evidence "${args[@]:pos}"; then mode=dump-unknown; fi
                   return ;;
                 *o* | *O*)
-                  [ "$((cursor + 1))" -ge "${#args[@]}" ] ||
-                    [ "${arg_kinds[$((cursor + 1))]:-}" = literal ] || unproved=1
+                  [ "${arg_kinds[$((cursor + 1))]:-}" = literal ] || unproved=1
                   cursor=$((cursor + 2)) ;;
                 *) cursor=$((cursor + 1)) ;;
               esac
@@ -785,8 +773,7 @@ environment_program_text() {
         fi
         if [ -n "$wants_string" ]; then source=$value; source_pos=$cursor; fi
         break
-      done
-      ;;
+      done ;;
     eval)
       stdin_program=1
       # Eval can consume a leading option operand before joining its source.
@@ -829,7 +816,7 @@ environment_dump() { # command kind; arguments are already decoded data
   local LC_ALL=C i=0 c next quote="" word="" expansion="" active="" kind=literal compound="" bare=1 quoted=""
   local j start=0 end n fd redirection_kind target proc output input_redirect input_escaped pos program value named flags
   local mode pattern_count pattern filter_ok stage=0 text text_length span span_re comment_span options_ended null_output syntax_head program_pos stdin_program source_pos data_source piped_source="" pipeline="" heredoc_input=${heredoc_input:-}
-  local receiver receiver_pattern receiver_option receiver_named written_judge launcher
+  local receiver receiver_pattern receiver_option receiver_named
   local unsupported="" scan candidate limit producer_end code incoming_sources="" file_output file_body redirect_evidence head_start main_start script_pos forwarded_argument=""
   local heredoc_op="" heredoc_origin delimiter line remaining doc body found math_depth=0 needs_target="" main_text main_required="" body_start body_end
   local name_re='^[A-Za-z_][A-Za-z0-9_]*(=.*)?$'
@@ -837,15 +824,7 @@ environment_dump() { # command kind; arguments are already decoded data
   local ordinary_span_re=$'^[^\'"\\\\$`# \t\r\n;|()<>&]+'
   local single_span_re="^[^']+" ansi_span_re="^[^'\\\\]+" double_span_re='^[^"\\$`]+' comment_span_re=$'^[^\n]+'
   local tokens=() kinds=() unquoted_words=() saved_quotes=() closers=() args=() arg_kinds=() arg_unquoted=() arg_roles=() stage_roles=() stage_args=() stage_kinds=() stage_unquoted=() heredocs=() heredoc_tabs=() heredoc_expand=() heredoc_bodies=() heredoc_starts=() body_ids=() stage_sources=() stage_stdin=() executable_texts=() executable_stages=()
-  local body_decisions=() arg_origins=() substitution_refs=() redirect_refs=() redirect_unknown="" write_targets=() write_readable=() stage_written=()
-  local context_id ref written_index write_index judge_context referenced judge context_count body_count substitution_origin substitution_kind
-  # Recursive contexts carry a classification argument. The outer submission
-  # owns evidence across those contexts and every stage, regardless of order.
-  if [ "$#" -eq 1 ]; then
-    local written_bodies=() written_paths=() written_contexts=() written_readable=()
-    local context_programs=() context_judges=() context_all=() context_unknown=()
-    local reference_contexts=() reference_paths=() collect_written=1
-  fi
+  local body_decisions=()
   local expansion_words=() arg_expansions=() stage_expansions=()
   local private_inputs=()
   local starts=() ends=() separators=() decisions=() literal_inputs=() input_bodies=() file_outputs=() executable_contexts=()
@@ -908,14 +887,12 @@ environment_dump() { # command kind; arguments are already decoded data
       # A substitution's known producer must remain visible inside double
       # quotes. Saving only the enclosing quote grants no inner permission.
       if { [ "$c" = '$' ] && [ "$next" = '(' ]; } || [ "$c" = '`' ]; then
-        substitution_origin=${#tokens[@]}; substitution_kind=$kind
         if [ -n "$active" ]; then expansion_words[${#tokens[@]}]=$expansion; unquoted_words[${#tokens[@]}]=$bare; tokens[${#tokens[@]}]=$word; kinds[${#kinds[@]}]=$kind; fi
         word=""; expansion=""; active=""; kind=literal; bare=1; quoted=""; compound=1; needs_target=""
         n=${#closers[@]}
         if [ "$c" = '`' ] && [ "$n" -gt 0 ] && [ "${closers[$((n - 1))]}" = '`' ]; then
           quote=${saved_quotes[$((n - 1))]}; unset 'closers[n-1]' 'saved_quotes[n-1]'
         else
-          [ "$substitution_kind" = heredoc-data ] || substitution_refs[${#tokens[@]}]=$substitution_origin
           saved_quotes[n]=$quote; quote=""
           if [ "$c" = '$' ]; then
             [ "${text:$((i + 1)):1}" != '(' ] || math_depth=$((n + 1))
@@ -1068,8 +1045,6 @@ environment_dump() { # command kind; arguments are already decoded data
   for ((stage=0; stage<${#starts[@]}; stage++)); do
     start=${starts[$stage]}; end=${ends[$stage]}; args=(); arg_kinds=(); arg_unquoted=(); arg_expansions=(); arg_roles=()
     private_inputs=(); proc=""; output=""; input_redirect=""; input_escaped=""; mode=other; program=""; program_pos=""; data_source=""; file_output=""; file_body=""; redirect_evidence=""
-    arg_origins=(); redirect_refs=(); redirect_unknown=""; write_targets=(); write_readable=(); stage_written=()
-    context_id=${#context_programs[@]}
     for ((j=start; j<end; j++)); do
       case "${kinds[$j]}" in operator | operator-stderr | operator-explicit-other)
         fd=${kinds[$j]}
@@ -1103,22 +1078,11 @@ environment_dump() { # command kind; arguments are already decoded data
           '>&') [ "$fd" = operator-stderr ] || output=1 ;;
           '&>' | '&>''>') output=1 ;;
         esac
-        case "${tokens[$((j - 1))]}" in
-          '<' | '<>' | '>' | '>>' | '&>' | '&>''>')
-            redirect_refs[${#redirect_refs[@]}]=$target
-            if [ "${kinds[$j]:-}" = unknown ] ||
-               environment_main_evidence --head "${expansion_words[$j]:-}"; then redirect_unknown=1; fi ;;
-        esac
-        case "${tokens[$((j - 1))]}" in
-          '<>' | '>' | '>>' | '&>' | '&>''>')
-            n=${#write_targets[@]}; write_targets[n]=$target; write_readable[n]=""
-            if [ "${tokens[$((j - 1))]}" = '>' ] && [ "$fd" = operator ]; then write_readable[n]=1; fi ;;
-        esac
         if environment_main_evidence "$target"; then redirect_evidence=1; fi
         continue ;;
       esac
       n=${#args[@]}
-      args[n]=${tokens[$j]}; arg_kinds[n]=${kinds[$j]}; arg_unquoted[n]=${unquoted_words[$j]}; arg_expansions[n]=${expansion_words[$j]:-}; arg_origins[n]=$j
+      args[n]=${tokens[$j]}; arg_kinds[n]=${kinds[$j]}; arg_unquoted[n]=${unquoted_words[$j]}; arg_expansions[n]=${expansion_words[$j]:-}
     done
     # An empty recorded stage cannot prove how literal input will execute.
     # Existing boundaries select this main-refusal path before head parsing.
@@ -1143,51 +1107,6 @@ environment_dump() { # command kind; arguments are already decoded data
       for ((j=program_pos+1; j<${#args[@]}; j++)); do arg_roles[j]=argument; done
     fi
     environment_program_text
-    # Save command and reference facts before conservative suffix scanning
-    # reuses argv. Complete-submission ownership removes any order proof.
-    if [ -n "${collect_written:-}" ] &&
-       { [ "${#args[@]}" -gt 0 ] || [ -n "${substitution_refs[$end]:-}" ]; } &&
-       [ "${arg_kinds[$head_start]:-}" != heredoc-data ]; then
-      context_programs[context_id]=$program
-      context_judges[context_id]=$written_judge
-      context_all[context_id]=$launcher
-      context_unknown[context_id]=$redirect_unknown
-      if [ "${arg_kinds[$head_start]:-}" = unknown ] ||
-         environment_main_evidence --head "${arg_expansions[$head_start]:-}"; then context_all[context_id]=1; fi
-      for ((j=start; j<=end; j++)); do
-        if [ -n "${substitution_refs[$j]:-}" ]; then
-          context_unknown[context_id]=1
-          referenced=""
-          for ((n=0; n<${#arg_origins[@]}; n++)); do
-            [ "${arg_origins[$n]}" = "${substitution_refs[$j]}" ] || continue
-            referenced=1
-            [ "${arg_roles[$n]:-}" != command ] || context_all[context_id]=1
-          done
-          [ -n "$program_pos$referenced" ] || context_all[context_id]=1
-        fi
-      done
-      for ((j=head_start+1; j<${#args[@]}; j++)); do
-        [ "${arg_roles[$j]:-}" != executable ] || continue
-        n=${#reference_paths[@]}; reference_contexts[n]=$context_id; reference_paths[n]=${args[$j]}
-        if [ "${arg_kinds[$j]}" = unknown ] ||
-           environment_main_evidence --head "${arg_expansions[$j]}"; then context_unknown[context_id]=1; fi
-      done
-      for target in ${redirect_refs[@]+"${redirect_refs[@]}"}; do
-        n=${#reference_paths[@]}; reference_contexts[n]=$context_id; reference_paths[n]=$target
-      done
-      # Tee is an unread writer. Its output operands are already decoded
-      # stage argv, just as redirect operands are owned above.
-      if [ "$program" = tee ]; then
-        for ((j=pos; j<${#args[@]}; j++)); do
-          case "${args[$j]}" in -*) continue ;; esac
-          n=${#write_targets[@]}; write_targets[n]=${args[$j]}; write_readable[n]=""
-        done
-      fi
-      for target in ${write_targets[@]+"${write_targets[@]}"}; do
-        n=${#written_paths[@]}; written_paths[n]=$target; written_contexts[n]=$context_id
-        written_readable[n]=""; written_bodies[n]=""; stage_written[${#stage_written[@]}]=$n
-      done
-    fi
     if { [ "$mode" = other ] || [ "$mode" = unclassified-forwarded ]; } &&
        [ -n "$program_pos" ] && [ "${arg_kinds[$program_pos]}" = literal ]; then
       if environment_main_evidence --head "${arg_expansions[$program_pos]}"; then mode=dump-unknown; fi
@@ -1223,13 +1142,6 @@ environment_dump() { # command kind; arguments are already decoded data
          [ "$file_output" = 1 ] && [ "$file_body" = 1 ] && [ -z "$redirect_evidence" ] &&
          [ "$program_pos" = 0 ] && [ "$head_start" -eq 0 ] && [ "${arg_kinds[0]}" = literal ] &&
          [ "$data_source" = " $doc" ]; then
-        # Keep independent body history. Neither argv nor a later write
-        # proves that submitted shell evidence can be discarded.
-        for ((write_index=0; write_index<${#stage_written[@]}; write_index++)); do
-          [ -n "${write_readable[$write_index]}" ] || continue
-          written_index=${stage_written[$write_index]}
-          written_bodies[written_index]=${heredoc_bodies[$doc]}; written_readable[written_index]=1
-        done
         body=${heredoc_bodies[$doc]}; body_start=${heredoc_starts[$doc]}; body_end=$((body_start + ${#body}))
         main_text=${main_text:0:body_start}${body//[!$'\n']/ }${main_text:body_end}
         continue
@@ -1367,38 +1279,6 @@ environment_dump() { # command kind; arguments are already decoded data
       done
     fi
   done
-  if [ "$#" -eq 1 ]; then
-    collect_written=""
-    body_count=${#written_paths[@]}; context_count=${#context_programs[@]}
-    for ((written_index=0; written_index<body_count; written_index++)); do
-      body=${written_bodies[$written_index]}
-      for ((judge_context=0; judge_context<context_count; judge_context++)); do
-        [ "$judge_context" != "${written_contexts[$written_index]}" ] || continue
-        referenced=${context_all[$judge_context]}${context_unknown[$judge_context]}
-        if [ -z "$referenced" ]; then
-          for ((ref=0; ref<${#reference_paths[@]}; ref++)); do
-            [ "${reference_contexts[$ref]}" = "$judge_context" ] || continue
-            [ "${reference_paths[$ref]}" != "${written_paths[$written_index]}" ] || referenced=1
-          done
-        fi
-        [ -n "$referenced" ] || continue
-        judge=${context_judges[$judge_context]}
-        [ -z "${context_all[$judge_context]}" ] || judge=shell
-        case "$judge" in
-          data) continue ;;
-          interpreter)
-            environment_receiver "${context_programs[$judge_context]}"
-            if [ -n "${written_readable[$written_index]}" ] && environment_receiver_evidence "$body"; then return 0; fi ;;
-          shell)
-            # Unread targets retain the registry's existing refusal: no
-            # submitted body exists from which shell permission can follow.
-            [ -n "${written_readable[$written_index]}" ] || return 0
-            local command_text=$body
-            if environment_dump shell conservative; then return 0; fi ;;
-        esac
-      done
-    done
-  fi
   for ((stage=0; stage<${#decisions[@]}; stage++)); do
     # The retained set decision also needs the recorded closing group and
     # status file write. Future-stage collector facts are now available.
