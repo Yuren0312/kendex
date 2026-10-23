@@ -186,6 +186,7 @@ SANDBOX="$TMP/routing/skills/orch/tests"
 mkdir -p "$SANDBOX/lib" "$TMP/routing/skills/orch/scripts/lib" "$TMP/routing/skills/github/scripts/lib" "$TMP/routing/tools"
 cp "$ROOT/tools/macos-test-contracts" "$ROOT/tools/macos-test-contracts.json" "$TMP/routing/tools/"
 cp "$TEST_DIR/run-all.sh" "$SANDBOX/run-all.sh"
+cp "$TEST_DIR/lib/suite-process.sh" "$SANDBOX/lib/suite-process.sh"
 cp "$TEST_DIR/../scripts/lib/lane-state.sh" "$TMP/routing/skills/orch/scripts/lib/lane-state.sh"
 cp "$ROOT/skills/github/scripts/lib/group-leader.sh" "$TMP/routing/skills/github/scripts/lib/group-leader.sh"
 printf '#!/usr/bin/env bash\n: # the sandbox clears nothing; its suites are empty\n' \
@@ -383,6 +384,8 @@ family_rows='dev_future|orch-dev
 review_future|orch-dev
 lane_future|orch-state
 workflow-state_future|orch-state
+lanes_future|orch-dev|orch-state
+lanes_context_future|orch-dev|orch-state
 dev_review_lane_workflow-state_future|orch-dev
 other_future|orch-rest'
 while IFS='|' read -r name profile; do
@@ -392,7 +395,8 @@ for PARTITION_RUNNER_OS in Linux macOS; do
   for profile in orch-dev orch-state orch-rest; do
     selected --shard "$profile" > "$TMP/$profile.names"
   done
-  while IFS='|' read -r name owner; do
+  while IFS='|' read -r name owner mac_owner; do
+    [[ "$PARTITION_RUNNER_OS" != macOS || -z "$mac_owner" ]] || owner=$mac_owner
     claims=0
     for profile in orch-dev orch-state orch-rest; do
       if grep -qxF "$name" "$TMP/$profile.names"; then
@@ -411,6 +415,7 @@ for PARTITION_RUNNER_OS in Linux macOS; do
   # A planted assertion uses a private suite file and the workflow profile's
   # real entry. A selected failure must propagate to the shard verdict.
   while IFS='|' read -r name profile; do
+    if [[ "$name" == lanes_future && "$PARTITION_RUNNER_OS" == macOS ]]; then profile=orch-state; fi
     printf '#!/usr/bin/env bash\ntest green = red\n' > "$SANDBOX/$name.sh"
     rc=0
     RUNNER_OS="$PARTITION_RUNNER_OS" bash "$SANDBOX/run-all.sh" --shard "$profile" \
@@ -421,6 +426,7 @@ for PARTITION_RUNNER_OS in Linux macOS; do
   done <<'ROWS'
 dev_future|orch-dev
 lane_future|orch-state
+lanes_future|orch-dev
 ROWS
 done
 while IFS='|' read -r name profile; do
@@ -562,6 +568,7 @@ mkdir -p "$POOL/skills/orch/tests/lib" "$POOL/skills/orch/scripts/lib" "$POOL/to
 mkdir -p "$POOL/skills/github/scripts/lib"
 cp "$TEST_DIR/run-all.sh" "$POOL/skills/orch/tests/run-all.sh"
 cp "$TEST_DIR/lib/git-env.sh" "$POOL/skills/orch/tests/lib/git-env.sh"
+cp "$TEST_DIR/lib/suite-process.sh" "$POOL/skills/orch/tests/lib/suite-process.sh"
 cp "$TEST_DIR/../scripts/lib/lane-state.sh" "$POOL/skills/orch/scripts/lib/lane-state.sh"
 cp "$ROOT/skills/github/scripts/lib/group-leader.sh" "$POOL/skills/github/scripts/lib/group-leader.sh"
 cp "$ROOT/tools/tests/run-all.sh" "$POOL/tools/tests/run-all.sh"
@@ -1181,10 +1188,11 @@ fi
 # mutations, but keep the production runner's discovery and selection intact.
 # The control driver needs Bash 4; its two jobs remain Linux-only.
 if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+  source "$ROOT/skills/linear/tests/lib/control-runner.sh"
   LINEAR_RUNNER=skills/linear/tests/must-fail-controls.sh
   LINEAR_FIXTURE="$TMP/linear"
   mkdir -p "$LINEAR_FIXTURE/tests/controls" "$LINEAR_FIXTURE/scripts" "$TMP/linear-claims"
-  cp "$ROOT/$LINEAR_RUNNER" "$LINEAR_FIXTURE/tests/must-fail-controls.sh"
+  control_runner_install "$LINEAR_FIXTURE"
   printf 'VALUE=green\n' >"$LINEAR_FIXTURE/scripts/value.sh"
   for f in "$ROOT"/skills/linear/tests/controls/*.control.sh; do
     [[ -f "$f" ]] || { bad "linear control discovery found no files"; break; }
