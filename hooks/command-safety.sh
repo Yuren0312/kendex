@@ -1205,9 +1205,6 @@ environment_dump() { # command kind; arguments are already decoded data
            ! environment_main_evidence --head "${stage_expansions[$candidate]}"; then continue; fi
         if [ -z "$script_pos" ] || [ "$candidate" -le "$script_pos" ] ||
            [ "${stage_roles[$candidate]}:${stage_kinds[$candidate]}" != argument:literal ]; then
-          if { [ "${stage_kinds[$candidate]}" = literal ] ||
-               [ "${stage_kinds[$candidate]}" = dollar-literal ]; } &&
-             environment_main_evidence --head "${stage_expansions[$candidate]}"; then return 0; fi
           if environment_main_evidence "$value"; then return 0; fi
           continue
         fi
