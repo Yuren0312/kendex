@@ -49,6 +49,24 @@ seed_fleet() {
   for n in 1 2 3 4 5 6 7 8 9 10; do issue "KEN-$n" "Title $n" "Outcome $n | kept"; done
 }
 
+parked_numeric_rows() { awk '/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] \| / {print}'; }
+if [[ "${1:-}" == --parked-hours-only ]]; then
+  if [[ -n "${2:-}" ]]; then
+    REPORT_DIR="$(mutant_scripts parked-report/orch oversee-report)" || exit 1
+    ln -s "$(cd "$TEST_DIR/../../github" && pwd)" "$TMP_ROOT/parked-report/github"
+    [[ ! -L "$REPORT_DIR/oversee-report" ]] || exit 1
+    cp -- "$2" "$REPORT_DIR/oversee-report"
+    REPORT_UNDER_TEST="$REPORT_DIR/oversee-report"
+  fi
+  seed_fleet parked_hours
+  run -- render --state "$CASE/state.json" --repo owner/repo
+  assert_eq "$RC" 0 'retained parked intervals render without disk reads' "$CASE/err"
+  assert_eq "$(parked_numeric_rows <<<"$OUT")" $'2026-09-20 | 24 | unavailable\n2026-09-21 | 14.222 | unavailable' 'daily parked hours include the open interval and keep idle stops unavailable'
+  printf '\npass: %s   fail: %s\n' "$PASS" "$FAIL"
+  [[ "$FAIL" -eq 0 ]]
+  exit
+fi
+
 # The suite's clock reads before the week the review cap fell, so no case but
 # the Escapes ones below, each on a later clock, reads a count.
 ESCAPES_UNREAD="Escapes: unread (the clock reads before the cap week 2026-09-28)"
@@ -184,7 +202,11 @@ Waiting on you:
 - KEN-2 waits on the overseer to answer: Which schema?
 - KEN-2 waits on red checks on #12: test, lint
 - KEN-3 waits on a stopped review gate, review-round-cap: one unresolved review thread"
-assert_eq "$RC|$OUT" "0|$WANT" \
+assert_eq "$(parked_numeric_rows <<<"$OUT")" $'2026-09-20 | 24 | unavailable\n2026-09-21 | 14.222 | unavailable' 'daily parked hours include the confirmed open interval'
+# The existing whole-report assertion keeps its original rows; numeric park
+# rows above own the added display contract.
+CORE_OUT="$(awk '/^Parked time \(/ {skip=1;next} skip && /^Idle-stop counts/ {skip=0;getline;next} !skip {print}' <<<"$OUT")"
+assert_eq "$RC|$CORE_OUT" "0|$WANT" \
   "Landed holds only the fleet item merged since the last report, Running each live, preparing or parked lane with its PR, the parked one's from its record, Validation each running lane's minutes in total and per run, Next the queue, Waiting on you the open owner ask with its recommendation and deadline then each running lane's blockers"
 
 echo "=== render: round counts use the shared reader ==="

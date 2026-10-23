@@ -17,12 +17,15 @@ cp -R "$TEST_DIR/../scripts/lib" "$SCRIPTS/lib"
 orch_fixture_shared_libs "$TMP_ROOT/skills/orch"
 export MERGED_FIXTURE_ROOT="$TMP_ROOT"
 export PATH="$TMP_ROOT/bin:$PATH"
+export LANE_CLOSE_REAL_WORKFLOW_STATE="$TEST_DIR/../scripts/workflow-state"
 
 cat > "$SCRIPTS/workflow-state" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 root="$MERGED_FIXTURE_ROOT"
 case "$1" in
+  path) printf '%s/workflow-state-oversee.json\n' "$root" ;;
+  lane-run) shift; exec "$LANE_CLOSE_REAL_WORKFLOW_STATE" --no-private-env --state-dir "$root" lane-run "$@" ;;
   get) jq "$3" "$root/state" ;;
   remove) printf '%s\n' "$*" >> "$root/effects" ;;
   update)

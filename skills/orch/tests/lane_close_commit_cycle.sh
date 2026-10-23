@@ -19,6 +19,7 @@ cp "$TEST_DIR/../scripts/lane-close" "$SCRIPTS/lane-close"
 
 export COMMIT_CLOSE_ROOT="$TMP_ROOT"
 export PATH="$TMP_ROOT/bin:$PATH"
+export LANE_CLOSE_REAL_WORKFLOW_STATE="$TEST_DIR/../scripts/workflow-state"
 cat > "$SCRIPTS/workflow-state" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -26,6 +27,8 @@ printf '%s\n' "$*" >> "$COMMIT_CLOSE_ROOT/state-calls"
 [[ "${1:-}" != --state-dir ]] || shift 2
 verb="$1"; shift
 [[ "$verb" != remove ]] || exit 0
+if [[ "$verb" == path ]]; then printf '%s/workflow-state-oversee.json\n' "$COMMIT_CLOSE_ROOT"; exit; fi
+if [[ "$verb" == lane-run ]]; then exec "$LANE_CLOSE_REAL_WORKFLOW_STATE" --no-private-env --state-dir "$COMMIT_CLOSE_ROOT" lane-run "$@"; fi
 [[ "$1" == oversee ]]; shift
 case "$verb" in
   get) jq "$1" "$COMMIT_CLOSE_ROOT/state" ;;

@@ -252,6 +252,13 @@ The long pass's events, checked and reported in this order:
                              note on stderr naming the recorded key and the
                              keys seen; the repository is matched in lower
                              case, GitHub's names being case-insensitive
+  EVENT parked-ready <item> wait=item|account
+                             Every recorded typed wait has fresh landing or
+                             same-account admission evidence. The launcher
+                             checks it again before starting the kept disk.
+  EVENT parked-held <item> wait=item|account cause=<cause>
+                             The recorded condition or its proof is still
+                             unresolved. No start or destructive close follows.
   EVENT parked-merged <item> pr=<N> repo=<owner/repo>
                              the selected wait PR merged and the terminal
                              judge keeps the item open. repo= is in lower
@@ -1413,6 +1420,7 @@ ow_message() { # REASON FIELD=VALUE...
     reducer-baseline) text='The initial PR attention is the baseline. Only new attention produces events.' ;;
     state-target-invalid) text='The watch state target is not a regular file.' ;;
     long-pass-unfinished) text='The long pass exited 0 without writing its status, so whether it found news is unknown.' ;;
+    lane-time-unavailable) text='Parked time could not be read. This lane has no judged active duration.' ;;
     *) printf 'oversee-watch: message-invalid reason=%s\n' "$reason" >&2; return 2 ;;
   esac
   for field in "$@"; do

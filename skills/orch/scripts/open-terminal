@@ -106,6 +106,7 @@ parse_argv() {
 # `.env.local` is sourced as shell, so help is answered before the loader runs:
 # the dry run is the real parser in a subshell, so nothing it assigns survives
 # to be clobbered, and 9 is the only status meaning it reached the end.
+ORIGINAL_ARGS=("$@")
 parse_rc=0
 ( parse_argv "$@"; exit 9 ) || parse_rc=$?
 [[ "$parse_rc" -eq 9 ]] || exit "$parse_rc"
@@ -246,6 +247,18 @@ IN_SCOPE="$(printf '%s\n' ${IN_SCOPE_PATHS[@]+"${IN_SCOPE_PATHS[@]}"} | jq -Rsc 
 [[ "$OVER_CAP" != true || ${#ITEMS[@]} -eq 1 ]] || { ot_message over-cap-items "count=${#ITEMS[@]}" >&2; exit 1; }
 [[ "$TRACKER" == "linear" || "$TRACKER" == "github" ]] || { ot_message tracker-invalid "tracker=$TRACKER" >&2; exit 1; }
 [[ -n "$HARNESS" || -n "$CMD_TEMPLATE" ]] || { ot_message command-missing "options=--harness,--cmd" >&2; exit 1; }
+if [[ "$FLEET" == true ]]; then
+  lifecycle_path="$("$WORKFLOW_STATE" "${WORKFLOW_STATE_ARGS[@]}" path oversee)" || exit 1
+  lifecycle_commands=()
+  lifecycle_items="$(printf '%s\n' "${ITEMS[@]}" | LC_ALL=C sort -u)" || exit 1
+  while IFS= read -r lifecycle_item; do
+    if [[ "$TRACKER" == github ]]; then lifecycle_item="issue-$lifecycle_item"
+    else lifecycle_item="$("$SCRIPT_DIR/git-context" issue-canonical "$lifecycle_item" "$GH_ISSUE_PATTERN")" || exit 1; fi
+    lifecycle_key="${lifecycle_path%/*}/.lane-lifecycle/$lifecycle_item.lock"
+    lane_lifecycle_owned "$lifecycle_key" || lifecycle_commands+=("$WORKFLOW_STATE" "${WORKFLOW_STATE_ARGS[@]}" lane-run "$lifecycle_item" --)
+  done <<<"$lifecycle_items"
+  if [[ ${#lifecycle_commands[@]} -gt 0 ]]; then exec "${lifecycle_commands[@]}" "$0" "${ORIGINAL_ARGS[@]}"; fi
+fi
 # lane-host owns the setting's reading; it runs from this script's checkout,
 # whose project settings this script loaded, or from the caller's directory
 # when the script sits outside any checkout, since `cd ""` fails.
@@ -1522,8 +1535,9 @@ launch_ambient_codex_home() {
 # The PR wait outlives sandbox parking. This owner transfers its identity
 # once and later launch writes keep it until close or a new park replaces it.
 UNPARK_JQ='def unpark($at): (if .parked.at == null then .
-  else .pauses = ((.pauses // []) + [{from: .parked.at, to: $at, cause: "parked"}]) end)
-  | (if .parked == null then . else .pending_pr = (.parked | {pr, repo, head} + (if .until_pr == null then {} else {until_pr: .until_pr} end) + (if .until_repo == null then {} else {until_repo: .until_repo} end)) end) | del(.parked);'
+  else .pauses = ((.pauses // []) + [{from: .parked.at, to: $at, cause: "parked"} + (if .parked.wait == null then {} else {wait:.parked.wait,repo:.parked.repo,head:.parked.head,timing_unread:(.parked.timing_unread // false)} end)]) end)
+  | (if .parked.wait == null then . else .dependency_wait = (.parked + {resume_at:$at,outcome:"started"}) end)
+  | (if .parked == null or (.parked.wait != null and .parked.pr == null) then . else .pending_pr = (.parked | {pr, repo, head} + (if .until_pr == null then {} else {until_pr: .until_pr} end) + (if .until_repo == null then {} else {until_repo: .until_repo} end)) end) | del(.parked);'
 
 # One lane record per item in the oversee workflow state WORKFLOW_STATE_ARGS
 # addresses, which is what oversee-watch --state reads the live fleet from.
@@ -1646,7 +1660,7 @@ lane_record_write() { # MODE ITEM WINDOW MAIL_ROOT SESSION_ID LAUNCHED_AT [STATU
        | if .status == "running" or .prepare.step == "selection" then . else del(.harness, .model, .effort, .preference_entry, .pick, .account, .session_id, .recovery) end else . end) as $patch
      | if any($l[]; .item == $rec.item)
        then {state: (.lanes = ($l | map(if .item == $rec.item then (if $mode == "wake" then . else del(.prepare, .live_display) | unpark($rec.launched_at)
-         | if $rec.status == "running" or $rec.prepare.step == "selection" then del(.preference_entry, .pick) | del(.cloud_repo_access) else . end end) + $patch else . end))), report: "rewritten"}
+         | if $rec.status == "running" or $rec.prepare.step == "selection" then del(.preference_entry, .pick) | del(.cloud_repo_access) else . end end) + (if .dependency_wait != null then ($patch | del(.recovery,.allow_all)) else $patch end) | if .dependency_wait != null and $rec.status == "running" then .dependency_wait.outcome="running" else . end else . end))), report: "rewritten"}
        elif $mode == "wake" then {state: ., report: "unrecorded"}
        else {state: (.lanes = $l + [$rec]), report: "appended"} end end' --argjson rec "$rec" --arg mode "$mode")" || return 1
   [[ "$report" != '"obligation-conflict"' ]] || { ot_message obligation-conflict "item=$item" >&2; return 1; }
@@ -1690,6 +1704,13 @@ lane_live_display_apply() { # WT_ID ITEM
 # lane-close --park with its disk kept. Status 0 for a parked record, 1 for any
 # other record or none, 2 for a state that could not be read: a launch that
 # read it as "not parked" would create onto a stopped sandbox.
+dependency_resume_failed() { # CAUSE
+  [[ -n "${DEPENDENCY_RECORD:-}" ]] || return 0
+  "$WORKFLOW_STATE" "${WORKFLOW_STATE_ARGS[@]}" update oversee --arg item "$wt_id" --arg cause "$1" '
+    (.lanes[] | select(.item == $item)) |= (.status="stopped" | .dependency_wait.outcome="failed"
+      | .dependency_wait.failure={cause:$cause,at:(now|strftime("%Y-%m-%dT%H:%M:%SZ"))})' >/dev/null
+}
+
 lane_record_parked() { # WT_ID
   lane_record_read "$1" status || return 2
   [[ "$LANE_RECORD_VALUE" == parked ]]
@@ -1818,7 +1839,11 @@ start_cmd() { # ITEM MAIL_ID REPO [SESSION_ID] [WAKE_DIR] [BRIEF_PATH]
   # its exitWithError path, process.exit(1), the start brief runs in the same
   # call. Only status 1 falls through: a lane ended by a signal, lane-close's
   # stop among them, must not start afresh behind the stop.
-  if [[ "$HOST_RELAUNCH" == true && "$RELAUNCH_ROUTE" != fresh ]]; then
+  if [[ -n "${DEPENDENCY_SESSION:-}" ]]; then
+    session_id="$DEPENDENCY_SESSION"
+    if [[ "$HARNESS" == codex ]]; then printf 'codex %sresume %q\n' "$flags" "$session_id"; return; fi
+    [[ "$HARNESS" != pi ]] || session_id="$(jq -r '(.parked.wait // .dependency_wait.wait).session_file' <<<"$DEPENDENCY_RECORD")" || return 1
+  elif [[ "$HOST_RELAUNCH" == true && "$RELAUNCH_ROUTE" != fresh ]]; then
     case "$HARNESS" in claude)
       local fresh
       fresh="$(RELAUNCH_ROUTE=fresh start_cmd "$item" "$mail_id" "$repo")" || return 1
@@ -3015,6 +3040,26 @@ host_harness_stop() { # [prior]
 relaunch_route() { # ITEM STATE_ID WORKTREE
   local judge
   RELAUNCH_ROUTE=resume HOST_SELECTION_FILE="" RELAUNCH_HANDOFF_DIR=""
+  if [[ -n "${DEPENDENCY_SESSION:-}" ]]; then
+    # Provider cat proves the original transcript before a harness can start.
+    # The binding records the path; providers without this proof keep stopped.
+    local session_file
+    session_file="$(jq -er '(.parked.wait // .dependency_wait.wait).session_file | strings | select(length > 0)' <<<"$DEPENDENCY_RECORD")" || {
+      ot_message dependency-held "item=$1" cause=native-session-proof-missing >&2; return 1;
+    }
+    local transcript
+    transcript="$(host_transport cat --item "$2" "$session_file")" || {
+      ot_message dependency-held "item=$1" cause=native-session-unread >&2; return 1;
+    }
+    jq -Rne --arg id "$DEPENDENCY_SESSION" --arg harness "$HARNESS" '
+      [inputs | fromjson?] | any(.[];
+        if $harness == "codex" then .type == "session_meta" and .payload.id == $id
+        elif $harness == "pi" then .type == "session" and .id == $id
+        else .sessionId == $id end)' <<<"$transcript" >/dev/null || {
+      ot_message dependency-held "item=$1" cause=native-session-mismatch >&2; return 1;
+    }
+    return 0
+  fi
   # A saved selection belongs to the successor that already started.
   if [[ "$host_pending_step" == selection ]]; then
     [[ "$HARNESS" != codex ]] || HOST_SELECTION_FILE="tmp/lane-mail/$2/relaunch-selection"
@@ -3387,6 +3432,14 @@ launch_record_finish() {
   # reads its pane through and the root its mailbox is read under. A record
   # that cannot be written fails the item loudly: the window is open, but a
   # lane the watch does not carry is a lane nobody hears from.
+  if [[ -n "${DEPENDENCY_SESSION:-}" ]]; then
+    record_session="$DEPENDENCY_SESSION"
+    if [[ "$HARNESS" == codex && "$CONTINUE_RESUME" == true ]]; then
+      local continuation
+      continuation="$(relaunch_continuation "$wt_id" "$HARNESS")" || return 1
+      launch_write continuation "$title" "$LAUNCH_PANE" ssh text "$continuation" || return 1
+    fi
+  fi
   record_window=""
   [[ "$TERMINAL_MODE" != tmux ]] || record_window="$LAUNCH_SESSION:$title"
   record_root="$wt"
@@ -4282,9 +4335,55 @@ for raw in "${ITEMS[@]}"; do
     lane_record_parked "$wt_id" || parked_rc=$?
     [[ "$parked_rc" -ne 2 ]] || { failed=$((failed + 1)); continue; }
   fi
+  DEPENDENCY_RECORD="" DEPENDENCY_SESSION=""
+  if [[ "$FLEET" == true && "$RELAUNCH" == true ]]; then
+    dependency_record="$("$WORKFLOW_STATE" "${WORKFLOW_STATE_ARGS[@]}" get oversee ".lanes[]? | select(.item == \"$wt_id\")")" || { failed=$((failed + 1)); continue; }
+    if jq -e '.parked.wait == null and .dependency_wait.outcome == "running"' <<<"$dependency_record" >/dev/null; then
+      # A completed park is history. Only a confirmed native death returns
+      # this item to its existing death-recovery owner; a replay cannot do so.
+      native_state="$(host_transport status --item "$wt_id" --harness "$(jq -r .harness <<<"$dependency_record")")" || native_state=unread
+      if [[ "$native_state" != exited ]]; then
+        ot_message dependency-held "item=$item" cause=resume-already-running >&2
+        failed=$((failed + 1)); continue
+      fi
+      dependency_record="$(jq -c 'del(.dependency_wait)' <<<"$dependency_record")" || exit 1
+    fi
+    if jq -e '(.parked.wait // .dependency_wait.wait) != null' <<<"$dependency_record" >/dev/null; then
+      DEPENDENCY_RECORD="$dependency_record"
+      if jq -e '.status == "running" or .dependency_wait.outcome == "running"' <<<"$dependency_record" >/dev/null; then
+        ot_message dependency-held "item=$item" cause=resume-already-running >&2
+        failed=$((failed + 1)); continue
+      fi
+      if ! lane_wait_landed "$dependency_record"; then
+        ot_message dependency-held "item=$item" "cause=$LANE_WAIT_CAUSE" >&2
+        failed=$((failed + 1)); continue
+      fi
+      if ! jq -e --arg host "$LANE_HOST" --arg harness "$HARNESS" --arg account "${LANE_ENV#*=}" \
+          --arg model "$LAUNCH_MODEL" --arg effort "$LAUNCH_EFFORT" --arg flags "$LAUNCH_FLAGS" \
+          '(.parked.wait // .dependency_wait.wait).binding as $b
+          | $b.host == $host and $b.harness == $harness and $b.account == $account
+          and $b.model == $model and $b.effort == $effort
+          and (.parked.wait // .dependency_wait.wait).launch_flags == $flags' <<<"$dependency_record" >/dev/null; then
+        ot_message dependency-held "item=$item" cause=launch-mismatch >&2
+        failed=$((failed + 1)); continue
+      fi
+      DEPENDENCY_SESSION="$(jq -r '(.parked.wait // .dependency_wait.wait).binding.session_id' <<<"$dependency_record")" || exit 1
+      "$WORKFLOW_STATE" "${WORKFLOW_STATE_ARGS[@]}" update oversee --arg item "$wt_id" --argjson proof "$LANE_WAIT_EVIDENCE" \
+        '(.lanes[] | select(.item == $item)) |= (if .parked.wait != null then .parked.landing=$proof else .dependency_wait.landing=$proof end)' >/dev/null || { failed=$((failed + 1)); continue; }
+    fi
+  fi
   if [[ "$parked_rc" -eq 0 ]]; then
+    if [[ -n "$DEPENDENCY_RECORD" ]]; then
+      "$WORKFLOW_STATE" "${WORKFLOW_STATE_ARGS[@]}" update oversee --arg item "$wt_id" '
+        (.lanes[] | select(.item == $item)).parked |=
+          ((if .phase == null or .phase == "stopped" then . else .timing_unread=true end) | .phase="start-pending")' >/dev/null || { failed=$((failed + 1)); continue; }
+    fi
     start_rc=0 start_out=""
     start_out="$(host_transport start --item "$wt_id")" || start_rc=$?
+    if [[ "$start_rc" -ne 0 && -n "$DEPENDENCY_RECORD" ]]; then
+      "$WORKFLOW_STATE" "${WORKFLOW_STATE_ARGS[@]}" update oversee --arg item "$wt_id" --argjson exit "$start_rc" '
+        (.lanes[] | select(.item == $item)).parked |= (.phase="stopped" | .failure={cause:"start",exit:$exit,at:(now|strftime("%Y-%m-%dT%H:%M:%SZ"))})' >/dev/null || exit 1
+    fi
     if [[ "$start_rc" -eq "$LANE_HOST_BUSY_EXIT" ]]; then
       ot_message lane-host-busy "item=$item" step=start >&2
       failed=$((failed + 1))
@@ -4294,6 +4393,10 @@ for raw in "${ITEMS[@]}"; do
       failed=$((failed + 1))
       continue
     elif [[ "$start_out" != "sandbox-started item=$wt_id" ]]; then
+      if [[ -n "$DEPENDENCY_RECORD" ]]; then
+        "$WORKFLOW_STATE" "${WORKFLOW_STATE_ARGS[@]}" update oversee --arg item "$wt_id" '
+          (.lanes[] | select(.item == $item)).parked |= (.phase="start-unconfirmed" | .timing_unread=true)' >/dev/null || exit 1
+      fi
       ot_message host-start-failed "item=$item" "cause=answer-unparsed" >&2
       failed=$((failed + 1))
       continue
@@ -4334,6 +4437,7 @@ for raw in "${ITEMS[@]}"; do
     failed=$((failed + 1))
     continue
   elif [[ "$create_rc" -eq 75 ]]; then
+    dependency_resume_failed create-owned || exit 1
     ot_message item-owned "item=$item" "exit=75" >&2
     skipped=$((skipped + 1))
     continue
@@ -4342,6 +4446,7 @@ for raw in "${ITEMS[@]}"; do
     failed=$((failed + 1))
     continue
   elif [[ "$create_rc" -ne 0 && "$LANE_HOST" != local ]]; then
+    dependency_resume_failed "create:$create_rc" || exit 1
     ot_message host-create-failed "item=$item" "exit=$create_rc" >&2
     failed=$((failed + 1))
     continue
@@ -4396,6 +4501,11 @@ for raw in "${ITEMS[@]}"; do
         pi-root=*) pi_root="${field#pi-root=}" ;;
       esac
     done
+    if [[ -n "${DEPENDENCY_RECORD:-}" ]] && ! lane_wait_instance "$(jq -c '(.parked.wait // .dependency_wait.wait)' <<<"$DEPENDENCY_RECORD")" "$repo" "$wt_id"; then
+      dependency_resume_failed provider-instance-unread || exit 1
+      ot_message dependency-held "item=$item" cause=provider-instance-unread >&2
+      failed=$((failed + 1)); continue
+    fi
     if [[ -z "$ssh_target" || -z "$remote_path" || -z "$remote_prefix" || "$host_line" == *$'\n'* \
       || -n "$host_state" && "$host_state" != preparing ]]; then
       ot_message host-line-invalid "item=$item" >&2
@@ -4425,7 +4535,7 @@ for raw in "${ITEMS[@]}"; do
   fi
   # A provider-owned replacement prepares in the foreground so the background
   # preparing record cannot replace its still-running predecessor's record.
-  if [[ "$host_state" == preparing && "$FLEET" == true && -z "$HOST_SELECTION_FILE" && -z "$host_pending_step" && ( "$RELAUNCH" != true || -n "$CMD_TEMPLATE" && "$HOST_PANE" == local ) ]]; then
+  if [[ "$host_state" == preparing && "$FLEET" == true && -z "${DEPENDENCY_RECORD:-}" && -z "$HOST_SELECTION_FILE" && -z "$host_pending_step" && ( "$RELAUNCH" != true || -n "$CMD_TEMPLATE" && "$HOST_PANE" == local ) ]]; then
     launch_handoff || { failed=$((failed + 1)); continue; }
     preparing=$((preparing + 1))
   else
@@ -4449,6 +4559,7 @@ for raw in "${ITEMS[@]}"; do
       continue
     fi
     if [[ "$LANE_HOST" != local && "$RELAUNCH" == true && -z "$CMD_TEMPLATE" ]] && ! relaunch_route "$item" "$wt_id" "$wt"; then
+      dependency_resume_failed native-session-proof || exit 1
       failed=$((failed + 1))
       continue
     fi
@@ -4470,6 +4581,7 @@ for raw in "${ITEMS[@]}"; do
         launch_stop || true
       fi
       [[ "$LANE_HOST" == local ]] || host_launch_ready failed || { failed=$((failed + 1)); continue; }
+      dependency_resume_failed native-readiness || exit 1
       failed=$((failed + 1))
       continue
     fi

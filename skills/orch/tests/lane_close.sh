@@ -63,12 +63,12 @@ FLEET_DIR="$TMP_ROOT/fleet-state"
 mkdir -p "$FLEET_DIR"
 mkdir -p "$SCRIPTS/lib" "$FIXTURE/skills/linear/scripts" "$BIN"
 ln -s "$TEST_DIR/../../linear/scripts/lib" "$FIXTURE/skills/linear/scripts/lib"
-cp "$TEST_DIR/../scripts/lane-close" "$SCRIPTS/lane-close"
+cp "${2:-$TEST_DIR/../scripts/lane-close}" "$SCRIPTS/lane-close"
 cp "$TEST_DIR/../scripts/lib/lane-state.sh" "$TEST_DIR/../scripts/lib/date-ladder.sh" \
   "$TEST_DIR/../scripts/lib/usage-reset.sh" "$TEST_DIR/../scripts/lib/lane-host-slots.sh" \
   "$TEST_DIR/../scripts/lib/lane-capabilities.sh" "$TEST_DIR/../scripts/lib/tmux-server.sh" \
   "$TEST_DIR/../scripts/lib/lane-gitfile.sh" "$TEST_DIR/../scripts/lib/cloud-close-log.sh" \
-  "$TEST_DIR/../scripts/lib/escapes.sh" "$SCRIPTS/lib/"
+  "$TEST_DIR/../scripts/lib/escapes.sh" "$TEST_DIR/../scripts/lib/lane-relaunch.sh" "$SCRIPTS/lib/"
 chmod +x "$SCRIPTS/lane-close"
 cat >"$SCRIPTS/lib/pane-write.sh" <<'EOF'
 pane_write() {
@@ -105,6 +105,10 @@ set -euo pipefail
 printf '%s\n' "$*" >>"$LANE_CLOSE_STATE_CALLS"
 if [[ "${1:-}" == --state-dir ]]; then shift 2; fi
 verb="$1"; shift
+if [[ "$verb" == path ]]; then printf '%s/workflow-state-oversee.json\n' "$LANE_CLOSE_FLEET_DIR"; exit; fi
+if [[ "$verb" == lane-run ]]; then
+  exec "$LANE_CLOSE_REAL_WORKFLOW_STATE" --no-private-env --state-dir "$LANE_CLOSE_FLEET_DIR" lane-run "$@"
+fi
 if [[ "$verb" == remove ]]; then
   [[ "${LANE_CLOSE_REMOVE_STATUS:-0}" == 0 ]] || { printf 'workflow-state: remove-failed path=/fleet/x\n' >&2; exit "$LANE_CLOSE_REMOVE_STATUS"; }
   printf 'removed path=/fleet/completion-summary-%s.md\n' "$1"
@@ -126,7 +130,7 @@ case "$verb" in
   update)
     [[ "${LANE_CLOSE_STATE_WRITE_FAIL:-0}" == 0 ]] || exit "$LANE_CLOSE_STATE_WRITE_FAIL"
     args=()
-    while [[ "${1:-}" == --arg ]]; do args+=(--arg "$2" "$3"); shift 3; done
+    while [[ "${1:-}" == --arg || "${1:-}" == --argjson ]]; do args+=("$1" "$2" "$3"); shift 3; done
     expr="$1"
     jq "${args[@]}" "$expr" "$LANE_CLOSE_STATE" >"$LANE_CLOSE_STATE.next"
     mv -- "$LANE_CLOSE_STATE.next" "$LANE_CLOSE_STATE" ;;
@@ -231,6 +235,7 @@ fi
 # fails: LANE_CLOSE_HOST_LIST replaces its rows, a row naming KEN-1 by
 # default, and LANE_CLOSE_HOST_LIST_STATUS fails it.
 if [[ "$1" == list ]]; then
+  if [[ "${2:-}" == --json ]]; then printf '%s\n' "${LANE_CLOSE_HOST_LIST_JSON:-[]}"; exit; fi
   [[ "${LANE_CLOSE_HOST_LIST_STATUS:-0}" -eq 0 ]] \
     || { printf 'lane-host-fixture: list-failed\n' >&2; exit "$LANE_CLOSE_HOST_LIST_STATUS"; }
   printf '%b' "${LANE_CLOSE_HOST_LIST-acme/repo/KEN-1\trunning\t1h\tsandbox-1\n}"
@@ -338,6 +343,7 @@ cat >"$SCRIPTS/lanes" <<'EOF'
 printf '%s\n' "$*" >>"$LANE_CLOSE_LANES_CALLS"
 printf '%s\n' "${ORCH_LANE_HOST-unset}" >>"$LANE_CLOSE_LANES_CALLS.host"
 status="${LANE_CLOSE_LANES_STATUS:-0}"
+if [[ -n "${LANE_CLOSE_PICK_JSON:-}" ]]; then printf '%s\n' "$LANE_CLOSE_PICK_JSON"; exit "$status"; fi
 if [[ -n "${LANE_CLOSE_WALLED_ACCOUNT:-}" ]]; then
   status=0
   [[ "$3" != "$LANE_CLOSE_WALLED_ACCOUNT" ]] || status=3
@@ -381,6 +387,7 @@ if [[ "${LANE_CLOSE_TRACKER_FAIL:-0}" != 0 ]]; then
   printf 'linear.sh: api-unreachable\n' >&2
   exit "$LANE_CLOSE_TRACKER_FAIL"
 fi
+if [[ -n "${LANE_CLOSE_DEPENDENCY_LIVE:-}" ]]; then printf '%s\n' "$LANE_CLOSE_DEPENDENCY_LIVE"; exit; fi
 printf '{"state":"%s","state_type":"%s","description":""}\n' \
   "${LANE_CLOSE_TRACKER_STATE:-Done}" "${LANE_CLOSE_TRACKER_STATE_TYPE-completed}"
 EOF
@@ -485,6 +492,7 @@ case "$1 $2" in
     fi
     printf '%s\n' "$LANE_CLOSE_PR_VIEW" ;;
   "repo view") printf 'owner/resolved\n' ;;
+  "api repos/owner/repo/git/ref/heads/ken-1") printf '%s\n' "${LANE_CLOSE_PUBLISHED_HEAD:-abc123}" ;;
   "api graphql")
     [[ "${LANE_CLOSE_PR_QUEUE_STATUS:-0}" -eq 0 ]] || { printf 'gh: graphql: Something went wrong\n' >&2; exit "$LANE_CLOSE_PR_QUEUE_STATUS"; }
     queue='{"data":{"repository":{"pullRequest":{"isInMergeQueue":false,"mergeQueueEntry":null}}}}'
@@ -611,6 +619,8 @@ PY
 }
 
 SCRIPT="$SCRIPTS/lane-close"
+export LANE_CLOSE_REAL_WORKFLOW_STATE="$TEST_DIR/../scripts/workflow-state"
+export LANE_CLOSE_FLEET_DIR="$FLEET_DIR"
 
 # A library control takes a fixture tree of its own: links to the same
 # lane-close and stubs over one changed library copy. OLD is replaced
@@ -645,6 +655,84 @@ pathlib.Path(target).write_text(text)
 MUTPY
   printf '%s\n' "$dir/skills/orch/scripts/lane-close"
 }
+
+working_screen() { printf '› run\n  press to interrupt\n' >"$SCREEN"; }
+
+# --dependency-only scopes baseline and mutation controls to this contract.
+dependency_state() {
+  write_state running codex /host linear owner/repo
+  jq '.lanes[0] += {session_id:"native-1",effort:"high",allow_all:true,
+    sandbox_instance_id:"immutable-1",launch:{pane:"%7",server:999},
+    recovery:{spent:true,opaque:{receipt:"failed",counter:1}},cost:12.5}' "$STATE" >"$STATE.next"
+  mv -- "$STATE.next" "$STATE"
+  write_panes python
+  working_screen
+  jq '.lanes[0] | {kind:"item",reason:"held step",source:"directive-1",session_file:"/sessions/native-1.jsonl",launch_flags:"--model model --effort high",
+    binding:{host,harness,launch,launched_at,session_id,account,model,effort,sandbox_instance_id},
+    dependencies:[{tracker:"linear",id:"immutable-item-2",key:"KEN-2",repo:"owner/repo",step:"build after landing",
+      delivery:{kind:"pr",pr:9,branch:"ken-2",item:"KEN-2"}}]}' "$STATE" >"$TMP_ROOT/wait.json"
+}
+export LANE_CLOSE_DEPENDENCY_LIVE='{"uuid":"immutable-item-2","identifier":"KEN-2","state_type":"started"}'
+export LANE_CLOSE_HOST_LIST_JSON='[{"repo":"repo","item":"KEN-1","id":"immutable-1","name":"reusable-name"}]'
+export LANE_CLOSE_PARK_READ=1
+for kind in item account; do
+  dependency_state
+  if [[ "$kind" == account ]]; then
+    jq '. | del(.dependencies) | . + {kind:"account",account:"/lane",host:"/host",harness:"codex",model:"model",bucket:"weekly",no_reset:true}' \
+      "$TMP_ROOT/wait.json" >"$TMP_ROOT/wait.next"
+    mv -- "$TMP_ROOT/wait.next" "$TMP_ROOT/wait.json"
+  fi
+  before="$(jq -c '.lanes[0].recovery' "$STATE")"
+  LANE_CLOSE_LANES_STATUS=3 LANE_CLOSE_PICK_JSON='{"config_dir":"/lane","measured_through":"host","status":"ok","binding_bucket":"weekly","binding_resets_at":null}' \
+    LANE_CLOSE_MAIL_PENDING="$(pending_ask 50)" run_close "$SCRIPT" --park --wait-file "$TMP_ROOT/wait.json"
+  assert_eq "rc=$RC status=$(jq -r '.lanes[0].status' "$STATE") kind=$(jq -r '.lanes[0].parked.wait.kind' "$STATE") asks=$(jq -r '.lanes[0].parked.pending_asks|length' "$STATE") recovery=$(jq -c '.lanes[0].recovery' "$STATE")" \
+    "rc=0 status=parked kind=$kind asks=1 recovery=$before" "$kind wait keeps the pending ask and spent recovery record" "$TMP_ROOT/err"
+  assert_eq "$(jq -r '.lanes[0] | [.sandbox_instance_id,.parked.head,.cost,.launched_at] | @tsv' "$STATE")" \
+    $'immutable-1\tabc123\t12.5\t2026-09-20T00:00:00Z' 'parking retains instance, head, cost and original launch time'
+  run_close "$SCRIPT" --if-terminal
+  assert_eq "rc=$RC close=$(close_call_count) status=$(jq -r '.lanes[0].status' "$STATE")" \
+    'rc=4 close=0 status=parked' 'tracker Done cannot delete a typed dependency park'
+done
+for row in \
+  'dirty|LANE_CLOSE_PORCELAIN= M work|running|0|false' \
+  'unpublished|LANE_CLOSE_PUBLISHED_HEAD=older|running|0|false' \
+  'provider-gap|LANE_CLOSE_HOST_LIST_JSON=[]|running|0|false' \
+  'provider-stale|LANE_CLOSE_HOST_LIST_JSON=[{"repo":"repo","item":"KEN-1","id":"replacement"}]|running|0|false' \
+  'provider-duplicate|LANE_CLOSE_HOST_LIST_JSON=[{"repo":"repo","item":"KEN-1","id":"immutable-1"},{"repo":"repo","item":"KEN-1","id":"immutable-1"}]|running|0|false' \
+  'git-unread|LANE_CLOSE_PARK_READ=0|running|0|false' \
+  'missing-stop-ack|LANE_CLOSE_STOP_SANDBOX_OUT=unacknowledged|stopped|1|false' \
+  'failed-stop|LANE_CLOSE_STOP_SANDBOX_STATUS=7|stopped|1|false'; do
+  IFS='|' read -r label setting want_status want_stop want_at <<<"$row"
+  dependency_state
+  name="${setting%%=*}" value="${setting#*=}"
+  export "$name=$value"
+  run_close "$SCRIPT" --park --wait-file "$TMP_ROOT/wait.json"
+  assert_eq "rc=$RC status=$(jq -r '.lanes[0].status' "$STATE") stop=$(stop_count KEN-1 codex) at=$(jq -r '.lanes[0].parked.at != null' "$STATE")" \
+    "rc=1 status=$want_status stop=$want_stop at=$want_at" "$label refuses without a false confirmed pause" "$TMP_ROOT/err"
+  unset "$name"
+  export LANE_CLOSE_HOST_LIST_JSON='[{"repo":"repo","item":"KEN-1","id":"immutable-1","name":"reusable-name"}]' LANE_CLOSE_PARK_READ=1
+done
+dependency_state
+jq '.binding.launch.pane="%stale"' "$TMP_ROOT/wait.json" >"$TMP_ROOT/wait.next"
+mv -- "$TMP_ROOT/wait.next" "$TMP_ROOT/wait.json"
+run_close "$SCRIPT" --park --wait-file "$TMP_ROOT/wait.json"
+assert_eq "rc=$RC stop=$(stop_count KEN-1 codex) status=$(jq -r '.lanes[0].status' "$STATE")" \
+  'rc=1 stop=0 status=running' 'a superseded request cannot retire the current instance'
+if [[ "${1:-}" != --dependency-only ]]; then
+  MUTANT="$(mutant dependency-clean 'and .porcelain == "" and (.at' 'and (.porcelain | type == "string") and (.at')"
+  [[ -x "$MUTANT" ]] || exit 1
+  dependency_state
+  LANE_CLOSE_PORCELAIN=' M work' run_close "$MUTANT" --park --wait-file "$TMP_ROOT/wait.json"
+  observed="rc=$RC status=$(jq -r '.lanes[0].status' "$STATE") stop=$(stop_count KEN-1 codex)"
+  CONTROL_RED="$(FAIL=0; assert_eq "$observed" 'rc=1 status=running stop=0' control >/dev/null; printf '%s' "$FAIL")"
+  assert_eq "$CONTROL_RED" 1 'control: the preservation assertion rejects a dirty-boundary bypass'
+fi
+if [[ "${1:-}" == --dependency-only || "${1:-}" == --dependency-control ]]; then
+  printf '\npass: %s   fail: %s\n' "$PASS" "$FAIL"
+  [[ "$FAIL" -eq 0 ]]
+  exit
+fi
+unset LANE_CLOSE_DEPENDENCY_LIVE LANE_CLOSE_HOST_LIST_JSON LANE_CLOSE_PARK_READ
 
 echo '=== lane-close refuses ambiguous and live panes ==='
 write_state running claude /host
@@ -2238,7 +2326,6 @@ echo '=== --park stops a clean merge wait: harness, window, then sandbox ==='
 # and its pull request open, armed and CLEAN with a silent reducer. The judge
 # reads GitHub and the reducer before the stop; the record ends parked and
 # carries the pull request and head it was judged on.
-working_screen() { printf '› run\n  press to interrupt\n' >"$SCREEN"; }
 export LANE_CLOSE_PARK_READ=1
 park_count() { grep -c -- '^stop-sandbox --item KEN-1 host=' "$HOST_CALLS" || true; }
 prwatch_count() { awk 'END { print NR + 0 }' "$LANE_CLOSE_PRWATCH_CALLS"; }

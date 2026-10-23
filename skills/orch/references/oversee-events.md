@@ -321,6 +321,14 @@ When the fleet's LAST item completes, run the `heartbeat` triage pass before clo
 
 Report both with the close-out.
 
+### `parked-ready [ITEM] wait=item|account`
+
+The recorded typed wait has fresh landing or same-account admission evidence. Follow [oversee-lanes.md § Parking an item or account wait](oversee-lanes.md#parking-an-item-or-account-wait). The launcher rechecks that condition under lifecycle ownership before starting compute. The watch repeats readiness at a heartbeat until resume changes the record.
+
+### `parked-held [ITEM] wait=item|account cause=[CAUSE]`
+
+The typed wait remains unresolved or its evidence is unavailable. Keep the disk stopped. Resolve the named proof through its existing owner. Do not use an own-PR attention line, an unmerged PR close or tracker terminality as permission to resume or delete it.
+
 ### `parked-merged [ITEM] pr=[N] repo=[OWNER/REPO]`
 
 the wait PR merged and the item has work left.

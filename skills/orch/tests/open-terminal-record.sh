@@ -65,6 +65,10 @@ printf '#!/usr/bin/env bash\nexec "$BASH" -c "${!#}"\n' > "$BIN/ghostty"
 cat > "$BIN/gh" <<'EOF'
 #!/usr/bin/env bash
 # The resolver's `gh repo view` rung, answered only where a row arms it.
+if [[ "${1:-} ${2:-}" == 'api --paginate' && "${3:-}" == repos/o/r/activity* ]]; then printf '%s\n' "${STUB_DEPENDENCY_ACTIVITY:-[]}"; exit; fi
+if [[ -n "${STUB_DEPENDENCY_FILES:-}" && -f "$STUB_DEPENDENCY_FILES/${1:-}-${3:-}.json" ]]; then cat -- "$STUB_DEPENDENCY_FILES/$1-$3.json"; exit; fi
+if [[ "${1:-} ${2:-}" == 'pr view' && -n "${STUB_DEPENDENCY_VIEW:-}" ]]; then printf '%s\n' "$STUB_DEPENDENCY_VIEW"; exit; fi
+if [[ "${1:-} ${2:-}" == 'issue view' && -n "${STUB_DEPENDENCY_ISSUE:-}" ]]; then printf '%s\n' "$STUB_DEPENDENCY_ISSUE"; exit; fi
 if [[ "${1:-} ${2:-}" == 'pr view' && -n "${STUB_PR_STATE:-}" ]]; then
   printf '%s\n' "$STUB_PR_STATE"
   exit 0
@@ -81,7 +85,8 @@ cat > "$BIN/lanes" <<'LANES'
 case "${1:-}" in
   check) exit 0 ;;
   list) echo "[]" ;;
-  pick) [[ -z "${STUB_PICK_CLAIMS:-}" ]] || jq -cn --argjson n "$STUB_PICK_CLAIMS" '{config_dir: "/stub/lane", claims: $n}' ;;
+  pick) if [[ -n "${STUB_DEPENDENCY_PICK:-}" ]]; then printf '%s\n' "$STUB_DEPENDENCY_PICK"; exit "${STUB_DEPENDENCY_PICK_RC:-0}"; fi
+    [[ -z "${STUB_PICK_CLAIMS:-}" ]] || jq -cn --argjson n "$STUB_PICK_CLAIMS" '{config_dir: "/stub/lane", claims: $n}' ;;
 esac
 exit 0
 LANES
@@ -172,12 +177,14 @@ EXISTS_DIR="$TMP_ROOT/exists"
 mkdir -p "$EXISTS_DIR"
 
 REPO="$TMP_ROOT/repo"
-mutant_scripts repo >/dev/null || exit 1
+mutant_scripts repo open-terminal >/dev/null || exit 1
 orch_fixture_shared_libs "$REPO"
 git -C "$REPO" init -q
 git -C "$REPO" config gc.auto 0
 git -C "$REPO" config maintenance.auto false
 OT="$REPO/scripts/open-terminal"
+[[ ! -L "$OT" ]] || exit 1
+[[ -z "${2:-}" ]] || cp -- "$2" "$OT"
 WS="$REPO/scripts/workflow-state"
 # Every fleet state sits in the temp repo every row launches from unless it
 # names another, where an overseer's state sits, so the overseer binding reads
@@ -247,6 +254,112 @@ CLOUD_ACCESS='{"step":"cloud-repo-access-manual","repositories":["owner/repo"],"
 # A fleet launch names its harness and carries the words the fleet gate asks
 # for; a row about some other part of the launch passes that gate with this.
 FLEET_CMD=(--harness claude --cmd "true --model opus --effort high $QUESTION_OFF_ALL $COMPACTION_OFF_ALL")
+
+{
+  HOST_STUB="$TEST_DIR/fixtures/lane-host"
+  HOSTED_DISK="$TMP_ROOT/dependency-remote"
+  mkdir -p "$HOSTED_DISK/srv/lane" "$HOSTED_DISK/sessions"
+  printf 'gitdir: /srv/clone/.git/worktrees/lane\n' > "$HOSTED_DISK/srv/lane/.git"
+  printf '%s\n' '{"type":"session_meta","payload":{"id":"native-70","cwd":"/srv/lane","source":"cli"}}' > "$HOSTED_DISK/sessions/native-70.jsonl"
+  "$WS" --state-dir "$STATE" init oversee >/dev/null
+  [[ ! -L "$REPO/scripts/lanes" ]] || unlink "$REPO/scripts/lanes"
+  cp -- "$BIN/lanes" "$REPO/scripts/lanes"
+  DEP_FLAGS='-m gpt-6-astra -c model_reasoning_effort=high --dangerously-bypass-approvals-and-sandbox'
+  dependency_resume_state() {
+    "$WS" --state-dir "$STATE" update oversee --arg host "$HOST_STUB" --arg account "$LANE_DIR" --arg flags "$DEP_FLAGS" '
+      .lanes=[{item:"CC-70",tracker:"linear",repo:"o/r",harness:"codex",host:$host,kind:"ssh",account:$account,
+        model:"gpt-6-astra",effort:"high",session_id:"native-70",sandbox_instance_id:"immutable-70",mail_root:"/srv/lane",
+        window:"stub:CC-70",launched_at:"2026-09-20T00:00:00Z",launch:{pane:"%1",server:999},status:"parked",
+        recovery:{spent:true,opaque:{receipt:"failed",counter:1}},cost:12.5,pauses:[]}]
+      | .lanes[0] |= (.parked={at:"2026-09-21T00:00:00Z",head:"abc",repo:"o/r",wait:{kind:"item",reason:"held step",source:"directive-70",
+          session_file:"/sessions/native-70.jsonl",launch_flags:$flags,
+          binding:{host,harness,launch,launched_at,session_id,account,model,effort,sandbox_instance_id},
+          dependencies:[{tracker:"github",id:"immutable-issue-2",key:"2",repo:"o/r",step:"build after landing",
+            delivery:{kind:"pr",pr:9,branch:"dependency-2",item:"2"}}]}})' >/dev/null
+    : > "$TMP_ROOT/host.log"
+  }
+  dependency_resume() {
+    local create_line="${DEP_CREATE_LINE:-}"
+    [[ -n "$create_line" ]] || create_line=$'ssh-target=lane.example\tpath=/srv/lane\tremote-prefix=exec bash -lc'
+    STUB_PANE_CMD=ssh STUB_PANE_TEXT='dev@lane:~$' STUB_HARNESS_TEXT='Working (esc to interrupt)' \
+      LANE_HOST_STUB_LOG="$TMP_ROOT/host.log" LANE_HOST_STUB_DIR="$HOSTED_DISK" \
+      LANE_HOST_STUB_CREATE_LINE="$create_line" \
+      LANE_HOST_STUB_LIST_JSON='[{"repo":"r","item":"CC-70","id":"immutable-70","name":"reusable-name"}]' \
+      RUN_TMUX=stub,1,0 run_ot --relaunch --continue-resume --tmux --harness codex --launch-flags "$DEP_FLAGS" --lane "$LANE_DIR" --host "$HOST_STUB" --repo o/r CC-70
+  }
+  export STUB_DEPENDENCY_ISSUE='{"id":"immutable-issue-2","number":2,"state":"CLOSED","stateReason":"COMPLETED"}'
+  export STUB_DEPENDENCY_VIEW='{"number":9,"state":"MERGED","headRefName":"dependency-2","headRepositoryOwner":{"login":"o"},"mergedAt":"2026-10-22T12:00:00Z","mergeCommit":{"oid":"actual-landed-commit"}}'
+  dependency_resume_state
+  before="$($WS --state-dir "$STATE" get oversee '.lanes[0].recovery' | jq -c .)"
+  dependency_resume
+  assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status') session=$($WS --state-dir "$STATE" get oversee '.lanes[0].session_id') recovery=$($WS --state-dir "$STATE" get oversee '.lanes[0].recovery' | jq -c .)" \
+    "rc=0 status=running session=native-70 recovery=$before" 'exact native resume preserves the spent recovery object' "$TMP_ROOT/err"
+  assert_eq "$($WS --state-dir "$STATE" get oversee '[(.lanes[0].pauses|length),.lanes[0].dependency_wait.outcome]' | jq -c .)" '[1,"running"]' 'confirmed resume closes the pause exactly once'
+  dependency_resume
+  assert_eq "rc=$RC starts=$(grep -c '^start ' "$TMP_ROOT/host.log" || true) creates=$(grep -c '^create ' "$TMP_ROOT/host.log" || true)" 'rc=1 starts=1 creates=1' 'a replay starts no second harness or sandbox'
+  for view in \
+    '{"number":9,"state":"OPEN"}' \
+    '{"number":9,"state":"CLOSED"}' \
+    '{"number":9,"state":"MERGED","headRefName":"unrelated","headRepositoryOwner":{"login":"o"},"mergedAt":"2026-10-22T12:00:00Z","mergeCommit":{"oid":"other"}}'; do
+    dependency_resume_state
+    STUB_DEPENDENCY_VIEW="$view" dependency_resume
+    assert_eq "rc=$RC starts=$(grep -c '^start ' "$TMP_ROOT/host.log" || true) status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status')" 'rc=1 starts=0 status=parked' 'Done, failed and unrelated deliveries keep compute stopped' "$TMP_ROOT/err"
+  done
+  dependency_resume_state
+  LANE_HOST_STUB_START_OUT=unacknowledged dependency_resume
+  assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status') creates=$(grep -c '^create ' "$TMP_ROOT/host.log" || true) pauses=$($WS --state-dir "$STATE" get oversee '.lanes[0].pauses|length')" 'rc=1 status=parked creates=0 pauses=0' 'a missing start acknowledgment keeps the open pause and parked disk'
+  dependency_resume_state
+  LANE_HOST_STUB_CREATE_OWNED=CC-70 dependency_resume
+  assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status') outcome=$($WS --state-dir "$STATE" get oversee '.lanes[0].dependency_wait.outcome')" 'rc=75 status=stopped outcome=failed' 'failed create keeps the accepted wait and failure after confirmed start' "$TMP_ROOT/err"
+  dependency_resume_state
+  mv -- "$HOSTED_DISK/sessions/native-70.jsonl" "$HOSTED_DISK/sessions/native-70.kept"
+  dependency_resume
+  assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status') outcome=$($WS --state-dir "$STATE" get oversee '.lanes[0].dependency_wait.outcome')" 'rc=1 status=stopped outcome=failed' 'a missing original native transcript cannot become a fresh-session success' "$TMP_ROOT/err"
+  mv -- "$HOSTED_DISK/sessions/native-70.kept" "$HOSTED_DISK/sessions/native-70.jsonl"
+  dependency_resume_state
+  LANE_HOST_STUB_WAIT_STATUS=69 DEP_CREATE_LINE=$'ssh-target=lane.example\tpath=/srv/lane\tremote-prefix=exec bash -lc\tstate=preparing' dependency_resume
+  assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status')" 'rc=0 status=preparing' 'busy accepted preparation retains its one native continuation' "$TMP_ROOT/err"
+  dependency_resume
+  assert_eq "rc=$RC starts=$(grep -c '^start ' "$TMP_ROOT/host.log" || true) creates=$(grep -c '^create ' "$TMP_ROOT/host.log" || true) status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status')" 'rc=0 starts=1 creates=1 status=running' 'busy continuation completes without another start or create' "$TMP_ROOT/err"
+  mkdir -p "$TMP_ROOT/dependency-files"
+  printf '%s\n' "$STUB_DEPENDENCY_ISSUE" > "$TMP_ROOT/dependency-files/issue-2.json"
+  printf '%s\n' '{"id":"immutable-issue-3","number":3,"state":"CLOSED","stateReason":"COMPLETED"}' > "$TMP_ROOT/dependency-files/issue-3.json"
+  printf '%s\n' "$STUB_DEPENDENCY_VIEW" > "$TMP_ROOT/dependency-files/pr-9.json"
+  printf '%s\n' '{"number":10,"state":"OPEN"}' > "$TMP_ROOT/dependency-files/pr-10.json"
+  dependency_resume_state
+  "$WS" --state-dir "$STATE" update oversee '.lanes[0].parked.wait.dependencies |= (. + [.[0] | .id="immutable-issue-3" | .key="3" | .delivery={kind:"pr",pr:10,branch:"dependency-3",item:"3"}])' >/dev/null
+  STUB_DEPENDENCY_FILES="$TMP_ROOT/dependency-files" dependency_resume
+  assert_eq "rc=$RC starts=$(grep -c '^start ' "$TMP_ROOT/host.log" || true)" 'rc=1 starts=0' 'one uncleared blocker keeps the whole multi-item wait parked' "$TMP_ROOT/err"
+  printf '%s\n' '{"number":10,"state":"MERGED","headRefName":"dependency-3","headRepositoryOwner":{"login":"o"},"mergedAt":"2026-10-22T13:00:00Z","mergeCommit":{"oid":"actual-second-landing"}}' > "$TMP_ROOT/dependency-files/pr-10.json"
+  STUB_DEPENDENCY_FILES="$TMP_ROOT/dependency-files" dependency_resume
+  assert_eq "rc=$RC proofs=$($WS --state-dir "$STATE" get oversee '.lanes[0].dependency_wait.landing|length')" 'rc=0 proofs=2' 'every distinct blocker must supply its own exact landing' "$TMP_ROOT/err"
+  dependency_resume_state
+  "$WS" --state-dir "$STATE" update oversee '.lanes[0].parked.wait.dependencies[0].delivery={kind:"commit",branch:"main",commit:"1111111111111111111111111111111111111111"}' >/dev/null
+  STUB_DEPENDENCY_ACTIVITY='[{"timestamp":"2026-10-22T12:00:00Z","after":"1111111111111111111111111111111111111111"}]' dependency_resume
+  assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status')" 'rc=0 status=running' 'the existing successful-push owner proves a direct delivery' "$TMP_ROOT/err"
+  dependency_resume_state
+  "$WS" --state-dir "$STATE" update oversee '.lanes[0].parked.wait.dependencies[0].delivery={kind:"commit",branch:"main",commit:"1111111111111111111111111111111111111111"}' >/dev/null
+  STUB_DEPENDENCY_ACTIVITY='[]' dependency_resume
+  assert_eq "rc=$RC starts=$(grep -c '^start ' "$TMP_ROOT/host.log" || true)" 'rc=1 starts=0' 'a missing successful push cannot clear a direct-delivery wait' "$TMP_ROOT/err"
+  dependency_resume_state
+  STUB_DEPENDENCY_ISSUE='{"id":"immutable-issue-2","number":2,"state":"CLOSED","stateReason":"NOT_PLANNED"}' dependency_resume
+  assert_eq "rc=$RC starts=$(grep -c '^start ' "$TMP_ROOT/host.log" || true)" 'rc=1 starts=0' 'a canceled immutable dependency stays parked despite a PR merge' "$TMP_ROOT/err"
+  dependency_resume_state
+  "$WS" --state-dir "$STATE" update oversee '.lanes[0].parked.wait |= (del(.dependencies) | .kind="account" | .account=.binding.account | .host=.binding.host | .harness=.binding.harness | .model=.binding.model | .bucket="weekly" | .no_reset=true)' >/dev/null
+  STUB_DEPENDENCY_PICK="$(jq -cn --arg a "$LANE_DIR" '{config_dir:$a,status:"ok",measured_through:"host",binding_bucket:"weekly"}')" dependency_resume
+  assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status')" 'rc=0 status=running' 'fresh same-account admission resumes the native account wait' "$TMP_ROOT/err"
+  dependency_resume_state
+  "$WS" --state-dir "$STATE" update oversee '.lanes[0].parked.wait |= (del(.dependencies) | .kind="account" | .account=.binding.account | .host=.binding.host | .harness=.binding.harness | .model=.binding.model | .bucket="weekly" | .no_reset=true)' >/dev/null
+  STUB_DEPENDENCY_PICK='{"config_dir":"/other","status":"ok","measured_through":"host","binding_bucket":"weekly"}' dependency_resume
+  assert_eq "rc=$RC starts=$(grep -c '^start ' "$TMP_ROOT/host.log" || true)" 'rc=1 starts=0' 'room on another account cannot authorize this wait' "$TMP_ROOT/err"
+  if [[ "${1:-}" == --dependency-only ]]; then
+    printf '\npass: %s   fail: %s\n' "$PASS" "$FAIL"
+    [[ "$FAIL" -eq 0 ]]
+    exit
+  fi
+  unset STUB_DEPENDENCY_ISSUE STUB_DEPENDENCY_VIEW
+  "$WS" --state-dir "$STATE" update oversee '.lanes=[]' >/dev/null
+}
 
 echo "=== a launch appends one record under the item's workflow-state id ==="
 printf '%s\n' '/orch small CC-1' \
@@ -817,7 +930,7 @@ git -C "$TMP_ROOT/unpaused" init -q
 git -C "$TMP_ROOT/unpaused" config gc.auto 0
 git -C "$TMP_ROOT/unpaused" config maintenance.auto false
 orch_fixture_shared_libs "$TMP_ROOT/unpaused"
-mutate_file "$UNPAUSED_OT" '  else .pauses = ((.pauses // []) + [{from: .parked.at, to: $at, cause: "parked"}]) end)' '  else . end)'
+mutate_file "$UNPAUSED_OT" '  else .pauses = ((.pauses // []) + [{from: .parked.at, to: $at, cause: "parked"} + (if .parked.wait == null then {} else {wait:.parked.wait,repo:.parked.repo,head:.parked.head,timing_unread:(.parked.timing_unread // false)} end)]) end)' '  else . end)'
 "$WS" --state-dir "$STATE" update oversee --arg at "$PARKED_AT" '(.lanes[] | select(.item == "CC-65")) |= (del(.pauses) | .status = "parked" | .parked = {pr: 65, head: "abc", repo: "o/r", at: $at})' >/dev/null
 STUB_PANE_CMD=ssh STUB_PANE_TEXT='dev@lane:~$' LANE_HOST_STUB_LOG="$TMP_ROOT/host.log" LANE_HOST_STUB_DIR="$HOSTED_DISK" RUN_TMUX=stub,1,0 \
   run_ot SCRIPT="$UNPAUSED_OT" --relaunch --tmux --harness claude --lane "$LANE_DIR" --host "$HOST_STUB" --repo o/r --cmd "true --model opus --effort high $QUESTION_OFF_ALL $COMPACTION_OFF_ALL" CC-65

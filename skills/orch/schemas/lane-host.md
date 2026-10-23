@@ -81,6 +81,12 @@ Local launches keep their existing state environment. SSH providers, static and 
 - A Copilot lane's identity is the login stored in its account directory's `config.json`, which the host's copy of that directory holds; no token is copied or handed in. The provider's prefix sets `COPILOT_HOME` to the account and carries the state environment above: the rest of the Copilot launch policy, the cleared `COPILOT_GITHUB_TOKEN`, the shared skills and the folder trust, rides in the start command `open-terminal` types, which runs after the login shell's profile. A Copilot lane places no approval file.
 - `.kendex-lock.json` is committed and arrives with the clone. A provider neither copies nor commits it by hand. This machine's half of the record, `.cache/kendex/lock-local.json`, is per host: a provider does not copy it.
 
+
+### Immutable instance reads
+
+Typed item/account parking uses the existing optional `list --json` form. Its top-level array contains sandbox rows with `item`, short repository name in `repo`, and immutable instance `id`. `label` names `OWNER/REPO/ITEM`; `name` is reusable and grants no instance proof. The caller requires exactly one matching item/repository row. Missing, duplicate, unreadable or mismatched identity refuses `provider-instance-unread`. A provider without this JSON form keeps its legacy PR-parking behavior and cannot admit a typed wait. `create` needs no second identity producer.
+
+
 ## Codex hook approval
 
 Every Codex command the launcher builds carries `--dangerously-bypass-hook-trust` from `scripts/lib/lane-launch.sh`, so enabled hooks need no persisted approval for that invocation on either route; a provider may still place its account's `hooks.state` entries as below.

@@ -130,3 +130,6 @@ skills/reviewer/scripts/review-depth text eol=lf
 .agents/skills/reviewer/scripts/review-depth text eol=lf
 skills/jarvis/scripts/lib/task.py text eol=lf
 .agents/skills/jarvis/scripts/lib/task.py text eol=lf
+
+skills/orch/scripts/lib/watch-host-kinds.sh text eol=lf
+.agents/skills/orch/scripts/lib/watch-host-kinds.sh text eol=lf

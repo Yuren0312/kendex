@@ -568,40 +568,14 @@ fi
 # over the shortest period GitHub filters by that holds the launch, an hour of
 # clock skew spared. Sets MERGED_AT, or MERGED_CAUSE with push.err.
 push_time() {
-  local repo="$REPO" base query launched span at after status
+  local repo="$REPO" base launched_at
   MERGED_AT="" MERGED_CAUSE=""
-  : >"$WORK/push.err"
   [[ -n "$repo" ]] || repo="$(unset GH_REPO; kendex_github_resolve_gh_repo "${checkout:-.}" 2>/dev/null)" \
     || { MERGED_CAUSE="repo-unresolved"; return; }
   base="$("$SCRIPT_DIR/resolve-base-branch" "${checkout:-.}" 2>"$WORK/push.err")" \
     || { MERGED_CAUSE="base-unresolved"; return; }
-  query="ref=$(jq -rn --arg r "refs/heads/$base" '$r | @uri')&activity_type=push&per_page=100"
-  launched="$(jq -r '.launched_at // empty | fromdate' <<<"$lane" 2>"$WORK/push.err")" \
-    || { MERGED_CAUSE="launch-unreadable"; return; }
-  for span in day:86400 week:604800 month:2419200 quarter:7689600 year:31536000; do
-    if [[ -n "$launched" ]] && (( $(date +%s) - launched + 3600 < ${span#*:} )); then
-      query+="&time_period=${span%%:*}"
-      break
-    fi
-  done
-  if ! gh api --paginate "repos/$repo/activity?$query" >"$WORK/activity.json" 2>"$WORK/push.err" \
-    || ! jq -rs --arg commit "$COMMIT" --arg since "${launched:-0}" '[.[][] | {at: .timestamp, after}] | sort_by(.at)
-      | ([.[] | select(.after == $commit)] | first | .at // empty | "\(.) exact"),
-        (.[] | select((.at | fromdate) >= ($since | tonumber)) | "\(.at) \(.after)")' \
-      "$WORK/activity.json" >"$WORK/pushes" 2>"$WORK/push.err"; then
-    MERGED_CAUSE="activity-unread"
-    return
-  fi
-  while read -r at after; do
-    if [[ "$after" != exact ]]; then
-      status="$(gh api "repos/$repo/compare/$COMMIT...$after" --jq .status 2>"$WORK/push.err")" \
-        || { MERGED_CAUSE="compare-failed"; return; }
-      [[ "$status" == ahead ]] || continue
-    fi
-    MERGED_AT="$at"
-    return
-  done <"$WORK/pushes"
-  MERGED_CAUSE="no-push"
+  launched_at="$(jq -r '.launched_at // empty' <<<"$lane")" || { MERGED_CAUSE="launch-unreadable"; return; }
+  lane_push_time "$repo" "$base" "$COMMIT" "$launched_at" "$WORK"
 }
 
 if [[ -n "$COMMIT" ]]; then
@@ -617,8 +591,7 @@ if [[ -n "$COMMIT" ]]; then
 fi
 
 # Open parks and walls run through the measured gap until their owner closes them.
-pauses="$(jq -c '[(.pauses // [])[] | {from: (.from | fromdate), to: (if .to == null then null else .to | fromdate end)}]
-  + ([.parked.at, .walled.at] | map(select(. != null) | {from: fromdate, to: null}))' <<<"$lane" 2>"$WORK/pauses.err")" \
+pauses="$(jq -c "$LANE_INTERVALS_JQ"'lane_pauses(false)' <<<"$lane" 2>"$WORK/pauses.err")" \
   || refuse pauses-unreadable "$ITEM" "$WORK/pauses.err"
 
 negatives="$(jq -r --arg item "$ITEM" "$CYCLE_DEFS"'.rounds // [] | .[] | select(.secs != (.secs | interval))
@@ -627,19 +600,13 @@ negatives="$(jq -r --arg item "$ITEM" "$CYCLE_DEFS"'.rounds // [] | .[] | select
 
 cycle="$(jq -c -n --argjson lane "$lane" --argjson t "$timeline" --argjson rounds "$rounds" --argjson stages "$stages" --argjson pauses "$pauses" \
   --argjson targets "$TARGETS" --arg class "$class" --arg cause "$class_cause" --arg tier "$TIER" \
-  --arg class_reason "$class_reason" --arg evidence "$class_evidence" "$CYCLE_DEFS"'
+  --arg class_reason "$class_reason" --arg evidence "$class_evidence" "$CYCLE_DEFS$LANE_INTERVALS_JQ"'
   # The gate waits of the gap FROM..TO, epoch seconds: an instant a pause
   # covers is paused; before ready, any other is draft. After ready, the
   # latest push or bot review sets the wait, bot_wait where neither came yet.
   # A push and a bot review in one second read the push first.
   # The same union measures gate holds, merge holds and the time a check
   # ran. This local calculation adds no merge policy or new lane record.
-  def covered_seconds($spans; $from; $to):
-    ($spans | map({a: ([.from, $from] | max), b: ([.to // $to, $to] | min)})
-     | map(select(.b > .a)) | sort_by(.a)
-     | reduce .[] as $p ([]; if length > 0 and $p.a <= .[-1].b
-         then .[-1].b = ([.[-1].b, $p.b] | max) else . + [$p] end)) as $union
-    | [$union[] | .b - .a] | add // 0;
   def paused_seconds($from; $to): covered_seconds($pauses; $from; $to);
   def gate_waits($from; $to):
     ([$t.ready_times[]? | select(. != null) | fromdate | select(. <= $to)] | max) as $ready

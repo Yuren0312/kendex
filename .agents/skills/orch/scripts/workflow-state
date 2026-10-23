@@ -1260,7 +1260,7 @@ state_units() { # SD STATE_FILE PD
     for entry in "$sd"/*; do
         [[ "$pd" != "$entry" && "$pd" != "$entry"/* ]] || continue
         case "$entry" in
-            "$sd/${2##*/}"|"$sd/${2##*/}.lock"|"$WATCH_PID_FILE"|"$WATCH_ARGV_FILE"|"$WATCH_LOG_FILE"|"$WATCH_ERR_FILE"|"$WATCH_RUNNER_FILE") ;;
+            "$sd/.lane-lifecycle"|"$sd/${2##*/}"|"$sd/${2##*/}.lock"|"$WATCH_PID_FILE"|"$WATCH_ARGV_FILE"|"$WATCH_LOG_FILE"|"$WATCH_ERR_FILE"|"$WATCH_RUNNER_FILE") ;;
             "$sd/handoffs")
                 for f in "$entry"/*; do [[ "${f##*/}" == OVERSEER-HANDOFF.md ]] || UNITS+=("$f"); done ;;
             "$sd/lane-mail")
@@ -1523,6 +1523,39 @@ cmd_remove() {
     fleet_state_file >/dev/null || cmd_prune
 }
 
+# lane-close and open-terminal hold this owner through their provider effects.
+# The child inherits the binding so recovery can call the launcher without
+# reacquiring its own lock. The parent keeps ownership until that child exits.
+cmd_lane_run() { # ITEM -- COMMAND...
+    local item="${1:-}" key lock_file owner_start owners="${ORCH_LANE_LIFECYCLE:-}" rc=0
+    [[ -n "$owners" ]] || owners='{}'
+    [[ "$item" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "${2:-}" == -- && $# -ge 3 ]] || {
+        printf 'workflow-state: lane-run-invalid item=%s\n' "$item" >&2; return 2;
+    }
+    shift 2
+    mkdir -p -- "$STATE_DIR/.lane-lifecycle" || return 1
+    key="$STATE_DIR/.lane-lifecycle/$item.lock"
+    source "$SCRIPT_DIR/lib/lane-state.sh"
+    source "$SCRIPT_DIR/lib/lane-relaunch.sh"
+    if lane_lifecycle_owned "$key"; then "$@"; return; fi
+    owner_start="$(lane_process_start "$$")" || return 1
+    [[ -n "$owner_start" ]] || return 1
+    (
+        lock_file="$key"
+        exec 9>"$lock_file" || exit 1
+        orch_take_lock 9 "$lock_file" 1 || {
+            printf 'workflow-state: lane-busy item=%s\n' "$item" >&2; exit 75;
+        }
+        ORCH_LANE_LIFECYCLE="$(jq -cn --argjson owners "$owners" --arg key "$key" --arg pid "$$" --arg start "$owner_start" '$owners + {($key):{pid:$pid,start:$start}}')" || exit 1
+        export ORCH_LANE_LIFECYCLE
+        "$@" || rc=$?
+        # Release even when a detached descendant inherited a descriptor.
+        if command -v flock >/dev/null 2>&1; then flock -u 9 || exit 1; fi
+        orch_release_lock
+        exit "$rc"
+    )
+}
+
 cmd_help() {
     cat << 'EOF'
 Usage: workflow-state [--state-dir <path>] [--no-private-env] <command> <issue_id> [args...]
@@ -1542,6 +1575,10 @@ Global options (before the subcommand):
                                 the caller.
 
 Commands:
+  lane-run <item> -- <command> [args...]
+                                Hold the per-item lifecycle owner through a
+                                close or launch and its conditional state writes.
+                                A concurrent owner refuses with exit 75.
   init <issue_id> [options]     Create new state file
     --agent <name>              Primary agent
     --worktree <path>           Worktree path
@@ -1962,6 +1999,7 @@ resolve_state_dir
 # Main dispatch. The help case above answered an absent or empty subcommand,
 # so $1 is set and non-empty here.
 case "$1" in
+    lane-run)  shift; cmd_lane_run "$@" ;;
     init)      shift; cmd_init "$@" ;;
     get)       shift; cmd_get "$@" ;;
     update)    shift; cmd_update "$@" ;;

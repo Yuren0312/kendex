@@ -1052,7 +1052,7 @@ completed overlapping open|yes|400-3600
 ROWS
 }
 standing_wall_rows shipped
-control m-standing-wall oversee-cycle '[.parked.at, .walled.at]' '[.parked.at]'
+control m-standing-wall lib/watch-host-kinds.sh '[ .parked.at, (if $park_only then null else .walled.at end)' '[ .parked.at, null'
 if (FAIL=0; standing_wall_rows control; [[ "$FAIL" -eq 0 ]]) > "$TMP_ROOT/standing-wall-control.out"; then
   fail "standing wall: ignoring the open wall did not redden its accounting"
 else

@@ -375,6 +375,7 @@ source "$SCRIPT_DIR/lib/date-ladder.sh"
 source "$SCRIPT_DIR/lib/lane-gitfile.sh"
 # shellcheck source=lib/lane-state.sh
 source "$SCRIPT_DIR/lib/lane-state.sh"
+source "$SCRIPT_DIR/lib/watch-host-kinds.sh"
 # shellcheck source=lib/lane-claims.sh
 source "$SCRIPT_DIR/lib/lane-claims.sh"
 # shellcheck source=lib/launch-overlap.sh
@@ -1047,6 +1048,28 @@ escapes_row() {
     "$this" "$last" "$ESCAPE_CAP_WEEK" "$cap"
 }
 
+parked_hours() {
+  local days
+  if ! days="$(jq -r --argjson cutoff "$NOW" "$LANE_INTERVALS_JQ"'
+      [.lanes[]? | {spans:lane_pauses(true)}] as $lanes
+      | if any($lanes[].spans[]; .from > $cutoff or (.to != null and .to > $cutoff)) then error("future-pause") else . end
+      | ([$lanes[].spans[].from] | min) as $first
+      | if $first == null then empty else
+        range((($first / 86400) | floor) * 86400; $cutoff; 86400) as $day
+        | [$lanes[] | covered_seconds(.spans; $day; ([$day + 86400,$cutoff]|min))] | add as $seconds
+        | "\($day | strftime("%Y-%m-%d")) | \((($seconds / 3600 * 1000) | round) / 1000) | unavailable"
+        end' <<<"$STATE_JSON" 2>"$WORK_DIR/parked-hours.err")"; then
+    printf '%s\n' 'Parked hours: unavailable (malformed timing).'
+    return
+  fi
+  printf '%s\n' 'Parked time (UTC calendar days; retained lane records only, archives unread):' \
+    '| Day | Parked lane hours | Confirmed 60-minute idle stops |' \
+    '| --- | ---: | --- |'
+  if [[ -n "$days" ]]; then printf '%s\n' "$days"
+  else printf '%s\n' '| No confirmed intervals | 0 | unavailable |'; fi
+  printf '%s\n' 'Idle-stop counts are unavailable: reaped mailbox notes precede stop and may be followed by reap-not-stopped.'
+}
+
 render() {
   local rows="" item number sha repo list open="" pr status landed_name=Landed cut_since
   github_auth
@@ -1103,6 +1126,8 @@ render() {
     rows+="$item"$'\t'"$item (${pr:-no PR}, $status)"$'\n'
   done <<<"$list"
   table Running "$rows"
+  echo
+  parked_hours
   echo
 
   if [[ -z "$VALIDATION" ]]; then

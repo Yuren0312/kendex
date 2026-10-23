@@ -235,6 +235,10 @@ One with neither refuses as `tmux-missing`, so set `ORCH_TMUX_SESSION` for such 
 
 ## Recovery relaunch
 
+### Resuming a typed park
+
+A typed park follows [oversee-lanes.md § Parking an item or account wait](oversee-lanes.md#parking-an-item-or-account-wait). Use this launch command only after its recorded condition clears. A park resume keeps the same native work and recovery object. It does not spend or reset death recovery. It takes no fresh-session fallback. Missing transcript or immutable-instance evidence leaves the lane held.
+
 ### Source-only recovery
 
 A standing source-only handoff retains its phase scope. Read the native standing record and the retained artifact named by its first `remaining` entry, then load the successor's required current protocol and obtain native admission. Follow [start.md § 0](../workflows/start.md#0-resume-from-a-handoff) and [start-worktree.md § 1 step 3](../workflows/start-worktree.md#1-open-the-session): the standing record replaces implementation preparation and resumes that same entry through the existing-state branch.

@@ -15,6 +15,154 @@
 # and custom commands cannot recover their original permissions, so the watch
 # must refuse before stopping a lane. The host and tracker retain their existing
 # lane-record meanings, including null host meaning local.
+# The request is supplied by the overseer from the current launch record.
+# Costs, pauses and mailbox cursors are deliberately outside this identity.
+LANE_ATTEMPT_JQ='def lane_attempt: {host,harness,launch,launched_at,session_id,account,model,effort,sandbox_instance_id};'
+# Only a live owning process can pass ownership to a nested lifecycle call.
+# A stale inherited environment from an ended launcher grants no ownership.
+lane_lifecycle_owned() { # LOCK_PATH
+  local identity pid start actual owners="${ORCH_LANE_LIFECYCLE:-}"
+  [[ -n "$owners" ]] || owners='{}'
+  identity="$(jq -er --arg key "$1" '.[$key] | select(.pid != null and .start != null) | [.pid,.start] | join("\u001f")' <<<"$owners")" || return 1
+  IFS=$'\x1f' read -r pid start <<<"$identity"
+  actual="$(lane_process_start "$pid")" || return 1
+  [[ -n "$actual" && "$actual" == "$start" ]]
+}
+
+LANE_WAIT_CAUSE=""
+LANE_WAIT_EVIDENCE=null
+lane_wait_validate() { # WAIT CURRENT_RECORD [resume]
+  LANE_WAIT_CAUSE=wait-invalid
+  jq -e --argjson record "$2" --arg mode "${3:-park}" "$LANE_ATTEMPT_JQ"'
+    def text: type == "string" and length > 0;
+    def repo: text and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$");
+    (.reason | text) and (.source | text) and (.binding == ($record | lane_attempt))
+    and (.binding.host | text) and (.binding.session_id | text) and (.binding.sandbox_instance_id | text)
+    and (.binding.launch | type == "object") and (.session_file | text) and (.launch_flags | type == "string") and ($mode == "resume" or $record.prepare == null)
+    and (if .kind == "item" then
+      (.dependencies | type == "array" and length > 0 and all(.[];
+        (.tracker == "linear" or .tracker == "github") and (.id | text) and (.key | text)
+        and (.repo | repo) and (.step | text)
+        and (.delivery.kind == "pr" or .delivery.kind == "commit" or .delivery.kind == "artifact")
+        and (if .delivery.kind == "pr" then
+          (.delivery.pr == null or (.delivery.pr | type == "number" and . > 0 and floor == .))
+          and (.delivery.branch | text) and .delivery.item == .key
+        elif .delivery.kind == "commit" then (.delivery.branch | text) and (.delivery.commit | text and test("^[0-9A-Fa-f]{40}$"))
+        else (.delivery.artifact | text) and (.delivery.verification | text) end)))
+    elif .kind == "account" then
+      .account == $record.account and .host == $record.host and .harness == $record.harness
+      and .model == $record.model and (.bucket | text) and .no_reset == true
+    else false end)' <<<"$1" >/dev/null || return 1
+  if [[ "$(jq -r .kind <<<"$1")" == item ]]; then
+    local dep
+    while IFS= read -r dep; do lane_wait_item_identity "$dep" || return 1; done < <(jq -c '.dependencies[]' <<<"$1")
+  fi
+  LANE_WAIT_CAUSE=""
+}
+
+# A tracker completion is only an identity read. Landing is judged separately.
+lane_wait_item_identity() { # DEPENDENCY
+  local dep="$1" tracker key id repo live
+  tracker="$(jq -r .tracker <<<"$dep")" && key="$(jq -r .key <<<"$dep")" \
+    && id="$(jq -r .id <<<"$dep")" && repo="$(jq -r .repo <<<"$dep")" || return 1
+  LANE_WAIT_CAUSE=item-unread
+  case "$tracker" in
+    linear)
+      live="$("$SCRIPT_DIR/../../linear/scripts/linear.sh" issues get "$key" --format=safe)" || return 1
+      jq -e --arg id "$id" --arg key "$key" '.uuid == $id and .identifier == $key and (.state_type | type == "string") and .state_type != "canceled"' <<<"$live" >/dev/null || return 1 ;;
+    github)
+      live="$(gh issue view "$key" --repo "$repo" --json id,number,state,stateReason)" || return 1
+      jq -e --arg id "$id" --arg key "$key" '.id == $id and (.number | tostring) == $key and (.state == "OPEN" or (.state == "CLOSED" and .stateReason == "COMPLETED"))' <<<"$live" >/dev/null || return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The provider owns this immutable identity. Its reusable sandbox name never
+# substitutes for the unique item/repository row in list --json.
+lane_provider_instance() { # HOST OWN_REPO ITEM
+  local listing
+  LANE_PROVIDER_INSTANCE_ID="" LANE_WAIT_CAUSE=provider-instance-unread
+  listing="$(ORCH_LANE_HOST="$1" "$SCRIPT_DIR/lane-host" list --json)" || return 1
+  LANE_PROVIDER_INSTANCE_ID="$(jq -er --arg repo "${2##*/}" --arg item "$3" '
+    if type != "array" then error("instance-list-invalid") else . end
+    | map(select((.repo | ascii_downcase) == ($repo | ascii_downcase) and (.item | ascii_downcase) == ($item | ascii_downcase)))
+    | select(length == 1) | .[0].id | strings | select(length > 0)' <<<"$listing")" || return 1
+  LANE_WAIT_CAUSE=""
+}
+
+lane_wait_instance() { # WAIT OWN_REPO ITEM
+  lane_provider_instance "$(jq -r .binding.host <<<"$1")" "$2" "$3" || return 1
+  LANE_WAIT_CAUSE=provider-instance-unread
+  [[ "$LANE_PROVIDER_INSTANCE_ID" == "$(jq -r .binding.sandbox_instance_id <<<"$1")" ]] || return 1
+  LANE_WAIT_CAUSE=""
+}
+
+lane_wait_account() { # WAIT room|walled
+  local wait="$1" expect="$2" row rc=0 account host harness model bucket
+  account="$(jq -r .account <<<"$wait")" && host="$(jq -r .host <<<"$wait")" \
+    && harness="$(jq -r .harness <<<"$wait")" && model="$(jq -r .model <<<"$wait")" \
+    && bucket="$(jq -r .bucket <<<"$wait")" || return 1
+  LANE_WAIT_CAUSE=account-unread
+  row="$(ORCH_LANE_HOST="$host" "$SCRIPT_DIR/lanes" pick --lane "$account" --harness "$harness" --native-model "$model" --no-cache --json)" || rc=$?
+  [[ "$expect:$rc" == room:0 || "$expect:$rc" == walled:3 ]] || { LANE_WAIT_CAUSE=account-not-admitted; return 1; }
+  # The provider must answer for the stopped host itself. Local fallback cannot
+  # establish that the account on the kept disk has room.
+  jq -e --arg account "$account" --arg bucket "$bucket" --arg expect "$expect" '
+    .config_dir == $account and .measured_through == "host" and .status == "ok"
+    and .binding_bucket == $bucket and ($expect != "walled" or .binding_resets_at == null)' <<<"$row" >/dev/null || return 1
+  LANE_WAIT_EVIDENCE="$row" LANE_WAIT_CAUSE=""
+}
+
+lane_wait_landed() { # CURRENT_RECORD
+  local record="$1" wait dep kind view pr branch repo key evidence='[]' hit
+  LANE_WAIT_EVIDENCE=null LANE_WAIT_CAUSE=wait-unread
+  wait="$(jq -ce '.parked.wait // .dependency_wait.wait' <<<"$record")" || return 1
+  # A resumed preparation still carries the original binding. Never replace
+  # that binding with a fresh launch merely because the sandbox started.
+  lane_wait_validate "$wait" "$(jq -c --argjson wait "$wait" '. + $wait.binding' <<<"$record")" resume || return 1
+  lane_wait_instance "$wait" "$(jq -r .repo <<<"$record")" "$(jq -r .item <<<"$record")" || return 1
+  kind="$(jq -r .kind <<<"$wait")" || return 1
+  if [[ "$kind" == account ]]; then lane_wait_account "$wait" room; return; fi
+  while IFS= read -r dep; do
+    lane_wait_item_identity "$dep" || return 1
+    kind="$(jq -r .delivery.kind <<<"$dep")" || return 1
+    LANE_WAIT_CAUSE=delivery-verifier-unavailable
+    # There is no generic release/deployment verifier in the provider protocol.
+    # Those named deliveries remain held until their existing owner supplies
+    # proof; Done and a message are never substituted for that proof.
+    if [[ "$kind" == commit ]]; then
+      local scratch push_at push_cause
+      scratch="$(mktemp -d)" || return 1
+      source "$SCRIPT_DIR/lib/watch-host-kinds.sh"
+      lane_push_time "$(jq -r .repo <<<"$dep")" "$(jq -r .delivery.branch <<<"$dep")" \
+        "$(jq -r .delivery.commit <<<"$dep")" "$(jq -r .binding.launched_at <<<"$wait")" "$scratch"
+      push_at="$MERGED_AT" push_cause="$MERGED_CAUSE"
+      [[ -z "$push_cause" ]] || cat -- "$scratch/push.err" >&2
+      rm -rf -- "${scratch:?}"
+      LANE_WAIT_CAUSE="delivery-${push_cause:-not-landed}"
+      [[ -n "$push_at" ]] || return 1
+      hit="$(jq -cn --arg at "$push_at" --argjson dependency "$dep" '{dependency:$dependency,landing:{at:$at,commit:$dependency.delivery.commit,branch:$dependency.delivery.branch}}')" || return 1
+      evidence="$(jq -cn --argjson all "$evidence" --argjson hit "$hit" '$all+[$hit]')" || return 1
+      continue
+    fi
+    [[ "$kind" == pr ]] || return 1
+    pr="$(jq -r '.delivery.pr // empty' <<<"$dep")" \
+      && branch="$(jq -r .delivery.branch <<<"$dep")" \
+      && repo="$(jq -r .repo <<<"$dep")" && key="$(jq -r .key <<<"$dep")" || return 1
+    LANE_WAIT_CAUSE=delivery-unbound
+    [[ -n "$pr" ]] || return 1
+    LANE_WAIT_CAUSE=delivery-unread
+    view="$(gh pr view "$pr" --repo "$repo" --json number,state,headRefName,headRepositoryOwner,mergedAt,mergeCommit,title,body)" || return 1
+    LANE_WAIT_CAUSE=delivery-not-landed
+    hit="$(jq -ce --arg key "$key" --arg branch "$branch" --arg owner "${repo%%/*}" --argjson pr "$pr" "$LANE_MERGED_JQ"'
+      select(.state == "MERGED" and .headRefName == $branch and (.mergeCommit.oid | strings | length > 0))
+      | [.] | lane_merged($key; $owner; $pr; 0) | select(length == 1) | .[0]
+      | {pr:.number,mergedAt,mergeCommit}' <<<"$view")" || return 1
+    evidence="$(jq -cn --argjson all "$evidence" --argjson hit "$hit" --argjson dependency "$dep" '$all + [{dependency:$dependency,landing:$hit}]')" || return 1
+  done < <(jq -c '.dependencies[]' <<<"$wait")
+  LANE_WAIT_CAUSE="" LANE_WAIT_EVIDENCE="$evidence"
+}
+
 lane_recovery_args() { # RECORD ACCOUNT STATE_DIR LAUNCHER [model-switched]
   local fields item harness flags refresh tracker repo live rc=0 model effort choice launch_model launch_id selector_id surface terminal=--tmux
   local -a words=() choice_words=()
@@ -352,6 +500,12 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     . "$scripts/lib/lane-state.sh"
     . "$scripts/lib/lane-launch.sh"
     . "$scripts/lib/lane-capabilities.sh"
+    item="$(jq -er .item <<<"$2")" || exit 1
+    lifecycle_path="$("$scripts/workflow-state" --state-dir "$3" path oversee)" || exit 1
+    lifecycle_key="${lifecycle_path%/*}/.lane-lifecycle/$item.lock"
+    if ! lane_lifecycle_owned "$lifecycle_key"; then
+      exec "$scripts/workflow-state" --state-dir "$3" lane-run "$item" -- "$BASH" "$0" "$@"
+    fi
     lane_model_recovery "$2" "$3" "$scripts" "$4"
     exit
   fi

@@ -378,6 +378,9 @@ case "${1:-} ${2:-}" in
           | if $rest then map({tag_name:.tagName,published_at:.publishedAt,draft:.isDraft}) else . end else . end' "$src"
     else echo '[]'; fi
     exit ;;
+  "issue view")
+    [[ -f "$STUB_DIR/dependency-issue-$3.json" ]] || exit 1
+    cat -- "$STUB_DIR/dependency-issue-$3.json"; exit ;;
   "pr view")
     printf '%s\n' "$*" >> "$STUB_DIR/gh.calls"
     [[ -r "$STUB_DIR/dependency-$3.json" ]] || { printf 'dependency-unread pr=%s\n' "$3" >&2; exit 1; }

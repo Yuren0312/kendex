@@ -871,6 +871,7 @@ PREPARE_ROWS=""
 PARKED_ROWS_FILTER='
   (.lanes // [])[] | select(type == "object" and .status == "parked")
   | if ((.item? | type) != "string" or (.item | length) == 0) then error("lane-field field=item value=\(.item | tojson)")
+    elif .parked.wait != null then "\(.item)\u001fwait:\(.parked.wait.kind)\u001f\(.launched_at | fromdateiso8601 | tostring)"
     elif (((.parked.until_pr // .parked.pr) | type) != "number" or ((.parked.until_repo // .parked.repo) | type) != "string") then error("lane-field field=parked value=\(.parked | tojson)")
     else "\(.item)\u001f\((.parked.until_repo // .parked.repo) | ascii_downcase)#\(.parked.until_pr // .parked.pr)\u001f\(.launched_at | if . == null then "" else (fromdateiso8601 | tostring) end)" end'
 PARKED_ITEMS=()
@@ -1509,6 +1510,27 @@ close_finished_hosted_lane() { # LANE ROW KEY; updates check_lanes' asking_state
 # verb's terminal judge, including a retained PR wait and Done-when boxes, on each
 # fleet pass unless its tracker is held, and keep only provider refusals:
 # user-owned changes need an overseer's action, not another provider call.
+# Typed waits use their exact delivery/account judge. Own PR attention and
+# tracker terminality cannot authorize their paid start or destructive close.
+check_dependency_parks() {
+  [[ -n "$STATE_FILE" ]] || return 0
+  local record item kind key prior rows="${PW_SEEN[0]}" entries
+  entries="$(jq -c '.lanes[]? | select(.status == "parked" and .parked.wait != null)' <<<"$FLEET_STATE")" || return 1
+  while IFS= read -r record; do
+    [[ -n "$record" ]] || continue
+    item="$(jq -r .item <<<"$record")" && kind="$(jq -r .parked.wait.kind <<<"$record")" || return 1
+    if lane_wait_landed "$record"; then key=ready; else key="held:$LANE_WAIT_CAUSE"; fi
+    prior="$(lane_row_get dependency-wait "$rows" "$item")" || return 1
+    if [[ "$key" != "$prior" ]]; then
+      if [[ "$key" == ready ]]; then echo "EVENT parked-ready $item wait=$kind"
+      else echo "EVENT parked-held $item wait=$kind cause=${key#held:}"; fi
+      PASS_EVENT=1
+      rows="$(lane_row_set dependency-wait "$rows" "$item" "$key")" || return 1
+    fi
+  done <<<"$entries"
+  PW_SEEN[0]="$rows"
+}
+
 check_terminal_lanes() {
   [[ -n "$STATE_FILE" ]] || return 0
   local records record item terminal key prior refused rc merged merge_key cycle_pr recorded_merge merged_repo rows="${PW_SEEN[0]}" refreshed=false
@@ -1855,6 +1877,7 @@ check_merged() {
     branches="${branches#*$'\n'}"
     PARKED_KEY=""
     item_parked "$item" || true
+    [[ "$PARKED_KEY" != wait:* ]] || continue
     until="" dependency_record="" own_pr="" own_repo=""
     while IFS=$'\x1f' read -r field recorded value; do
       [[ "$recorded" == "$item" ]] || continue
@@ -1973,6 +1996,11 @@ parked_merged_line() { # ITEM KEY
 parked_merged_owed() { # STATE
   local i row dependency
   for i in ${PARKED_ITEMS[@]+"${!PARKED_ITEMS[@]}"}; do
+    if [[ "${PARKED_KEYS[$i]}" == wait:* ]]; then
+      dependency="$(lane_row_get dependency-wait "$1" "${PARKED_ITEMS[$i]}")" || return 1
+      [[ "$dependency" != ready ]] || echo "EVENT parked-ready ${PARKED_ITEMS[$i]} wait=${PARKED_KEYS[$i]#wait:}"
+      continue
+    fi
     dependency="$(lane_row_get parked-until "$1" "${PARKED_ITEMS[$i]}")" || return 1
     if [[ "$dependency" == "${PARKED_KEYS[$i]} MERGED" ]]; then
       parked_merged_line "${PARKED_ITEMS[$i]}" "${PARKED_KEYS[$i]}"
@@ -5752,6 +5780,7 @@ long_pass() {
     # Read tracker replies before their deadline closes. An unread tracker
     # cannot establish that the person left the recommendation unanswered.
     [[ "$OWNER_TRACKER_READ" != read ]] || resolve_due_owner_asks tracker
+    check_dependency_parks
     check_merged
     check_terminal_lanes
     observe_lanes

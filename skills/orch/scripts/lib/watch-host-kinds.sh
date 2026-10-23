@@ -12,6 +12,62 @@
 # lib/lane-gitfile.sh and lib/lane-capabilities.sh, which that script sources
 # before this file.
 
+# The cycle owner's interval union also supplies long-lane and report time.
+# A malformed or reversed interval is unavailable, never a zero pause.
+LANE_INTERVALS_JQ='  def covered_seconds($spans; $from; $to):
+    ($spans | map({a: ([.from, $from] | max), b: ([.to // $to, $to] | min)})
+     | map(select(.b > .a)) | sort_by(.a)
+     | reduce .[] as $p ([]; if length > 0 and $p.a <= .[-1].b
+         then .[-1].b = ([.[-1].b, $p.b] | max) else . + [$p] end)) as $union
+    | [$union[] | .b - .a] | add // 0;
+
+  def lane_pauses($park_only):
+    if .parked.timing_unread == true or (.parked.wait != null and (.parked.phase // "" | startswith("start-")))
+       or any(.pauses[]?; .timing_unread == true) then error("pause-ack-unread") else . end
+    | ([ (.pauses // [])[] | select(($park_only | not) or .cause == "parked")
+       | {from:(.from | fromdateiso8601),to:(if .to == null then null else .to | fromdateiso8601 end)} ]
+     + [ .parked.at, (if $park_only then null else .walled.at end)
+         | select(. != null) | {from:fromdateiso8601,to:null} ])
+    | if any(.[]; .to != null and .to < .from) then error("reversed-pause") else . end;
+  def lane_parked_seconds($from; $to): lane_pauses(true)
+    | if any(.[]; .from > $to or (.to != null and .to > $to)) then error("future-pause") else covered_seconds(.; $from; $to) end;
+'
+
+# The successful-push reader is shared with the cycle recorder. The recorded
+# commit must be the push tip or contained by a later push on that exact branch.
+lane_push_time() { # REPO BRANCH COMMIT LAUNCHED_AT SCRATCH
+  local repo="$1" base="$2" commit="$3" launched_at="$4" work="$5" query launched span at after status
+  MERGED_AT="" MERGED_CAUSE=""
+  : >"$work/push.err"
+  query="ref=$(jq -rn --arg r "refs/heads/$base" '$r | @uri')&activity_type=push&per_page=100"
+  launched="$(jq -rn --arg at "$launched_at" '$at | fromdate' 2>"$work/push.err")" \
+    || { MERGED_CAUSE="launch-unreadable"; return; }
+  for span in day:86400 week:604800 month:2419200 quarter:7689600 year:31536000; do
+    if [[ -n "$launched" ]] && (( $(date +%s) - launched + 3600 < ${span#*:} )); then
+      query+="&time_period=${span%%:*}"
+      break
+    fi
+  done
+  if ! gh api --paginate "repos/$repo/activity?$query" >"$work/activity.json" 2>"$work/push.err" \
+    || ! jq -rs --arg commit "$commit" --arg since "${launched:-0}" '[.[][] | {at: .timestamp, after}] | sort_by(.at)
+      | ([.[] | select(.after == $commit)] | first | .at // empty | "\(.) exact"),
+        (.[] | select((.at | fromdate) >= ($since | tonumber)) | "\(.at) \(.after)")' \
+      "$work/activity.json" >"$work/pushes" 2>"$work/push.err"; then
+    MERGED_CAUSE="activity-unread"
+    return
+  fi
+  while read -r at after; do
+    if [[ "$after" != exact ]]; then
+      status="$(gh api "repos/$repo/compare/$commit...$after" --jq .status 2>"$work/push.err")" \
+        || { MERGED_CAUSE="compare-failed"; return; }
+      [[ "$status" == ahead ]] || continue
+    fi
+    MERGED_AT="$at"
+    return
+  done <"$work/pushes"
+  MERGED_CAUSE="no-push"
+}
+
 # The writer supplies its checkout. A recorder in a connected repository uses
 # the fleet's registered cwd, then its state directory, to find that checkout.
 # Keep linked-worktree roots: the watch stores its rows there, not in the clone.
@@ -444,11 +500,15 @@ cloud_stall_close() { # ITEM SINCE
 # reported lane-long once per age interval, its stage the Step line of its
 # status file. Keep the launch with the interval so a fresh launch starts over.
 check_lane_long() {
-  local entry item launched age interval prior rows="${PW_SEEN[0]}"
+  local entry item launched age paused interval prior rows="${PW_SEEN[0]}"
   for entry in ${LANE_AGES[@]+"${LANE_AGES[@]}"}; do
     item="${entry%%=*}"
     launched="${entry#*=}"
-    age=$((PASS_NOW - launched))
+    paused="$(jq -er --arg item "$item" --argjson from "$launched" --argjson to "$PASS_NOW" "$LANE_INTERVALS_JQ"'
+      .lanes[]? | select(.item == $item) | lane_parked_seconds($from; $to)' <<<"$FLEET_STATE")" || {
+      ow_message lane-time-unavailable "item=$item" >&2; continue;
+    }
+    age=$((PASS_NOW - launched - paused))
     (( age >= LANE_AGE_SECS )) || continue
     interval=$((age / LANE_AGE_SECS))
     if ! prior="$(lane_row_get lane-long "$rows" "$item")"; then

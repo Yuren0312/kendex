@@ -149,7 +149,7 @@ message() { # REASON FIELD=VALUE...
 
 usage() {
   cat <<'EOF'
-Usage: lane-close [--state-dir PATH] [--keep-sandbox | --park [--pr N] [--until-pr N|OWNER/REPO#N]]
+Usage: lane-close [--state-dir PATH] [--keep-sandbox | --park [--pr N] [--until-pr N|OWNER/REPO#N | --wait-file PATH]]
                   [--harness claude|codex|pi|copilot] [--tracker linear|github]
                   [--repo OWNER/REPO] ITEM
 
@@ -278,6 +278,15 @@ files removed, and its host close keeps the whole archive.
 worktree merged answers only where this checkout holds the item's branch; an
 exit other than 0 or 1 prints merged-unjudged and the close goes on without the
 flag, which keeps the whole archive.
+
+--park --wait-file PATH admits the overseer's typed item/account wait from
+schemas/workflow-state.md. It binds to the current launch and native session,
+keeps pending asks on the stopped disk, and requires readable Git identity,
+a clean-status record and a published recoverable head. Dirty or unpublished
+work refuses before retirement. It never commits or publishes work to park.
+The provider must expose its immutable id through list --json; a reusable name is no proof.
+It records the admitted wait before retirement. A failed or unacknowledged
+disk stop leaves stopped with that wait retained.
 
 --park --pr N parks a hosted lane's clean merge wait: the lane sits in its
 queue wait doing nothing while its pull request N waits for the merge queue,
@@ -409,6 +418,7 @@ need_value() {
   [[ $# -ge 2 && -n "${2:-}" ]] || { message missing-value "option=$1" >&2; exit 2; }
 }
 
+ORIGINAL_ARGS=("$@")
 STATE_DIR=""
 KEEP_SANDBOX=false
 TERMINAL_MODE=close
@@ -416,6 +426,8 @@ PARK=false
 PARK_PR=""
 PARK_UNTIL_PR=""
 PARK_UNTIL_REPO=""
+PARK_WAIT_FILE=""
+PARK_WAIT=null
 OPT_HARNESS=""
 OPT_TRACKER=""
 OPT_REPO=""
@@ -434,6 +446,7 @@ while [[ $# -gt 0 ]]; do
     --terminal-state) TERMINAL_MODE=state; shift ;;
     --if-terminal) TERMINAL_MODE=if; shift ;;
     --park) PARK=true; shift ;;
+    --wait-file) need_value "$@"; PARK_WAIT_FILE="$2"; shift 2 ;;
     --pr) need_value "$@"; PARK_PR="$2"; shift 2 ;;
     --pr=*) PARK_PR="${1#--pr=}"; need_value --pr "$PARK_PR"; shift ;;
     --until-pr) need_value "$@"; PARK_UNTIL_PR="$2"; shift 2 ;;
@@ -453,9 +466,12 @@ done
 if [[ "$PARK" == true && "$KEEP_SANDBOX" == true ]]; then
   message argument-count "value=--park" "conflict=--keep-sandbox" >&2; usage >&2; exit 2
 fi
-if [[ "$PARK" == true && -z "$PARK_PR$PARK_UNTIL_PR" || "$PARK" == false && -n "$PARK_PR$PARK_UNTIL_PR" ]]; then
+if [[ "$PARK" == true && -z "$PARK_PR$PARK_UNTIL_PR$PARK_WAIT_FILE" || "$PARK" == false && -n "$PARK_PR$PARK_UNTIL_PR$PARK_WAIT_FILE" ]]; then
   message missing-value "option=--park" "requires=--pr" >&2; usage >&2; exit 2
 fi
+[[ -z "$PARK_WAIT_FILE" || -z "$PARK_UNTIL_PR" ]] || {
+  message argument-count value=--wait-file conflict=--until-pr >&2; exit 2;
+}
 [[ -z "$PARK_PR" || "$PARK_PR" =~ ^[1-9][0-9]*$ ]] || { message missing-value "option=--pr" "value=$PARK_PR" >&2; exit 2; }
 # Qualified dependency references come from the overseer's park request.
 if [[ "$PARK_UNTIL_PR" =~ ^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([1-9][0-9]*)$ ]]; then
@@ -472,6 +488,15 @@ STATE_ARGS=()
 [[ -z "$STATE_DIR" ]] || STATE_ARGS=(--state-dir "$STATE_DIR")
 command -v jq >/dev/null 2>&1 || { message record-invalid "item=$ITEM" "field=jq" >&2; exit 1; }
 [[ -x "$WORKFLOW_STATE" ]] || { message record-invalid "item=$ITEM" "field=workflow-state" >&2; exit 1; }
+
+# Resolve and lock before the first record read. A replacement cannot change
+# this item's launch while its stop or start is in flight.
+lifecycle_path="$("$WORKFLOW_STATE" ${STATE_ARGS[@]+"${STATE_ARGS[@]}"} path oversee)" || exit 1
+lifecycle_key="${lifecycle_path%/*}/.lane-lifecycle/$ITEM.lock"
+source "$SCRIPT_DIR/lib/lane-relaunch.sh"
+if ! lane_lifecycle_owned "$lifecycle_key"; then
+  exec "$WORKFLOW_STATE" ${STATE_ARGS[@]+"${STATE_ARGS[@]}"} lane-run "$ITEM" -- "$0" "${ORIGINAL_ARGS[@]}"
+fi
 
 records="$($WORKFLOW_STATE ${STATE_ARGS[@]+"${STATE_ARGS[@]}"} get oversee '.lanes // []')" \
   || { message record-missing "item=$ITEM" >&2; exit 1; }
@@ -531,6 +556,11 @@ resolve_identity harness harness "$(record_field harness)" "$OPT_HARNESS"
 derive_identity tracker "$(lane_key_tracker "$ITEM")"
 tracker_source=given
 [[ "$DERIVE_IDENTITY_FILLED" -eq 0 ]] || tracker_source=derived
+
+if [[ "$PARK" == false && "$KEEP_SANDBOX" == false && "$TERMINAL_MODE" == close ]] &&
+    jq -e '(.parked.wait // (if .dependency_wait.outcome == "running" then null else .dependency_wait.wait end)) != null' <<<"$record" >/dev/null; then
+  message park-refused "item=$ITEM" reason=dependency-disposition-required >&2; exit 1
+fi
 
 case "$status" in
   done)
@@ -712,6 +742,9 @@ TRACKER_CAUSE=""
 ITEM_END=""
 tracker_terminal() {
   local value number state reason pr_repo pr_number pr_rows description checklist pending_pr=null
+  if jq -e '(.parked.wait // (if .dependency_wait.outcome == "running" then null else .dependency_wait.wait end)).kind != null' <<<"$record" >/dev/null; then
+    return 1
+  fi
   TRACKER_CAUSE=""
   if [[ "$TERMINAL_MODE" != close ]]; then
     # A resumed sandbox can be stopped or running while its PR is still open.
@@ -882,8 +915,17 @@ park_worktree_read() {
   PARK_SCRATCH=""
   return "$rc"
 }
+park_clean_judge() {
+  local clean
+  tracker_read clean env ORCH_LANE_HOST="$host" "$LANE_HOST" cat --item "$ITEM" "$mail_root/tmp/park-status.json" \
+    || { message park-refused "item=$ITEM" reason=clean-status-unread >&2; exit 1; }
+  jq -e --arg head "$PARK_HEAD" --arg branch "$PARK_BRANCH" \
+    '.head == $head and .branch == $branch and .porcelain == "" and (.at | type == "string" and length > 0)' <<<"$clean" >/dev/null \
+    || { message park-refused "item=$ITEM" reason=clean-status-invalid "branch-source=$PARK_BRANCH_SOURCE" >&2; exit 1; }
+}
+
 park_judge() {
-  local err view fields pr_state pr_head pr_branch armed merge_state queue queued out rc=0 kinds target clean target_repo connected
+  local err view fields pr_state pr_head pr_branch armed merge_state queue queued out rc=0 kinds target clean target_repo connected binding_record pending_asks published_head
   [[ -n "$host" ]] || { message park-refused "item=$ITEM" "reason=local" >&2; exit 1; }
   [[ -x "$LANE_HOST" ]] || { message record-invalid "item=$ITEM" "field=lane-host" >&2; exit 1; }
   err="$(mktemp)" || { message park-refused "item=$ITEM" "reason=provider-unsupported" "cause=stderr-unsaved" >&2; exit 1; }
@@ -898,6 +940,43 @@ park_judge() {
   if [[ -z "$PARK_REPO" ]]; then
     tracker_read PARK_REPO env -u GH_REPO -u GITHUB_REPOSITORY gh repo view --json nameWithOwner --jq .nameWithOwner \
       || { message park-refused "item=$ITEM" "reason=repo-unresolved" >&2; exit 1; }
+  fi
+  if [[ -n "$PARK_WAIT_FILE" ]]; then
+    PARK_WAIT="$(jq -ce '.' -- "$PARK_WAIT_FILE")" || {
+      message park-refused "item=$ITEM" reason=wait-unread >&2; exit 1;
+    }
+    binding_record="$(jq -c --argjson wait "$PARK_WAIT" '
+      if .sandbox_instance_id == null then .sandbox_instance_id=$wait.binding.sandbox_instance_id else . end' <<<"$record")" || exit 1
+    lane_wait_validate "$PARK_WAIT" "$binding_record" || {
+      message park-refused "item=$ITEM" "reason=$LANE_WAIT_CAUSE" >&2; exit 1;
+    }
+    # The provider has no proved dirty-work recovery contract. Keep the
+    # existing clean boundary and require a published recoverable head.
+    park_worktree_read || { message park-refused "item=$ITEM" reason=preservation-gap >&2; exit 1; }
+    lane_wait_instance "$PARK_WAIT" "$PARK_REPO" "$ITEM" || {
+      message park-refused "item=$ITEM" "reason=$LANE_WAIT_CAUSE" >&2; exit 1;
+    }
+    park_clean_judge
+    published_head="$(gh api "repos/$PARK_REPO/git/ref/heads/$PARK_BRANCH" --jq .object.sha)" || {
+      message park-refused "item=$ITEM" reason=published-head-unread >&2; exit 1;
+    }
+    [[ "$published_head" == "$PARK_HEAD" ]] || {
+      message park-refused "item=$ITEM" reason=unpublished-head >&2; exit 1;
+    }
+    if [[ "$(jq -r '.kind' <<<"$PARK_WAIT")" == account ]]; then
+      lane_wait_account "$PARK_WAIT" walled || {
+        message park-refused "item=$ITEM" "reason=$LANE_WAIT_CAUSE" >&2; exit 1;
+      }
+    fi
+    pending_asks="$(ORCH_LANE_HOST="$host" "$LANE_MAIL" pending --item "$ITEM" --root "$mail_root" --host)" || {
+      message park-refused "item=$ITEM" reason=mail-unread >&2; exit 1;
+    }
+    pending_asks="$(jq -Rsc 'split("\n") | map(select(length > 0) | fromjson | select(.kind == "ask") | .id)' <<<"$pending_asks")" || exit 1
+    "$WORKFLOW_STATE" ${STATE_ARGS[@]+"${STATE_ARGS[@]}"} update oversee \
+      --arg item "$ITEM" --argjson wait "$PARK_WAIT" --argjson asks "$pending_asks" \
+      --arg head "$PARK_HEAD" --arg branch "$PARK_BRANCH" --arg repo "$PARK_REPO" --arg own_pr "$PARK_PR" \
+      '(.lanes[] | select(.item == $item)) |= (.sandbox_instance_id=$wait.binding.sandbox_instance_id | .parked = ({wait:$wait,pending_asks:$asks,head:$head,branch:$branch,repo:$repo,phase:"admitted"} + (if $own_pr == "" then {} else {pr:($own_pr|tonumber)} end)))' >/dev/null || exit 1
+    return 0
   fi
   target_repo="${PARK_UNTIL_REPO:-$PARK_REPO}"
   if [[ -n "$PARK_UNTIL_REPO" ]]; then
@@ -936,11 +1015,7 @@ park_judge() {
     [[ "$pr_head" == "$PARK_HEAD" ]] \
       || { message park-refused "item=$ITEM" reason=pr-head-mismatch "pr=$PARK_PR" "branch-source=$PARK_BRANCH_SOURCE" >&2; exit 1; }
   fi
-  tracker_read clean env ORCH_LANE_HOST="$host" "$LANE_HOST" cat --item "$ITEM" "$mail_root/tmp/park-status.json" \
-    || { message park-refused "item=$ITEM" reason=clean-status-unread >&2; exit 1; }
-  jq -e --arg head "$PARK_HEAD" --arg branch "$PARK_BRANCH" \
-    '.head == $head and .branch == $branch and .porcelain == "" and (.at | type == "string" and length > 0)' <<<"$clean" >/dev/null \
-    || { message park-refused "item=$ITEM" reason=clean-status-invalid "branch-source=$PARK_BRANCH_SOURCE" >&2; exit 1; }
+  park_clean_judge
   # Dependency admission does not judge the other lane's queue or reviews.
   [[ -z "$PARK_UNTIL_PR" ]] || return 0
   # Queue membership is GraphQL's alone: gh pr view exposes no field for it,
@@ -981,6 +1056,15 @@ park_judge() {
 PARK_LINE_RE='^sandbox-stopped item=[^ ]+$'
 park_sandbox() {
   local out err rc=0 at fields=("item=$ITEM" "pr=$PARK_PR")
+  if [[ -n "$PARK_WAIT_FILE" ]]; then
+    # The provider stop has retired the writers. Keep their final Git head,
+    # and record stopped before a sandbox stop can fail or lose its answer.
+    update_status stopped || exit 1
+    park_worktree_read || { message park-failed "item=$ITEM" cause=preservation-gap >&2; exit 1; }
+    "$WORKFLOW_STATE" ${STATE_ARGS[@]+"${STATE_ARGS[@]}"} update oversee \
+      --arg item "$ITEM" --arg head "$PARK_HEAD" --arg branch "$PARK_BRANCH" \
+      '(.lanes[] | select(.item == $item)).parked |= (.head=$head | .branch=$branch | .phase="stop-pending")' >/dev/null || exit 1
+  fi
   [[ -z "$PARK_UNTIL_PR" ]] || fields+=("until-pr=$PARK_UNTIL_PR")
   err="$(mktemp)" || { message park-failed "${fields[@]}" "cause=stderr-unsaved" >&2; exit 1; }
   out="$(ORCH_LANE_HOST="$host" "$LANE_HOST" stop-sandbox --item "$ITEM" 2>"$err")" || rc=$?
@@ -989,12 +1073,24 @@ park_sandbox() {
   if [[ "$rc" -ne 0 || ! "$out" =~ $PARK_LINE_RE || "$out" != *"item=$ITEM" ]]; then
     [[ "$status" == stopped ]] || update_status stopped \
       || { message state-write-failed "item=$ITEM" "status=stopped" >&2; exit 1; }
+    if [[ -n "$PARK_WAIT_FILE" ]]; then
+      "$WORKFLOW_STATE" ${STATE_ARGS[@]+"${STATE_ARGS[@]}"} update oversee --arg item "$ITEM" --arg cause "$([[ "$rc" -eq 0 ]] && printf answer-unparsed || printf provider)" --argjson exit "$rc" '
+        (.lanes[] | select(.item == $item)).parked |= (.phase="stop-unconfirmed" | .failure={cause:$cause,exit:$exit,at:(now|strftime("%Y-%m-%dT%H:%M:%SZ"))})' >/dev/null || exit 1
+    fi
     [[ "$rc" -ne "$LANE_HOST_BUSY_EXIT" ]] || { message lane-host-busy "${fields[@]}" step=stop-sandbox >&2; exit "$rc"; }
     if [[ "$rc" -ne 0 ]]; then message park-failed "${fields[@]}" "cause=provider" "status=$rc" >&2
     else message park-failed "${fields[@]}" "cause=answer-unparsed" >&2; fi
     exit 1
   fi
   at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ -n "$PARK_WAIT_FILE" ]]; then
+    "$WORKFLOW_STATE" ${STATE_ARGS[@]+"${STATE_ARGS[@]}"} update oversee \
+      --arg item "$ITEM" --arg at "$at" --arg pr "$PARK_PR" \
+      '(.lanes[] | select(.item == $item)) |= (.status="parked" | .parked.at=$at | .parked.phase="stopped"
+        | if $pr == "" then . else .parked.pr=($pr|tonumber) end)' >/dev/null || exit 1
+    message parked "item=$ITEM" "head=$PARK_HEAD" "wait=$(jq -r .kind <<<"$PARK_WAIT")" status=parked
+    exit 0
+  fi
   "$WORKFLOW_STATE" ${STATE_ARGS[@]+"${STATE_ARGS[@]}"} update oversee \
     --arg item "$ITEM" --arg pr "$PARK_PR" --arg until "$PARK_UNTIL_PR" --arg until_repo "$PARK_UNTIL_REPO" --arg head "$PARK_HEAD" --arg repo "$PARK_REPO" --arg at "$at" \
     'if any(.lanes[]; .item == $item) then (.lanes[] | select(.item == $item)) |= (.status = "parked" | .parked = ({head: $head, repo: $repo, at: $at} + (if $pr == "" then {} else {pr: ($pr | tonumber)} end) + (if $until == "" then {} else {until_pr: ($until | tonumber)} end) + (if $until_repo == "" then {} else {until_repo: $until_repo} end)) | del(.pending_pr)) else error("lane record disappeared") end' \
@@ -1196,7 +1292,7 @@ if [[ "$status" == stopped ]]; then
     tracker_rc=0
     [[ -n "$ITEM_END" ]] || tracker_terminal || tracker_rc=$?
   fi
-  [[ "$tracker_rc" -eq 0 ]] || refuse_unanswered_ask
+  [[ "$tracker_rc" -eq 0 || -n "$PARK_WAIT_FILE" ]] || refuse_unanswered_ask
   if [[ "$PARK" == true ]]; then
     park_judge
     park_sandbox
@@ -1525,7 +1621,7 @@ stop_and_await_exit() {
     claude|codex|pi|copilot) ;;
     *) message harness-unsupported "item=$ITEM" "harness=${harness:-unknown}" >&2; exit 1 ;;
   esac
-  refuse_unanswered_ask
+  [[ -n "$PARK_WAIT_FILE" ]] || refuse_unanswered_ask
   close_secs="${ORCH_LANE_CLOSE_SECS:-15}"
   [[ "$close_secs" =~ ^[1-9][0-9]*$ ]] \
     || { message record-invalid "item=$ITEM" "field=ORCH_LANE_CLOSE_SECS" >&2; exit 1; }
@@ -1534,6 +1630,10 @@ stop_and_await_exit() {
     if command -v "$candidate" >/dev/null 2>&1; then close_bound="$candidate"; break; fi
   done
   stop_harness
+  if [[ -n "$PARK_WAIT_FILE" ]]; then
+    "$WORKFLOW_STATE" ${STATE_ARGS[@]+"${STATE_ARGS[@]}"} update oversee --arg item "$ITEM" '
+      (.lanes[] | select(.item == $item)) |= (.status="stopped" | .parked.phase="harness-retired")' >/dev/null || exit 1
+  fi
   [[ "$STOP_SKIPPED" == false && -n "$pane_id" ]] || finish_close
   await_pane_exit \
     || { message exit-timeout "item=$ITEM" "harness=$harness" "pane=$pane_id" "processes=$STOPPED_COUNT" ${STOP_IDENTITY:+"identity=$STOP_IDENTITY"} >&2; exit 1; }
