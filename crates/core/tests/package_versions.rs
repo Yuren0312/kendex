@@ -55,6 +55,28 @@ fn commit(dir: &Path, message: &str) -> String {
 }
 
 #[allow(clippy::unwrap_used)]
+fn commit_tracked(dir: &Path, message: &str) -> String {
+    git(
+        dir,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "--all",
+            "-m",
+            message,
+        ],
+    );
+    let output = Hardened::git(&["rev-parse", "HEAD"], Some(dir))
+        .run()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[allow(clippy::unwrap_used)]
 fn write_skill(dir: &Path, name: &str, body: &str) {
     let skill = dir.join("skills").join(name);
     fs::create_dir_all(&skill).unwrap();
@@ -786,7 +808,7 @@ fn history_projection_matches_first_parent_literal_and_bounded_timeline() {
     }
     for index in 0..200 {
         write_skill(&w.upstream, "[literal]", &format!("Change {index}."));
-        tip = commit(&w.upstream, "change");
+        tip = commit_tracked(&w.upstream, "change");
     }
     let complete = history::subtree_log(&mirror, &tip, rel).unwrap();
     assert_eq!(complete.len(), 200);
