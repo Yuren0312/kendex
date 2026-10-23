@@ -43,7 +43,11 @@ export interface Harness {
 }
 
 export function createHarness(env: { childAgent?: string; childPane?: string; tmuxPane?: string }): Harness {
-	const cwd = mkdtempSync(join(tmpdir(), "pi-agents-child-title-"));
+	const stack = new Error().stack ?? "";
+	const caller = stack.match(/[/\\]([^/\\\n]+)\.test\.ts:(\d+):\d+/)
+		?? stack.split("\n").slice(2).join("\n").match(/[/\\]([^/\\\n]+)\.ts:(\d+):\d+/);
+	const owner = (caller?.[1] ?? "extension-fixture").replace(/[^a-zA-Z0-9-]/g, "-");
+	const cwd = mkdtempSync(join(tmpdir(), `pi-agents-child-title-${owner}-L${caller?.[2] ?? "unknown"}-`));
 	const piUserDir = join(cwd, ".pi-agent-home");
 	mkdirSync(piUserDir, { recursive: true });
 	const previousEnv = {
