@@ -12,6 +12,7 @@
 
 set -euo pipefail
 environment_registry_active=""
+environment_refusal=(environment-read)
 
 # The reported private file is checked as text, without opening it or
 # evaluating submitted expansions. Filtering cannot make that read safe.
@@ -236,6 +237,12 @@ environment_producer() { # command kind, optional unsupported context and comman
     fi
     # No unresolved arm can discharge the forwarded classification check.
     if [ "$mode" = other ] && [ -n "${forwarded_argument:-}" ]; then mode=unclassified-forwarded; fi
+    if { [ "$mode" = other ] || [ "$mode" = unclassified-forwarded ]; } &&
+       [ -n "$program_pos" ] && [ "${arg_kinds[$program_pos]}" = literal ] &&
+       environment_main_evidence --head "${arg_expansions[$program_pos]}"; then
+      mode=dump-unknown
+      environment_refusal=(expanded-head "${args[$program_pos]}")
+    fi
 }
 
 # An argument role requires an executable head. Reserved-word syntax and
@@ -1178,9 +1185,6 @@ environment_dump() { # command kind; arguments are already decoded data
       for ((j=program_pos+1; j<${#args[@]}; j++)); do arg_roles[j]=argument; done
     fi
     environment_program_text
-    if { [ "$mode" = other ] || [ "$mode" = unclassified-forwarded ]; } &&
-       [ -n "$program_pos" ] && [ "${arg_kinds[$program_pos]}" = literal ] &&
-       environment_main_evidence --head "${arg_expansions[$program_pos]}"; then mode=dump-unknown; fi
     # Preserve main's known-dump evidence for brace arguments without giving
     # those arguments executable roles or applying the head expansion rule.
     for ((j=pos; j<${#args[@]}; j++)); do
@@ -1315,9 +1319,6 @@ environment_dump() { # command kind; arguments are already decoded data
         program=""; pos=0; mode=other; producer_end=0; program_pos=""
         environment_producer shell "$scan"
         environment_program_text
-        if { [ "$mode" = other ] || [ "$mode" = unclassified-forwarded ]; } &&
-           [ -n "$program_pos" ] && [ "${arg_kinds[$program_pos]}" = literal ] &&
-           environment_main_evidence --head "${arg_expansions[$program_pos]}"; then mode=dump-unknown; fi
         [ -z "$stdin_program" ] || stage_stdin[stage]=1
         case "$mode" in dump-*) return 0 ;; esac
         if [ "$candidate" -gt "$((script_pos + 1))" ] && [ -z "$output" ] &&
@@ -1388,7 +1389,10 @@ environment_dump() { # command kind; arguments are already decoded data
       done
       [ -n "$found" ] || continue
       # An empty body is readable too; store its presence independently.
-      [ "${write_states[$write]}" = readable ] || return 0
+      [ "${write_states[$write]}" = readable ] || {
+        environment_refusal=(unread-write "${write_targets[$write]}")
+        return 0
+      }
       local command_text=${write_bodies[$write]}
       # A body is an independent submitted shell program, not another write
       # in this submission's registry. Its own source checks still recurse.
@@ -1452,10 +1456,19 @@ refuse() { # KEY VALUE [CAUSE]
       settings=invalid-pattern) echo "COMMAND_SAFETY_DENY_PATTERN is not a readable POSIX ERE" ;;
       refused=policy) echo "the command text matches this project's COMMAND_SAFETY_DENY_PATTERN" ;;
       refused=environment-dump)
-        echo "the command contains a recognized private-file read or a whole-environment read without a proven direct named-variable filter"
-        echo "for named non-secret settings, use orch-env NAME DEFAULT; do not read or filter the private file"
-        echo "for actual environment producers, read named variables, for example: systemctl --user show-environment | grep '^NAME='"
-        echo "nested or unsupported environment routing can refuse conservatively; use the direct filtered form for environment producers" ;;
+        case "${environment_refusal[0]}" in
+          unread-write)
+            printf 'the submitted command may execute written file [%s], whose contents could not be established from this submission\n' "${environment_refusal[1]}"
+            echo "use a literal cat heredoc so the submitted contents can be checked, or write and run the file in separate submissions" ;;
+          expanded-head)
+            printf 'the executable word [%s] contains expansion that could select an environment producer\n' "${environment_refusal[1]}"
+            echo "use a literal executable name; for environment producers, use a direct named-variable filter" ;;
+          environment-read)
+            echo "the command contains a recognized private-file read or a whole-environment read without a proven direct named-variable filter"
+            echo "for named non-secret settings, use orch-env NAME DEFAULT; do not read or filter the private file"
+            echo "for actual environment producers, read named variables, for example: systemctl --user show-environment | grep '^NAME='"
+            echo "nested or unsupported environment routing can refuse conservatively; use the direct filtered form for environment producers" ;;
+        esac ;;
       refused=default-policy)
         echo "the command text sets a systemd-run MemoryMax= or MemoryHigh= cap in kilobytes or megabytes, which the hook's default COMMAND_SAFETY_DENY_PATTERN refuses: a cgroup starved by a cap that small can fail a kernel allocation and leave the host's root volume read-only"
         echo "run it with no memory cap, or with a cap in gigabytes; text that only mentions such a cap goes in a file, because matching reads the command text"

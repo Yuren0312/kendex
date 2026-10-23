@@ -1487,13 +1487,6 @@ ENVIRONMENT_ROWS
       printf 'FAIL %s: exit=%s expected=%s first=%s expected-first=%s stdout=[%s]\n' "$label" "$status" "$expected" "$first_key" "$want" "$output"
       failed=$((failed + 1))
     fi
-    if [ "$expected" -eq 2 ]; then
-      if grep -F -- "systemctl --user show-environment | grep '^NAME='" "$scratch/stderr" >/dev/null; then
-        passed=$((passed + 1))
-      else
-        printf 'FAIL %s remedy: missing required filtered form\n' "$label"; failed=$((failed + 1))
-      fi
-    fi
   done <<<"$rows"
   selection_complete
   [ "$((passed + failed))" -gt "$before" ] || { echo 'FAIL environment table has no rows'; failed=$((failed + 1)); }
@@ -1540,11 +1533,11 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "no-check" { swap("if environment_dump \"$command_kind\"; then", "if false; then") }
       defect == "private-path" { swap("environment_private_path() {", "environment_private_path() { return 1") }
       defect == "main-evidence-cut" { swap("[[ ! $evidence =~ $opaque_re ]] || return 0", ":") }
-      defect == "expanded-head" && /^       environment_main_evidence/ { swap("environment_main_evidence --head \"${arg_expansions[$program_pos]}\"; then mode=dump-unknown; fi", "false; then mode=dump-unknown; fi") }
+      defect == "expanded-head" && /^       environment_main_evidence --head/ { swap("; then", "; then :; elif false; then") }
       defect == "expansion-origin-cut" { swap("then expansion=$expansion$span", "then expansion=$expansion") }
       defect == "expansion-quote-mask" { swap("else expansion=$expansion'\'' '\''; fi", "else expansion=$expansion$span; fi") }
       defect == "written-reference" { swap("command_receivers[owner]=$receiver;", "command_receivers[owner]=data;") }
-      defect == "written-unread" { swap("[ \"${write_states[$write]}\" = readable ] || return 0", "[ \"${write_states[$write]}\" = readable ] || continue") }
+      defect == "written-unread" { swap("[ \"${write_states[$write]}\" = readable ] || {", "[ \"${write_states[$write]}\" = readable ] || continue; false && {") }
       defect == "identity-role" && /^        unset/ { swap("unset '\''closers[n]'\'' '\''nesting[n]'\''", "unset '\''closers[n]'\'' '\''nesting[n]'\''; command_id=$command_count; command_count=$((command_count + 1)); word=; kind=literal; active=") }
       defect == "identity-owner" && /write_targets\[write\]=\$target/ { swap("write_owners[write]=$owner", "write_owners[write]=-1") }
       defect == "heredoc-data-role" { swap("command_domains[0]=data", "command_domains[0]=command") }
@@ -1665,6 +1658,7 @@ identity-owner|FAIL environment: written-same-command-own-output: exit=2 expecte
 heredoc-data-role|FAIL environment: written-heredoc-data-role: exit=2 expected=0
 expanded-head|FAIL environment: expanded-head-brace-env: exit=0 expected=2
 expanded-head|FAIL environment: expanded-head-glob-printenv: exit=0 expected=2
+expanded-head|FAIL environment: expanded-head-forwarded-mixed-glob: exit=0 expected=2
 expansion-origin-cut|FAIL environment: expanded-head-mixed-prefix-glob: exit=0 expected=2
 expansion-quote-mask|FAIL environment: quoted-glob-head-data: exit=2 expected=0
 receiver-named-method|FAIL environment: receiver-jarvis-config-named-method: exit=2 expected=0
