@@ -3,14 +3,15 @@
 # name: command-safety
 # event: PreToolUse
 # matcher: Bash
-# description: On harnesses that execute hooks, refuse cat reads of the known ~/.fleet/env spellings. Refuse recognized whole-environment reads unless a proven direct pipe filters named variables. This fixed check runs outside Git and before project policy. Nested dumps and unsupported routing can refuse conservatively. It reads submitted text, not unseen programs, aliases or runtime-built commands. COMMAND_SAFETY_DENY_PATTERN replaces only the default systemd-run memory-cap pattern; `^$` disables only that project-pattern check.
+# description: On harnesses that execute hooks, refuse cat reads of the known ~/.fleet/env spellings. Refuse recognized whole-environment reads unless a proven direct pipe filters named variables. Refuse expanded executable heads and possibly executed written scripts with dump evidence or unread contents within one submission. This fixed check runs outside Git and before project policy. Nested dumps and unsupported routing can refuse conservatively. It reads submitted text, not existing files or unseen programs. COMMAND_SAFETY_DENY_PATTERN replaces only the default systemd-run memory-cap pattern; `^$` disables only that project-pattern check.
 # summary: Refuses cat reads of the known private environment file and offers the named non-secret settings reader. Refuses recognized whole-environment command text and gives a filter that names a variable. Also applies the project deny pattern or the default systemd-run memory-cap rule. Unreadable payloads warn and allow the call; unreadable policy support affects only the pattern check.
-# safety: Classify literal command producers and the program receiving inline code or registered heredoc input. Shells retain shell parsing, known interpreters use language-specific whole-environment evidence, literal cat bodies retain their data contract, and unknown receivers retain conservative shell-word detection. Unquoted body expansions are checked independently, and unsupported forwarded contexts retain conservative refusal. Known private-file cat reads cannot be filtered into permission. Only proven direct named-variable filters grant environment-producer dump permission; project-pattern matching remains independent and reads the submitted text. Unseen programs and runtime-built names are outside this text check; unreadable payloads or policy support warn and allow their affected check. Every diagnostic starts with command-safety: <key>=<value>.
+# safety: One command record retains executable, word and redirect roles through substitutions; actual child commands are checked independently. Classify producers and receivers once before recursive source checks. Shells retain shell parsing, known interpreters use language-specific whole-environment evidence, literal cat bodies retain their data contract, and unknown receivers retain conservative shell-word detection. Within one submission, distinct shell references and unresolved executable contexts trigger shell judgment of recorded writes; matched unread contents refuse, and readable bodies stay independent. No file is read and no cross-submission registry exists. Unquoted body expansions are checked independently, and unsupported forwarded contexts retain conservative refusal. Known private-file cat reads cannot be filtered into permission. Only proven direct named-variable filters grant environment-producer dump permission; project-pattern matching remains independent and reads the submitted text. Unreadable payloads or policy support warn and allow their affected check. Every diagnostic starts with command-safety: <key>=<value>.
 # timeout: 10
 # requires-skills: [commit-guards]
 # ---
 
 set -euo pipefail
+environment_registry_active=""
 
 # The reported private file is checked as text, without opening it or
 # evaluating submitted expansions. Filtering cannot make that read safe.
@@ -40,7 +41,7 @@ environment_producer() { # command kind, optional unsupported context and comman
       # Refuse rather than permit an encoded environment producer.
       [ "${arg_kinds[$pos]}" != ansi-escaped ] || { mode=dump-unknown; return; }
       [ "${arg_kinds[$pos]}" != dollar-literal ] || arg_kinds[pos]=literal
-      [ "${arg_kinds[$pos]}" = literal ] || break
+      [ "${arg_kinds[$pos]}" = literal ] || { program_pos=$pos; program=""; break; }
       program_pos=$pos; program=${args[$pos]##*/}; pos=$((pos + 1))
       case "$program" in
         exec | builtin)
@@ -285,11 +286,18 @@ environment_head() { # command kind; updates pos, syntax_head and arg_roles
 # The directed cuts retain main's text test where executable evidence is
 # unproved. This grants no argument, body-data or direct-filter permission.
 environment_main_evidence() {
-  local value evidence continuation=$'\\\n'
+  local value evidence head="" continuation=$'\\\n'
   local opaque_re='(^|[^A-Za-z0-9_.-])(env|printenv|export|declare|typeset|show-environment)([^A-Za-z0-9_.-]|$)|(^|[^A-Za-z0-9_-])set([^A-Za-z0-9_-]|$)|/proc/[^[:space:]]*/environ'
+  if [ "${1:-}" = --head ]; then head=1; shift; fi
   for value in "$@"; do
     evidence=${value//"$continuation"/}
     evidence=${evidence//[\'\"\\]/}
+    if [ -n "$head" ]; then
+      case "$evidence" in
+        *[\*\?]* | *'['*']'* | *'{'*','*'}'* | *'{'*'..'*'}'*) return 0 ;;
+      esac
+      continue
+    fi
     [[ ! $evidence =~ $opaque_re ]] || return 0
   done
   return 1
@@ -804,18 +812,32 @@ environment_program_text() {
 }
 
 environment_dump() { # command kind; arguments are already decoded data
-  local LC_ALL=C i=0 c next quote="" word="" active="" kind=literal compound="" bare=1 quoted=""
+  local LC_ALL=C i=0 c next quote="" word="" expansion="" active="" kind=literal compound="" bare=1 quoted=""
   local j start=0 end n fd redirection_kind target proc output input_redirect input_escaped pos program value named flags
   local mode pattern_count pattern filter_ok stage=0 text text_length span span_re comment_span options_ended null_output syntax_head program_pos stdin_program source_pos data_source piped_source="" pipeline="" heredoc_input=${heredoc_input:-}
   local receiver receiver_pattern receiver_option receiver_named
   local unsupported="" scan candidate limit producer_end code incoming_sources="" file_output file_body redirect_evidence head_start main_start script_pos forwarded_argument=""
-  local heredoc_op="" heredoc_origin delimiter line remaining doc body found math_depth=0 needs_target="" main_text main_required="" body_start body_end
+  local heredoc_op="" heredoc_origin delimiter line remaining doc body found needs_target="" main_text main_required="" body_start body_end
   local name_re='^[A-Za-z_][A-Za-z0-9_]*(=.*)?$'
   local filter_re='^([A-Za-z_][A-Za-z0-9_]*=?|\^[A-Za-z_][A-Za-z0-9_]*=|\^\([A-Za-z_][A-Za-z0-9_]*(\|[A-Za-z_][A-Za-z0-9_]*)+\)=)$'
   local ordinary_span_re=$'^[^\'"\\\\$`# \t\r\n;|()<>&]+'
   local single_span_re="^[^']+" ansi_span_re="^[^'\\\\]+" double_span_re='^[^"\\$`]+' comment_span_re=$'^[^\n]+'
   local tokens=() kinds=() unquoted_words=() saved_quotes=() closers=() args=() arg_kinds=() arg_unquoted=() arg_roles=() stage_roles=() stage_args=() stage_kinds=() stage_unquoted=() heredocs=() heredoc_tabs=() heredoc_expand=() heredoc_bodies=() heredoc_starts=() body_ids=() stage_sources=() stage_stdin=() executable_texts=() executable_stages=()
   local body_decisions=()
+  local command_id=0 command_count=1 owner record index redirect write reference
+  local token_commands=() expansion_words=() arg_expansions=() stage_expansions=()
+  local command_domains=()
+  local record_first=() record_last=() token_next=()
+  local saved_commands=() saved_words=() saved_expansions=() saved_kinds=() saved_bare=() saved_quoted=() saved_targets=() nesting=() arithmetic_levels=()
+  local ordered_tokens=() ordered_kinds=() ordered_unquoted=() ordered_expansions=() ordered_bodies=()
+  local command_writes=()
+  local registry_root="" command_offset
+  if [ -z "${environment_registry_active:-}" ]; then
+    local environment_registry_active=1 command_serial=0
+    local write_owners=() write_targets=() write_kinds=() write_bodies=() write_states=()
+    local reference_owners=() reference_targets=() reference_kinds=() command_receivers=() command_unresolved=()
+    registry_root=1
+  fi
   local private_inputs=()
   local starts=() ends=() separators=() decisions=() literal_inputs=() input_bodies=() file_outputs=() executable_contexts=()
   if [ "${2:-}" = forwarded ]; then
@@ -827,9 +849,9 @@ environment_dump() { # command kind; arguments are already decoded data
   [ "${2:-}" != conservative ] || compound=1
   if [ "$1" = argv ]; then
     tokens=(${command_argv[@]+"${command_argv[@]}"})
-    for ((i=0; i<${#tokens[@]}; i++)); do kinds[i]=literal; unquoted_words[i]=""; done
+    for ((i=0; i<${#tokens[@]}; i++)); do kinds[i]=literal; unquoted_words[i]=""; token_commands[i]=0; expansion_words[i]=""; done
   else
-    [ "$1" != expansions ] || quote='"'
+    if [ "$1" = expansions ]; then quote='"'; command_domains[0]=data; fi
     text=$command_text
     text_length=${#text}
     while [ "$i" -lt "$text_length" ]; do
@@ -838,12 +860,14 @@ environment_dump() { # command kind; arguments are already decoded data
         "'") span_re=$single_span_re ;;
         ansi) span_re=$ansi_span_re ;;
         '"') span_re=$double_span_re ;;
+        arithmetic) span_re='^[^$()`]+' ;;
         *) span_re=$ordinary_span_re ;;
       esac
       # Copy literal spans once. Marker handlers keep the quote and routing
       # decisions; growing a word byte by byte exceeds the hook budget.
       if [[ ${text:$i} =~ $span_re ]]; then
         span=${BASH_REMATCH[0]}; word=$word$span; active=1
+        if [ -z "$quote" ]; then expansion=$expansion$span; else expansion=$expansion' '; fi
         i=$((i + ${#span}))
         continue
       fi
@@ -851,13 +875,13 @@ environment_dump() { # command kind; arguments are already decoded data
       if [ "$quote" = ansi ]; then
         case "$c" in
           "'") quote="" ;;
-          '\') kind=ansi-escaped; word=$word$c$next; i=$((i + 1)) ;;
-          *) word=$word$c ;;
+          '\') kind=ansi-escaped; word=$word$c$next; expansion=$expansion'  '; i=$((i + 1)) ;;
+          *) word=$word$c; expansion=$expansion' ' ;;
         esac
         continue
       fi
       if [ "$quote" = "'" ]; then
-        if [ "$c" = "'" ]; then quote=""; else word=$word$c; fi
+        if [ "$c" = "'" ]; then quote=""; else word=$word$c; expansion=$expansion' '; fi
         continue
       fi
       if [ "$c" = '\' ]; then
@@ -867,31 +891,50 @@ environment_dump() { # command kind; arguments are already decoded data
         if [ "$quote" = '"' ]; then
           case "$next" in '"' | '\' | '$' | '`' | $'\n') ;; *) word=$word$c ;; esac
         fi
-        [ "$next" = $'\n' ] || { word=$word$next; active=1; }
+        [ "$next" = $'\n' ] || { word=$word$next; expansion=$expansion' '; active=1; }
         continue
       fi
-      # A substitution's known producer must remain visible inside double
-      # quotes. Saving only the enclosing quote grants no inner permission.
+      # A child command has its own record. The enclosing word, including a
+      # pending redirect operand, resumes without treating child output as text.
+      n=${#closers[@]}
+      if [ "$n" -gt 0 ] && [ "${nesting[$((n - 1))]:-}" = substitution ] &&
+         [ "$c" = "${closers[$((n - 1))]}" ] && [ -z "$quote" ]; then
+        if [ -n "$active" ]; then token_commands[${#tokens[@]}]=$command_id; expansion_words[${#tokens[@]}]=$expansion; unquoted_words[${#tokens[@]}]=$bare; tokens[${#tokens[@]}]=$word; kinds[${#kinds[@]}]=$kind; fi
+        token_commands[${#tokens[@]}]=$command_id; expansion_words[${#tokens[@]}]=""; unquoted_words[${#tokens[@]}]=""; tokens[${#tokens[@]}]=';'; kinds[${#kinds[@]}]=operator
+        n=$((n - 1)); command_id=${saved_commands[$n]}; quote=${saved_quotes[$n]}
+        word=${saved_words[$n]}; expansion=${saved_expansions[$n]}; kind=${saved_kinds[$n]}
+        bare=${saved_bare[$n]}; quoted=${saved_quoted[$n]}; needs_target=${saved_targets[$n]}; active=1
+        unset 'closers[n]' 'nesting[n]'
+        continue
+      fi
+      if [ "$c" = '$' ] && [ "$next" = '(' ] && [ "${text:$((i + 1)):1}" = '(' ]; then
+        saved_quotes[n]=$quote; closers[n]=arithmetic; nesting[n]=arithmetic; arithmetic_levels[n]=1
+        quote=arithmetic; word=$word'$(('; expansion=$expansion' '; kind=unknown; active=1; i=$((i + 2))
+        continue
+      fi
       if { [ "$c" = '$' ] && [ "$next" = '(' ]; } || [ "$c" = '`' ]; then
-        if [ -n "$active" ]; then unquoted_words[${#tokens[@]}]=$bare; tokens[${#tokens[@]}]=$word; kinds[${#kinds[@]}]=$kind; fi
-        word=""; active=""; kind=literal; bare=1; quoted=""; compound=1; needs_target=""
-        n=${#closers[@]}
-        if [ "$c" = '`' ] && [ "$n" -gt 0 ] && [ "${closers[$((n - 1))]}" = '`' ]; then
-          quote=${saved_quotes[$((n - 1))]}; unset 'closers[n-1]' 'saved_quotes[n-1]'
-        else
-          saved_quotes[n]=$quote; quote=""
-          if [ "$c" = '$' ]; then
-            [ "${text:$((i + 1)):1}" != '(' ] || math_depth=$((n + 1))
-            closers[n]=')'; i=$((i + 1))
-          else closers[n]='`'; fi
-        fi
-        [ -z "$quote" ] || bare=""
-        unquoted_words[${#tokens[@]}]=""
-        tokens[${#tokens[@]}]=';'; kinds[${#kinds[@]}]=operator
+        saved_commands[n]=$command_id; saved_quotes[n]=$quote; saved_words[n]=$word'$(...)'
+        saved_expansions[n]=$expansion' '; saved_kinds[n]=unknown; saved_bare[n]=$bare
+        saved_quoted[n]=$quoted; saved_targets[n]=$needs_target; nesting[n]=substitution
+        if [ "$c" = '$' ]; then closers[n]=')'; i=$((i + 1)); else closers[n]='`'; fi
+        command_id=$command_count; command_count=$((command_count + 1))
+        word=""; expansion=""; active=""; kind=literal; bare=1; quoted=""; quote=""; needs_target=""; compound=1
+        continue
+      fi
+      if [ "$quote" = arithmetic ]; then
+        n=$((n - 1)); word=$word$c
+        case "$c" in
+          '(') arithmetic_levels[n]=$((arithmetic_levels[n] + 1)) ;;
+          ')')
+            arithmetic_levels[n]=$((arithmetic_levels[n] - 1))
+            if [ "${arithmetic_levels[$n]}" -eq 0 ] && [ "$next" = ')' ]; then
+              word=$word')'; i=$((i + 1)); quote=${saved_quotes[$n]}; unset 'closers[n]' 'nesting[n]'
+            fi ;;
+        esac
         continue
       fi
       if [ "$quote" = '"' ]; then
-        if [ "$c" = '"' ] && { [ "$1" != expansions ] || [ "${#closers[@]}" -ne 0 ]; }; then quote=""; else word=$word$c; [ "$c" != '$' ] || [ "$kind" = ansi-escaped ] || kind=unknown; fi
+        if [ "$c" = '"' ] && { [ "$1" != expansions ] || [ "${#closers[@]}" -ne 0 ]; }; then quote=""; else word=$word$c; expansion=$expansion' '; [ "$c" != '$' ] || [ "$kind" = ansi-escaped ] || kind=unknown; fi
         continue
       fi
       case "$c" in
@@ -934,17 +977,16 @@ environment_dump() { # command kind; arguments are already decoded data
             active=""
           fi
           if [ -n "$active" ]; then
-            unquoted_words[${#tokens[@]}]=$bare; tokens[${#tokens[@]}]=$word; kinds[${#kinds[@]}]=$kind
+            token_commands[${#tokens[@]}]=$command_id; expansion_words[${#tokens[@]}]=$expansion; unquoted_words[${#tokens[@]}]=$bare; tokens[${#tokens[@]}]=$word; kinds[${#kinds[@]}]=$kind
             needs_target=""
           fi
-          word=""; active=""; kind=literal; bare=1; quoted=""
+          word=""; expansion=""; active=""; kind=literal; bare=1; quoted=""
           case "$c" in ' ' | $'\t' | $'\r') continue ;; esac
           case "$c" in
-            '(') compound=1; n=${#closers[@]}; saved_quotes[n]=""; closers[n]=')'; c=';' ;;
+            '(') compound=1; n=${#closers[@]}; saved_quotes[n]=""; closers[n]=')'; nesting[n]=group; c=';' ;;
             ')')
               compound=1; n=${#closers[@]}
-              if [ "$n" -gt 0 ]; then quote=${saved_quotes[$((n - 1))]}; unset 'closers[n-1]' 'saved_quotes[n-1]'; fi
-              [ "${#closers[@]}" -ge "$math_depth" ] || math_depth=0
+              if [ "$n" -gt 0 ]; then quote=${saved_quotes[$((n - 1))]}; unset 'closers[n-1]' 'nesting[n-1]'; fi
               [ -z "$quote" ] || bare=""
               c=';' ;;
             $'\n')
@@ -973,23 +1015,21 @@ environment_dump() { # command kind; arguments are already decoded data
               esac
               if [ "$c" = '&>' ] && [ "${text:$i:1}" = '>' ]; then c=$c'>'; i=$((i + 1)); fi
               if [ "$c" = '<<' ] && [ "${text:$i:1}" = '<' ]; then c='<<<'; i=$((i + 1)); fi
-              if [ "$c" = '<<' ] && [ "$math_depth" -eq 0 ]; then
+              if [ "$c" = '<<' ]; then
                 compound=1
                 if [ "${text:$i:1}" = - ]; then c='<<-'; i=$((i + 1)); fi
                 heredoc_op=$c; heredoc_origin=${#tokens[@]}
               fi ;;
           esac
-          unquoted_words[${#tokens[@]}]=""; tokens[${#tokens[@]}]=$c
-          if [ "$c" = '<<' ] && [ "$math_depth" -ne 0 ]; then kinds[${#kinds[@]}]=arithmetic
-          else
-            kinds[${#kinds[@]}]=$redirection_kind
-            case "$c" in '<'* | '>'* | '&>'*) needs_target=1 ;; *) needs_target="" ;; esac
-          fi ;;
-        *) word=$word$c; active=1 ;;
+          token_commands[${#tokens[@]}]=$command_id; expansion_words[${#tokens[@]}]=""; unquoted_words[${#tokens[@]}]=""; tokens[${#tokens[@]}]=$c
+          kinds[${#kinds[@]}]=$redirection_kind
+          case "$c" in '<'* | '>'* | '&>'*) needs_target=1 ;; *) needs_target="" ;; esac
+          case "$c" in ';' | '|' | '&&' | '||' | '&') command_id=$command_count; command_count=$((command_count + 1)) ;; esac ;;
+        *) word=$word$c; expansion=$expansion$c; active=1 ;;
       esac
     done
     [ -z "$quote" ] && [ "${#closers[@]}" -eq 0 ] || compound=1
-    if [ -n "$active" ]; then unquoted_words[${#tokens[@]}]=$bare; tokens[${#tokens[@]}]=$word; kinds[${#kinds[@]}]=$kind; fi
+    if [ -n "$active" ]; then token_commands[${#tokens[@]}]=$command_id; expansion_words[${#tokens[@]}]=$expansion; unquoted_words[${#tokens[@]}]=$bare; tokens[${#tokens[@]}]=$word; kinds[${#kinds[@]}]=$kind; fi
   fi
   # A shell can end a submission before a registered body is read. Evidence
   # must exist before its identifier reaches either expansion or input checks.
@@ -1016,21 +1056,49 @@ environment_dump() { # command kind; arguments are already decoded data
   done
   [ "${#heredocs[@]}" -eq 0 ] || heredoc_input=1
   main_text=${text:-}
-  n=${#tokens[@]}
-  for ((i=0; i<=n; i++)); do
-    if [ "$i" -lt "$n" ]; then
-      [ "${kinds[$i]}" = operator ] || continue
-      [ "${tokens[$i]}" != '|' ] || pipeline=1
-      case "${tokens[$i]}" in '|' | ';' | '&&' | '||' | '&') ;; *) continue ;; esac
-    fi
-    starts[stage]=$start; ends[stage]=$i
-    separators[stage]=${tokens[$i]:-end}; stage=$((stage + 1)); start=$((i + 1))
+  # Group each complete command by identity, retaining its original words
+  # and redirect origins even when child records appeared between them.
+  for ((i=0; i<${#tokens[@]}; i++)); do
+    record=${token_commands[$i]}
+    if [ -n "${record_last[$record]+present}" ]; then token_next[${record_last[$record]}]=$i
+    else record_first[record]=$i; fi
+    record_last[record]=$i
   done
+  for ((record=0; record<command_count; record++)); do
+    start=${#ordered_tokens[@]}; redirect=end
+    for ((i=${record_first[$record]:--1}; i>=0; i=${token_next[$i]:--1})); do
+      if [ "${kinds[$i]}" = operator ]; then
+        case "${tokens[$i]}" in
+          '|' | ';' | '&&' | '||' | '&') redirect=${tokens[$i]}; continue ;;
+        esac
+      fi
+      index=${#ordered_tokens[@]}; ordered_tokens[index]=${tokens[$i]}; ordered_kinds[index]=${kinds[$i]}
+      ordered_unquoted[index]=${unquoted_words[$i]}; ordered_expansions[index]=${expansion_words[$i]:-}
+      [ -z "${body_ids[$i]+present}" ] || ordered_bodies[index]=${body_ids[$i]}
+    done
+    starts[record]=$start; ends[record]=${#ordered_tokens[@]}; separators[record]=$redirect
+    [ "$redirect" != '|' ] || pipeline=1
+    index=${#ordered_tokens[@]}; ordered_tokens[index]=$redirect; ordered_kinds[index]=operator
+    ordered_unquoted[index]=""; ordered_expansions[index]=""
+  done
+  tokens=("${ordered_tokens[@]}"); kinds=("${ordered_kinds[@]}"); unquoted_words=("${ordered_unquoted[@]}")
+  expansion_words=("${ordered_expansions[@]}"); body_ids=()
+  for ((index=0; index<${#ordered_tokens[@]}; index++)); do
+    [ -z "${ordered_bodies[$index]+present}" ] || body_ids[index]=${ordered_bodies[$index]}
+  done
+  command_offset=$command_serial; command_serial=$((command_serial + command_count))
   # Forwarded input has no local data contract for the complete pipeline.
   if [ -n "$pipeline" ] && [ -n "$incoming_sources" ] && [ -n "$heredoc_input" ] && environment_main_evidence "$text" "${@:3}"; then return 0; fi
   for ((stage=0; stage<${#starts[@]}; stage++)); do
-    start=${starts[$stage]}; end=${ends[$stage]}; args=(); arg_kinds=(); arg_unquoted=(); arg_roles=()
-    private_inputs=(); proc=""; output=""; input_redirect=""; input_escaped=""; mode=other; program=""; program_pos=""; data_source=""; file_output=""; file_body=""; redirect_evidence=""
+    owner=$((command_offset + stage))
+    # Heredoc expansion scans have one enclosing data record. Only their
+    # independently collected substitution children are executable contexts.
+    if [ "${command_domains[$stage]:-command}" = data ]; then
+      decisions[stage]=other; stage_sources[stage]=""; stage_stdin[stage]=""
+      continue
+    fi
+    start=${starts[$stage]}; end=${ends[$stage]}; args=(); arg_kinds=(); arg_unquoted=(); arg_expansions=(); arg_roles=()
+    private_inputs=(); proc=""; output=""; input_redirect=""; input_escaped=""; mode=other; program=""; program_pos=""; data_source=""; file_output=""; file_body=""; redirect_evidence=""; command_writes=()
     for ((j=start; j<end; j++)); do
       case "${kinds[$j]}" in operator | operator-stderr | operator-explicit-other)
         fd=${kinds[$j]}
@@ -1064,11 +1132,28 @@ environment_dump() { # command kind; arguments are already decoded data
           '>&') [ "$fd" = operator-stderr ] || output=1 ;;
           '&>' | '&>''>') output=1 ;;
         esac
+        redirect=${tokens[$((j - 1))]}
+        case "$redirect" in
+          '<' | '<>')
+            reference=${#reference_owners[@]}; reference_owners[reference]=$owner
+            reference_targets[reference]=$target; reference_kinds[reference]=${kinds[$j]:-unknown} ;;
+        esac
+        write=""
+        case "$redirect" in
+          '>' | '>>' | '<>' | '&>' | '&>''>') write=1 ;;
+          '>&') [[ $target =~ ^[0-9]+$ ]] || [ "$target" = - ] || write=1 ;;
+        esac
+        if [ -n "$write" ]; then
+          write=${#write_owners[@]}; write_owners[write]=$owner; write_targets[write]=$target
+          write_kinds[write]=${kinds[$j]:-unknown}; write_bodies[write]=""; write_states[write]=unread
+          # Only a literal stdout overwrite can carry the cat heredoc class.
+          if [ "$redirect:$fd" = '>:operator' ]; then command_writes[${#command_writes[@]}]=$write; fi
+        fi
         if environment_main_evidence "$target"; then redirect_evidence=1; fi
         continue ;;
       esac
       n=${#args[@]}
-      args[n]=${tokens[$j]}; arg_kinds[n]=${kinds[$j]}; arg_unquoted[n]=${unquoted_words[$j]}
+      args[n]=${tokens[$j]}; arg_kinds[n]=${kinds[$j]}; arg_unquoted[n]=${unquoted_words[$j]}; arg_expansions[n]=${expansion_words[$j]:-}
     done
     # An empty recorded stage cannot prove how literal input will execute.
     # Existing boundaries select this main-refusal path before head parsing.
@@ -1093,6 +1178,43 @@ environment_dump() { # command kind; arguments are already decoded data
       for ((j=program_pos+1; j<${#args[@]}; j++)); do arg_roles[j]=argument; done
     fi
     environment_program_text
+    if { [ "$mode" = other ] || [ "$mode" = unclassified-forwarded ]; } &&
+       [ -n "$program_pos" ] && [ "${arg_kinds[$program_pos]}" = literal ] &&
+       environment_main_evidence --head "${arg_expansions[$program_pos]}"; then mode=dump-unknown; fi
+    # Preserve main's known-dump evidence for brace arguments without giving
+    # those arguments executable roles or applying the head expansion rule.
+    for ((j=pos; j<${#args[@]}; j++)); do
+      [ "${arg_roles[$j]:-}" = argument ] && [ -n "${arg_unquoted[$j]}" ] || continue
+      case "${arg_expansions[$j]}" in *'{'*','*'}'*)
+        if environment_main_evidence "${args[$j]}"; then mode=dump-unknown; fi ;;
+      esac
+    done
+    command_receivers[owner]=$receiver; command_unresolved[owner]=""
+    if [ "$program" = opaque ] && [ "$head_start" -lt "${#args[@]}" ] && [ -z "$syntax_head" ]; then
+      command_unresolved[owner]=1
+    elif [ "$pos" -lt "${#args[@]}" ] && [ -z "$program" ] && [ -z "$syntax_head" ]; then
+      command_unresolved[owner]=1
+    elif [ -n "$program_pos" ] && [ "${arg_kinds[$program_pos]}" != literal ]; then
+      command_unresolved[owner]=1
+    fi
+    # A selected ordinary receiver never executes a shell-name argument.
+    if [ "$receiver" = shell ]; then
+      for ((j=pos; j<${#args[@]}; j++)); do
+        reference=${#reference_owners[@]}; reference_owners[reference]=$owner
+        reference_targets[reference]=${args[$j]}; reference_kinds[reference]=${arg_kinds[$j]}
+      done
+    fi
+    if [ "$program" = tee ]; then
+      options_ended=""
+      for ((j=pos; j<${#args[@]}; j++)); do
+        if [ -z "$options_ended" ]; then
+          case "${args[$j]}" in --) options_ended=1; continue ;; -*) continue ;; esac
+        fi
+        [ "${args[$j]}" != - ] || continue
+        write=${#write_owners[@]}; write_owners[write]=$owner; write_targets[write]=${args[$j]}
+        write_kinds[write]=${arg_kinds[$j]}; write_bodies[write]=""; write_states[write]=unread
+      done
+    fi
     # Supported shell source keeps this classification check in its queue.
     # Other unclassified forwarded argv retains the complete read evidence.
     if [ "$mode" = unclassified-forwarded ]; then
@@ -1115,6 +1237,7 @@ environment_dump() { # command kind; arguments are already decoded data
          [ "$file_output" = 1 ] && [ "$file_body" = 1 ] && [ -z "$redirect_evidence" ] &&
          [ "$program_pos" = 0 ] && [ "$head_start" -eq 0 ] && [ "${arg_kinds[0]}" = literal ] &&
          [ "$data_source" = " $doc" ]; then
+        for write in ${command_writes[@]+"${command_writes[@]}"}; do write_bodies[write]=${heredoc_bodies[$doc]}; write_states[write]=readable; done
         body=${heredoc_bodies[$doc]}; body_start=${heredoc_starts[$doc]}; body_end=$((body_start + ${#body}))
         main_text=${main_text:0:body_start}${body//[!$'\n']/ }${main_text:body_end}
         continue
@@ -1146,6 +1269,7 @@ environment_dump() { # command kind; arguments are already decoded data
       [ -z "$redirect_evidence" ] || return 0
       stage_args=(${args[@]+"${args[@]}"}); stage_kinds=(${arg_kinds[@]+"${arg_kinds[@]}"})
       stage_unquoted=(${arg_unquoted[@]+"${arg_unquoted[@]}"})
+      stage_expansions=(${arg_expansions[@]+"${arg_expansions[@]}"})
       stage_roles=(${arg_roles[@]+"${arg_roles[@]}"})
       script_pos=""
       if [ "$1" = shell ] && [ -z "${2:-}$compound$incoming_sources" ] &&
@@ -1173,7 +1297,8 @@ environment_dump() { # command kind; arguments are already decoded data
            [ "$start" -eq 0 ] && [ "$end" -eq 3 ] && [ "${stage_kinds[1]}" = literal ] &&
            [ "${stage_roles[0]}:${stage_roles[1]}" = command:argument ] &&
            [ "${stage_roles[$candidate]}" = argument ] && [ "${stage_kinds[$candidate]}" = literal ] &&
-           [ -z "${stage_unquoted[$candidate]}" ] && [ -z "$input_redirect$output" ]; then continue; fi
+           [ -z "${stage_unquoted[$candidate]}" ] && [ -z "$input_redirect$output" ] &&
+           ! environment_main_evidence --head "${stage_expansions[$candidate]}"; then continue; fi
         if [ -z "$script_pos" ] || [ "$candidate" -le "$script_pos" ] ||
            [ "${stage_roles[$candidate]}:${stage_kinds[$candidate]}" != argument:literal ]; then
           if environment_main_evidence "$value"; then return 0; fi
@@ -1185,10 +1310,14 @@ environment_dump() { # command kind; arguments are already decoded data
         args=("${stage_args[@]:candidate:limit-candidate}")
         arg_kinds=("${stage_kinds[@]:candidate:limit-candidate}")
         arg_unquoted=("${stage_unquoted[@]:candidate:limit-candidate}")
+        arg_expansions=("${stage_expansions[@]:candidate:limit-candidate}")
         arg_roles=()
         program=""; pos=0; mode=other; producer_end=0; program_pos=""
         environment_producer shell "$scan"
         environment_program_text
+        if { [ "$mode" = other ] || [ "$mode" = unclassified-forwarded ]; } &&
+           [ -n "$program_pos" ] && [ "${arg_kinds[$program_pos]}" = literal ] &&
+           environment_main_evidence --head "${arg_expansions[$program_pos]}"; then mode=dump-unknown; fi
         [ -z "$stdin_program" ] || stage_stdin[stage]=1
         case "$mode" in dump-*) return 0 ;; esac
         if [ "$candidate" -gt "$((script_pos + 1))" ] && [ -z "$output" ] &&
@@ -1243,6 +1372,31 @@ environment_dump() { # command kind; arguments are already decoded data
       done
     fi
   done
+  if [ -n "$registry_root" ]; then
+    for ((write=0; write<${#write_owners[@]}; write++)); do
+      found=""
+      for ((owner=0; owner<command_serial; owner++)); do
+        [ "$owner" -ne "${write_owners[$write]}" ] || continue
+        if [ -n "${command_unresolved[$owner]:-}" ]; then found=1; break; fi
+        [ "${command_receivers[$owner]:-}" = shell ] || continue
+        for ((reference=0; reference<${#reference_owners[@]}; reference++)); do
+          [ "${reference_owners[$reference]}" -eq "$owner" ] || continue
+          if [ "${reference_kinds[$reference]}" != literal ] ||
+             { [ "${write_kinds[$write]}" = literal ] && [ "${write_targets[$write]}" = "${reference_targets[$reference]}" ]; }; then found=1; break; fi
+        done
+        [ -z "$found" ] || break
+      done
+      [ -n "$found" ] || continue
+      # An empty body is readable too; store its presence independently.
+      [ "${write_states[$write]}" = readable ] || return 0
+      local command_text=${write_bodies[$write]}
+      # A body is an independent submitted shell program, not another write
+      # in this submission's registry. Its own source checks still recurse.
+      local environment_registry_active=""
+      if environment_dump shell; then return 0; fi
+      environment_registry_active=1
+    done
+  fi
   for ((stage=0; stage<${#decisions[@]}; stage++)); do
     # The retained set decision also needs the recorded closing group and
     # status file write. Future-stage collector facts are now available.

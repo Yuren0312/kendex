@@ -234,6 +234,121 @@ environment_rows() {
     [.[0], (.[1] | tojson), .[2], (.[3] // "project")] | @tsv
   ' "$@" <<'ENVIRONMENT_ROWS'
 [2,"env","bare-env"]
+[2,"{env,}","expanded-head-brace-env"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nprintf \"%s\\n\" \"$(printf safe)$(printf value)\"","ordinary-adjacent-substitution-arguments"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nf=$(printf safe)$(printf value); printf \"%s\\n\" \"$f\"","ordinary-assignment-adjacent-substitutions"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nprintf \"%s\\n\" \"$(printf safe)\" \"$REVIEW_ARG\"","ordinary-substitution-then-variable-argument"]
+[0,"case foo in f*) printf safe;; esac","ordinary-case-pattern"]
+[0,"[[ foo == f* ]] && printf safe","ordinary-conditional-pattern"]
+[0,"for file in *.rs; do printf safe; done","ordinary-file-loop"]
+[2,"true; {env,}","expanded-head-list-brace-env"]
+[2,"{printenv,}","expanded-head-brace-printenv"]
+[2,"{set,}","expanded-head-brace-set"]
+[2,"true; {set,}","expanded-head-list-brace-set"]
+[2,"/usr/bin/printen?","expanded-head-glob-printenv"]
+[2,"true; /usr/bin/printen?","expanded-head-list-glob-printenv"]
+[2,"\"/usr/bin\"/printen?","expanded-head-mixed-prefix-glob"]
+[2,"/usr/bin/\"printen\"?","expanded-head-mixed-name-glob"]
+[2,"true; \"/usr/bin\"/printen? --null","expanded-head-list-mixed-glob-argument"]
+[2,"{en\"v\",}","expanded-head-mixed-brace"]
+[2,"true; {en\"v\",}","expanded-head-list-mixed-brace"]
+[2,"e{nv,nv}","expanded-head-split-brace"]
+[2,"true; e{nv,nv}","expanded-head-list-split-brace"]
+[2,"e{n..n}v","expanded-head-range-brace"]
+[2,"builtin {s\"et\",}","expanded-head-builtin-mixed-brace"]
+[2,"true; e{n..n}v --null","expanded-head-list-range-brace-argument"]
+[2,"e{{n,n}v,}","expanded-head-nested-brace"]
+[2,"/usr/bin/e[n]v","expanded-head-bracket-glob"]
+[2,"/usr/bin/printen*","expanded-head-star-glob"]
+[2,"$'/usr/bin'/printen?","expanded-head-ansi-prefix-glob"]
+[2,"$\"/usr/bin\"/printen?","expanded-head-locale-prefix-glob"]
+[2,"{en\\v,}","expanded-head-escaped-letter-brace"]
+[2,"command \"/usr/bin\"/printen?","expanded-head-command-prefix"]
+[2,"env -u NAME \"/usr/bin\"/printen?","expanded-head-unset-selected-target"]
+[2,"bash wrapper.sh \"/usr/bin\"/printen?","expanded-head-forwarded-mixed-glob"]
+[2,"sh LAUNCH WAIT e{nv,nv}","expanded-head-forwarded-split-brace"]
+[2,"bash -c '\"/usr/bin\"/printen?'","expanded-head-recursive-mixed-glob"]
+[2,"true; tool {set,}","expanded-list-argument-retains-evidence"]
+[0,"tool '/usr/bin/printen?'","quoted-glob-argument-data"]
+[0,"tool /usr/bin/printen?","glob-argument-data"]
+[0,"'/usr/bin/printen?'","quoted-glob-head-data"]
+[0,["/usr/bin/printen?"],"argv-glob-head-data"]
+[0,"/usr/bin/printen\\?","escaped-glob-head-data"]
+[0,"\"/usr/bin\"/printen'?'","mixed-protected-glob-head-data"]
+[0,"'e{nv,nv}'","quoted-brace-head-data"]
+[0,"e\\{nv,nv\\}","escaped-brace-head-data"]
+[0,"e{nv\\,nv}","escaped-comma-head-data"]
+[0,"e{nv\",\"nv}","quoted-comma-head-data"]
+[0,"'e{'nv,nv}","quoted-brace-open-head-data"]
+[0,"e{nv,nv\"}\"","quoted-brace-close-head-data"]
+[0,"e{n\\.\\.n}v","escaped-range-head-data"]
+[0,"/usr/bin/e\\[n\\]v","escaped-bracket-head-data"]
+[0,["e{nv,nv}"],"argv-brace-head-data"]
+[0,"tool e{nv,nv}","split-brace-argument-data"]
+[0,"tool \"/usr/bin\"/printen?","mixed-glob-argument-data"]
+[0,"tool '{set,}'","quoted-brace-argument-data"]
+[2,"python3 <<PY\nprint(\"\"\"$(e{nv,nv})\"\"\")\nPY","expanded-executable-heredoc-substitution"]
+[2,"python3 <<PY\nprint(\"\"\"`e{nv,nv}`\"\"\")\nPY","expanded-executable-heredoc-backtick"]
+[2,"python3 <<PY\nprint(\"\"\"$(\"/usr/bin\"/printen?)\"\"\")\nPY","expanded-executable-heredoc-mixed-glob"]
+[0,"python3 <<PY\nprint(\"e{nv,nv}\")\nPY","expanded-heredoc-literal-data"]
+[0,"python3 <<'PY'\nprint(\"$(e{nv,nv})\")\nPY","expanded-heredoc-quoted-data"]
+[0,"python3 <<PY\nprint(\"\"\"$(printf safe)\"\"\")\nPY","expanded-heredoc-literal-executable"]
+[0,"python3 <<PY\nprint(\"\"\"$(printf 'e{nv,nv}')\"\"\")\nPY","expanded-heredoc-quoted-argument"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbash tmp/h.sh","written-heredoc-shell"]
+[2,"printf \"$(printf env)\" > tmp/h.sh; bash tmp/h.sh","written-substituted-printf-shell"]
+[0,"printf \"$(printf env)\" > tmp/h.sh; printf done","written-substituted-printf-data"]
+[0,"printf \"$(printf safe)\" > tmp/h.sh; ls","written-safe-substitution-unrelated"]
+[0,"printf '%s\\n' \"$((2*3))\"","ordinary-arithmetic-multiply"]
+[0,"printf '%s\\n' \"$((1?2:3))\"","ordinary-arithmetic-conditional"]
+[0,"printf '%s\\n' \"$(printf safe)\" *.rs","ordinary-substitution-glob-argument"]
+[0,"value=\"$(printf safe)\"*.rs; printf '%s\\n' \"$value\"","ordinary-assignment-glob-continuation"]
+[0,"printf \"%s\\n\" \"$((2*$(printf 3)))\"","ordinary-arithmetic-substitution"]
+[2,"printf \"%s\\n\" \"$((2*$(env)))\"","arithmetic-real-dump-substitution"]
+[2,"printf safe > \"$(env)\"","redirect-real-dump-substitution"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv -u NAME cmd\nEOF\nbash tmp/h.sh","written-named-removal-helper"]
+[0,"cat > tmp/h.sh <<'EOF'\nprintf done\nEOF\nbash tmp/h.sh","written-ordinary-helper"]
+[0,"cat > tmp/h.sh <<'EOF'\nset -euo pipefail\nprintf done\nEOF\nbash tmp/h.sh","written-shell-setup-helper"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nenv -u NAME cmd","written-removal-selected-ordinary"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nenv -u NAME bash tmp/h.sh","written-removal-selected-shell"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nenv --unknown NAME cmd","written-unknown-env-option"]
+[2,"value=\"$(printf safe)\" > tmp/h.sh; bash tmp/h.sh","written-assignment-only"]
+[2,"> tmp/h.sh; bash tmp/h.sh","written-redirect-only"]
+[2,"printf safe >> tmp/h.sh; bash tmp/h.sh","written-append"]
+[2,"printf safe | tee tmp/h.sh; bash tmp/h.sh","written-tee"]
+[2,"printf safe <> tmp/h.sh; bash tmp/h.sh","written-read-write"]
+[2,"printf safe &> tmp/h.sh; bash tmp/h.sh","written-combined-output"]
+[2,"printf safe &>\u003e tmp/h.sh; bash tmp/h.sh","written-combined-append"]
+[0,"printf safe 1>&2; bash tmp/h.sh","descriptor-duplication-no-file"]
+[2,"printf safe 2> tmp/h.sh; bash tmp/h.sh","written-stderr"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbash tmp/other.sh","written-other-literal-path"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbash \"$(printf tmp/h.sh)\"","written-substituted-shell-reference"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbash < tmp/h.sh","written-shell-input-reference"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\n\"$RUNNER\" tmp/h.sh","written-unresolved-executable"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nba$(printf sh) tmp/h.sh","written-partial-executable"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nprintf bash tmp/h.sh","written-shell-name-argument"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nprintf \"%s\" \"$(printf safe)\"","written-safe-child"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nprintf \"%s\" \"$(env)\"","written-dump-child"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\ncommand printf bash tmp/h.sh","written-command-selected-ordinary"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\ncommand \"$RUNNER\" tmp/h.sh","written-command-unresolved-target"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\ncommand printf \"$REVIEW_ARG\"","written-command-unresolved-argument"]
+[0,"bash \"$(printf tmp/h.sh)\" > tmp/h.sh","written-same-command-own-output"]
+[0,"printf safe > tmp/h.sh; python3 <<PY\nprint(\"safe\")\nPY","written-heredoc-data-role"]
+[0,"printf safe > tmp/h.sh; python3 <<PY\nprint(\"$(printf safe)\")\nPY","written-heredoc-safe-child-role"]
+[2,"printf safe > tmp/h.sh; python3 <<PY\nprint(\"$(env)\")\nPY","written-heredoc-real-child-role"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nenv NAME=value printf bash tmp/h.sh","written-env-selected-ordinary"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec printf safe","written-opaque-exec-cost"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nexec -a bash printf safe","written-opaque-exec-option-argument"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbash -c 'printf safe' tmp/h.sh","written-shell-operand-cost"]
+[2,"false && cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbash tmp/h.sh","written-skipped-history"]
+[2,"cat > tmp/h.sh <<'EOF' &\nenv\nEOF\nbash tmp/h.sh","written-background-history"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\ncat > tmp/h.sh <<'EOF'\nprintf done\nEOF\nbash tmp/h.sh","written-overwrite-history"]
+[2,"cat > tmp/a.sh <<'A'\n'\nA\ncat > tmp/h.sh <<'EOF'\nenv\nEOF\nbash tmp/h.sh","written-independent-bodies"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\n","written-first-submission-only"]
+[0,"bash tmp/h.sh","written-second-submission-only"]
+[2,"printf \"$(printf safe > tmp/h.sh)\"; bash tmp/h.sh","written-child-output-shell"]
+[2,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nbash -c 'bash tmp/h.sh'","written-recursive-shell-reference"]
+[2,"bash -c 'printf safe > tmp/h.sh'; bash tmp/h.sh","written-recursive-shell-write"]
+[0,"cat > tmp/h.sh <<'EOF'\nenv\nEOF\nprintf \"%s\" \"$(printf safe)$(printf value)\" \"$REVIEW_ARG\"","written-identity-role-control"]
 [2,"FABRICATED_VALUE=fixture-private-value-4519 cat ~/.fleet/env","private-tilde"]
 [2,"cat @PRIVATE_HOME@/.fleet/env","private-inherited-home"]
 [2,"cat $HOME/.fleet/env","private-textual-home"]
@@ -1425,6 +1540,14 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
       defect == "no-check" { swap("if environment_dump \"$command_kind\"; then", "if false; then") }
       defect == "private-path" { swap("environment_private_path() {", "environment_private_path() { return 1") }
       defect == "main-evidence-cut" { swap("[[ ! $evidence =~ $opaque_re ]] || return 0", ":") }
+      defect == "expanded-head" && /^       environment_main_evidence/ { swap("environment_main_evidence --head \"${arg_expansions[$program_pos]}\"; then mode=dump-unknown; fi", "false; then mode=dump-unknown; fi") }
+      defect == "expansion-origin-cut" { swap("then expansion=$expansion$span", "then expansion=$expansion") }
+      defect == "expansion-quote-mask" { swap("else expansion=$expansion'\'' '\''; fi", "else expansion=$expansion$span; fi") }
+      defect == "written-reference" { swap("command_receivers[owner]=$receiver;", "command_receivers[owner]=data;") }
+      defect == "written-unread" { swap("[ \"${write_states[$write]}\" = readable ] || return 0", "[ \"${write_states[$write]}\" = readable ] || continue") }
+      defect == "identity-role" && /^        unset/ { swap("unset '\''closers[n]'\'' '\''nesting[n]'\''", "unset '\''closers[n]'\'' '\''nesting[n]'\''; command_id=$command_count; command_count=$((command_count + 1)); word=; kind=literal; active=") }
+      defect == "identity-owner" && /write_targets\[write\]=\$target/ { swap("write_owners[write]=$owner", "write_owners[write]=-1") }
+      defect == "heredoc-data-role" { swap("command_domains[0]=data", "command_domains[0]=command") }
       defect == "operand-word-boundary" { swap("(^|[^A-Za-z0-9_.-])(env|printenv|export|declare|typeset|show-environment)([^A-Za-z0-9_.-]|$)", "(^|[^A-Za-z0-9_])(env|printenv|export|declare|typeset|show-environment)([^A-Za-z0-9_]|$)") }
       defect == "unclassified-head-only" { swap("if [ -z \"$stdin_program\" ] && { [ -n \"$redirect_evidence\" ] || environment_main_evidence \"${args[@]}\"; }; then mode=dump-unknown; fi", "if [ -z \"$stdin_program\" ] && { [ -n \"$redirect_evidence\" ] || environment_main_evidence \"${args[$program_pos]}\"; }; then mode=dump-unknown; fi") }
       defect == "unresolved-redirect-loss" { swap("if [ -z \"$stdin_program\" ] && { [ -n \"$redirect_evidence\" ] || environment_main_evidence \"${args[@]}\"; }; then mode=dump-unknown; fi", "if [ -z \"$stdin_program\" ] && environment_main_evidence \"${args[@]}\"; then mode=dump-unknown; fi") }
@@ -1458,7 +1581,7 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
         swap("[ -z \"$compound\" ] || return 0", "[ -z \"$compound\" ] || return 0; for ((j=stage; j<${#decisions[@]}; j++)); do [ \"${decisions[$j]}\" != filter ] || continue 2; done")
       }
       defect == "launcher-pass" && $0 == "        env)" { print; print "          program=\"\"; mode=other; break"; changed++; next }
-      defect == "nested-pass" && $0 == "  n=${#tokens[@]}" { print "  [ -z \"$compound\" ] || return 1"; changed++ }
+      defect == "nested-pass" && $0 == "  command_offset=$command_serial; command_serial=$((command_serial + command_count))" { print "  [ -z \"$compound\" ] || return 1"; changed++ }
       defect == "broad-filter" { swap("[[ $pattern =~ $filter_re ]]", "[[ -n $pattern ]]") }
       defect == "env-terminator" { swap("options_ended=1; pos=$((pos + 1)); continue ;;", "pos=$((pos + 1)); break ;;") }
       defect == "grep-record-flags" { swap("^-[EFq]+$", "^-[EFazq]+$") }
@@ -1535,6 +1658,15 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
     fi
   done <<'ENVIRONMENT_CONTROLS'
 private-path|FAIL environment: private-tilde: exit=0 expected=2
+written-reference|FAIL environment: written-heredoc-shell: exit=0 expected=2
+written-unread|FAIL environment: written-substituted-printf-shell: exit=0 expected=2
+identity-role|FAIL environment: ordinary-substitution-glob-argument: exit=2 expected=0
+identity-owner|FAIL environment: written-same-command-own-output: exit=2 expected=0
+heredoc-data-role|FAIL environment: written-heredoc-data-role: exit=2 expected=0
+expanded-head|FAIL environment: expanded-head-brace-env: exit=0 expected=2
+expanded-head|FAIL environment: expanded-head-glob-printenv: exit=0 expected=2
+expansion-origin-cut|FAIL environment: expanded-head-mixed-prefix-glob: exit=0 expected=2
+expansion-quote-mask|FAIL environment: quoted-glob-head-data: exit=2 expected=0
 receiver-named-method|FAIL environment: receiver-jarvis-config-named-method: exit=2 expected=0
 receiver-named-method|FAIL environment: receiver-jarvis-heredoc-named-method: exit=2 expected=0
 receiver-line-boundary|FAIL environment: receiver-python-heredoc-whole-line-end: exit=0 expected=2
