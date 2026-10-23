@@ -14,7 +14,7 @@ PROVIDER="$REPO_ROOT/skills/orch/tests/fixtures/lane-host"
 for row in 'MERGED|dependency-2|ready' 'CLOSED|dependency-2|held' 'MERGED|unrelated|held'; do
   IFS='|' read -r delivered branch expected <<<"$row"
   new_case "typed-$delivered-$branch"
-  jq -n --arg provider "$PROVIDER" '{triaged:[],lanes:[{item:"issue-2",tracker:"github",repo:"owner/repo",harness:"codex",account:"/lane",host:$provider,
+  jq -n --arg provider "$PROVIDER" '{triaged:[],lanes:[{item:"issue-2",tracker:"linear",repo:null,harness:"codex",account:"/lane",host:$provider,
     kind:"ssh",model:"gpt-6-astra",effort:"high",session_id:"native-2",sandbox_instance_id:"immutable-2",window:"gh-2",mail_root:"/srv/lane",
     launch:{pane:"%2",server:999},launched_at:"2026-09-20T00:00:00Z",status:"parked"}]}
     | .lanes[0] |= (.parked={at:"2026-09-20T00:01:00Z",phase:"stopped",head:"abc",repo:"owner/repo",wait:{kind:"item",reason:"held step",source:"directive-2",

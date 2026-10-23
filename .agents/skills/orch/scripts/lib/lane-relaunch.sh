@@ -107,9 +107,12 @@ lane_wait_account() { # WAIT room|walled
   [[ "$expect:$rc" == room:0 || "$expect:$rc" == walled:3 ]] || { LANE_WAIT_CAUSE=account-not-admitted; return 1; }
   # The provider must answer for the stopped host itself. Local fallback cannot
   # establish that the account on the kept disk has room.
-  jq -e --arg account "$account" --arg bucket "$bucket" --arg expect "$expect" '
+  source "$SCRIPT_DIR/lib/lane-model.sh"
+  jq -e --arg account "$account" --arg bucket "$bucket" --arg expect "$expect" --arg model "$model" "$LANE_MODEL_JQ"'
     .config_dir == $account and .measured_through == "host" and .status == "ok"
-    and .binding_bucket == $bucket and ($expect != "walled" or .binding_resets_at == null)' <<<"$row" >/dev/null || return 1
+    and (if $expect == "walled" then .binding_bucket == $bucket and .binding_resets_at == null
+      else .binding_bucket == $bucket
+        or ((shared_bindings + model_bindings($model)) | any(.[]; .bucket == $bucket and .pct != null)) end)' <<<"$row" >/dev/null || return 1
   LANE_WAIT_EVIDENCE="$row" LANE_WAIT_CAUSE=""
 }
 
@@ -120,7 +123,7 @@ lane_wait_landed() { # CURRENT_RECORD
   # A resumed preparation still carries the original binding. Never replace
   # that binding with a fresh launch merely because the sandbox started.
   lane_wait_validate "$wait" "$(jq -c --argjson wait "$wait" '. + $wait.binding' <<<"$record")" resume || return 1
-  lane_wait_instance "$wait" "$(jq -r .repo <<<"$record")" "$(jq -r .item <<<"$record")" || return 1
+  lane_wait_instance "$wait" "$(jq -r '.parked.repo // .dependency_wait.repo // .repo' <<<"$record")" "$(jq -r .item <<<"$record")" || return 1
   kind="$(jq -r .kind <<<"$wait")" || return 1
   if [[ "$kind" == account ]]; then lane_wait_account "$wait" room; return; fi
   while IFS= read -r dep; do
@@ -455,13 +458,18 @@ find_relaunch_session() { # HARNESS WORKTREE [HOST_CODEX_HOME]
 # whose --session takes a path, and a copilot session's own id, read from its
 # workspace.yaml by lib/copilot-session.sh. Empty is a transcript the harness cannot resume, and a
 # failure.
-session_id_of() { # HARNESS SESSION_FILE
+session_id_of() { # HARNESS SESSION_FILE [native]
   local id=""
   case "$1" in
     claude) id="$(basename "$2" .jsonl)" ;;
     codex) id="$(jq -Rrn 'first(inputs|fromjson?|select(.type=="session_meta")|.payload.id)//empty' "$2")" ;;
-    pi) id="$2" ;;
-    copilot) id="$(copilot_session_id "$2")" || return 1 ;;
+    pi)
+      if [[ "${3:-}" == native ]]; then
+        id="$(jq -Rrn 'first(inputs|fromjson|select(.type=="session")|.id)//empty' -- "$2")" || return 1
+      else id="$2"; fi ;;
+    copilot)
+      source "${BASH_SOURCE[0]%/*}/copilot-session.sh"
+      id="$(copilot_session_id "$2")" || return 1 ;;
   esac
   [[ -n "$id" ]] || return 1
   printf '%s\n' "$id"
@@ -485,10 +493,7 @@ recorded_session_file() { # HARNESS ACCOUNT NATIVE_ID SESSION_FILE
   else
     jq -Rne '[inputs | fromjson] | length > 0' -- "$file" >/dev/null || return 2
   fi
-  actual="$(session_id_of "$harness" "$file")" || return 2
-  if [[ "$harness" == pi ]]; then
-    actual="$(jq -Rrn 'first(inputs|fromjson|select(.type=="session")|.id)//empty' -- "$file")" || return 2
-  fi
+  actual="$(session_id_of "$harness" "$file" native)" || return 2
   [[ "$actual" == "$id" ]] || return 2
   printf '%s\n' "$file"
 }

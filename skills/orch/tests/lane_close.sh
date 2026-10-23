@@ -68,6 +68,7 @@ cp "$TEST_DIR/../scripts/lib/lane-state.sh" "$TEST_DIR/../scripts/lib/date-ladde
   "$TEST_DIR/../scripts/lib/usage-reset.sh" "$TEST_DIR/../scripts/lib/lane-host-slots.sh" \
   "$TEST_DIR/../scripts/lib/lane-capabilities.sh" "$TEST_DIR/../scripts/lib/tmux-server.sh" \
   "$TEST_DIR/../scripts/lib/lane-gitfile.sh" "$TEST_DIR/../scripts/lib/cloud-close-log.sh" \
+  "$TEST_DIR/../scripts/lib/lane-model.sh" "$TEST_DIR/../scripts/lib/copilot-session.sh" \
   "$TEST_DIR/../scripts/lib/escapes.sh" "$TEST_DIR/../scripts/lib/lane-relaunch.sh" "$SCRIPTS/lib/"
 chmod +x "$SCRIPTS/lane-close"
 cat >"$SCRIPTS/lib/pane-write.sh" <<'EOF'
@@ -207,6 +208,11 @@ if [[ "$1" == cat ]]; then
   fi
   # Park admission reads real Git identity and the lane's clean-status evidence.
   case "$4" in
+    /sessions/native-1.jsonl)
+      [[ "${LANE_CLOSE_SESSION_READ:-0}" == 0 ]] || exit "$LANE_CLOSE_SESSION_READ"
+      if [[ -n "${LANE_CLOSE_SESSION_META:-}" ]]; then printf '%s\n' "$LANE_CLOSE_SESSION_META"
+      else printf '%s\n' '{"type":"session_meta","payload":{"id":"native-1","cwd":"/srv/worktree"}}'; fi
+      exit 0 ;;
     */tmp/park-status.json)
       [[ "${LANE_CLOSE_CLEAN_STATUS:-0}" -eq 0 ]] || exit "$LANE_CLOSE_CLEAN_STATUS"
       jq -nc --arg branch "${LANE_CLOSE_PARK_BRANCH:-ken-1}" --arg head "${LANE_CLOSE_PARK_HEAD:-abc123}" \
@@ -677,8 +683,10 @@ export LANE_CLOSE_HOST_LIST_JSON='[{"repo":"repo","item":"KEN-1","id":"immutable
 export LANE_CLOSE_PARK_READ=1
 for kind in item account; do
   dependency_state
+  # Fresh hosted launches have no native id until their session is read.
+  jq '.lanes[0].session_id=null' "$STATE" > "$STATE.next" && mv -- "$STATE.next" "$STATE"
   if [[ "$kind" == account ]]; then
-    jq '. | del(.dependencies) | . + {kind:"account",account:"/lane",host:"/host",harness:"codex",model:"model",bucket:"weekly",no_reset:true}' \
+    jq '. | del(.dependencies) | .binding.session_id=null | . + {kind:"account",account:"/lane",host:"/host",harness:"codex",model:"model",bucket:"weekly",no_reset:true}' \
       "$TMP_ROOT/wait.json" >"$TMP_ROOT/wait.next"
     mv -- "$TMP_ROOT/wait.next" "$TMP_ROOT/wait.json"
   fi
@@ -689,9 +697,21 @@ for kind in item account; do
     "rc=0 status=parked kind=$kind asks=1 recovery=$before" "$kind wait keeps the pending ask and spent recovery record" "$TMP_ROOT/err"
   assert_eq "$(jq -r '.lanes[0] | [.sandbox_instance_id,.parked.head,.cost,.launched_at] | @tsv' "$STATE")" \
     $'immutable-1\tabc123\t12.5\t2026-09-20T00:00:00Z' 'parking retains instance, head, cost and original launch time'
+  assert_eq "$(jq -c '.lanes[0] | [.session_id,.parked.wait.binding.session_id]' "$STATE")" \
+    '["native-1","native-1"]' 'parking binds the verified native id to the fresh launch and wait'
   run_close "$SCRIPT" --if-terminal
   assert_eq "rc=$RC close=$(close_call_count) status=$(jq -r '.lanes[0].status' "$STATE")" \
     'rc=4 close=0 status=parked' 'tracker Done cannot delete a typed dependency park'
+done
+for evidence in missing wrong; do
+  dependency_state
+  if [[ "$evidence" == missing ]]; then
+    LANE_CLOSE_SESSION_READ=2 run_close "$SCRIPT" --park --wait-file "$TMP_ROOT/wait.json"
+  else
+    LANE_CLOSE_SESSION_META='{"type":"session_meta","payload":{"id":"other"}}' run_close "$SCRIPT" --park --wait-file "$TMP_ROOT/wait.json"
+  fi
+  assert_eq "rc=$RC stop=$(stop_count KEN-1 codex) status=$(jq -r '.lanes[0].status' "$STATE")" \
+    'rc=1 stop=0 status=running' "$evidence native session refuses before harness retirement" "$TMP_ROOT/err"
 done
 for row in \
   'dirty|LANE_CLOSE_PORCELAIN= M work|running|0|false' \

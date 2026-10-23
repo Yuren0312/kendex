@@ -281,14 +281,15 @@ FLEET_CMD=(--harness claude --cmd "true --model opus --effort high $QUESTION_OFF
   dependency_resume() {
     local create_line="${DEP_CREATE_LINE:-}"
     [[ -n "$create_line" ]] || create_line=$'ssh-target=lane.example\tpath=/srv/lane\tremote-prefix=exec bash -lc'
-    STUB_PANE_CMD=ssh STUB_PANE_TEXT='dev@lane:~$' STUB_HARNESS_TEXT='Working (esc to interrupt)' \
+    STUB_PANE_CMD=ssh STUB_PANE_TEXT='dev@lane:~$' STUB_HARNESS_TEXT="${DEP_SCREEN:-Working (esc to interrupt)}" \
       LANE_HOST_STUB_LOG="$TMP_ROOT/host.log" LANE_HOST_STUB_DIR="$HOSTED_DISK" \
       LANE_HOST_STUB_CREATE_LINE="$create_line" \
       LANE_HOST_STUB_LIST_JSON='[{"repo":"r","item":"CC-70","id":"immutable-70","name":"reusable-name"}]' \
-      RUN_TMUX=stub,1,0 run_ot --relaunch --continue-resume --tmux --harness codex --launch-flags "$DEP_FLAGS" --lane "$LANE_DIR" --host "$HOST_STUB" --repo o/r CC-70
+      RUN_TMUX=stub,1,0 run_ot --relaunch --continue-resume --tmux --harness "${DEP_HARNESS:-codex}" --launch-flags "$DEP_FLAGS" --lane "$LANE_DIR" --host "$HOST_STUB" --repo o/r CC-70
   }
   export STUB_DEPENDENCY_ISSUE='{"id":"immutable-issue-2","number":2,"state":"CLOSED","stateReason":"COMPLETED"}'
   export STUB_DEPENDENCY_VIEW='{"number":9,"state":"MERGED","headRefName":"dependency-2","headRepositoryOwner":{"login":"o"},"mergedAt":"2026-10-22T12:00:00Z","mergeCommit":{"oid":"actual-landed-commit"}}'
+  if [[ "${1:-}" != --native-only ]]; then
   dependency_resume_state
   before="$($WS --state-dir "$STATE" get oversee '.lanes[0].recovery' | jq -c .)"
   dependency_resume
@@ -297,6 +298,14 @@ FLEET_CMD=(--harness claude --cmd "true --model opus --effort high $QUESTION_OFF
   assert_eq "$($WS --state-dir "$STATE" get oversee '[(.lanes[0].pauses|length),.lanes[0].dependency_wait.outcome]' | jq -c .)" '[1,"running"]' 'confirmed resume closes the pause exactly once'
   dependency_resume
   assert_eq "rc=$RC starts=$(grep -c '^start ' "$TMP_ROOT/host.log" || true) creates=$(grep -c '^create ' "$TMP_ROOT/host.log" || true)" 'rc=1 starts=1 creates=1' 'a replay starts no second harness or sandbox'
+  "$WS" --state-dir "$STATE" update oversee '.lanes[0] |= (.parked=.dependency_wait | .status="parked" | .parked.phase="stopped" | .parked.at="2026-10-23T00:00:00Z")' >/dev/null
+  dependency_resume
+  assert_eq "rc=$RC starts=$(grep -c '^start ' "$TMP_ROOT/host.log" || true) pauses=$($WS --state-dir "$STATE" get oversee '.lanes[0].pauses|length')" \
+    'rc=0 starts=2 pauses=2' 'a new park can resume after a completed running wait' "$TMP_ROOT/err"
+  dependency_resume_state
+  "$WS" --state-dir "$STATE" update oversee '.lanes[0].repo=null' >/dev/null
+  dependency_resume
+  assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status')" 'rc=0 status=running' 'a Linear lane resolves its own instance from the retained park repository' "$TMP_ROOT/err"
   for view in \
     '{"number":9,"state":"OPEN"}' \
     '{"number":9,"state":"CLOSED"}' \
@@ -317,6 +326,7 @@ FLEET_CMD=(--harness claude --cmd "true --model opus --effort high $QUESTION_OFF
   assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status') outcome=$($WS --state-dir "$STATE" get oversee '.lanes[0].dependency_wait.outcome')" 'rc=1 status=stopped outcome=failed' 'a missing original native transcript cannot become a fresh-session success' "$TMP_ROOT/err"
   mv -- "$HOSTED_DISK/sessions/native-70.kept" "$HOSTED_DISK/sessions/native-70.jsonl"
   dependency_resume_state
+  "$WS" --state-dir "$STATE" update oversee '.lanes[0].repo=null' >/dev/null
   LANE_HOST_STUB_WAIT_STATUS=69 DEP_CREATE_LINE=$'ssh-target=lane.example\tpath=/srv/lane\tremote-prefix=exec bash -lc\tstate=preparing' dependency_resume
   assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status')" 'rc=0 status=preparing' 'busy accepted preparation retains its one native continuation' "$TMP_ROOT/err"
   dependency_resume
@@ -344,15 +354,66 @@ FLEET_CMD=(--harness claude --cmd "true --model opus --effort high $QUESTION_OFF
   dependency_resume_state
   STUB_DEPENDENCY_ISSUE='{"id":"immutable-issue-2","number":2,"state":"CLOSED","stateReason":"NOT_PLANNED"}' dependency_resume
   assert_eq "rc=$RC starts=$(grep -c '^start ' "$TMP_ROOT/host.log" || true)" 'rc=1 starts=0' 'a canceled immutable dependency stays parked despite a PR merge' "$TMP_ROOT/err"
+  for row in 'same|20|host|0|running|1' 'other|20|host|1|parked|0' 'same|null|host|1|parked|0' 'same|20|local|1|parked|0'; do
+    IFS='|' read -r dep_account dep_weekly dep_through want_rc want_status want_starts <<<"$row"
+    dependency_resume_state
+    "$WS" --state-dir "$STATE" update oversee '.lanes[0].parked.wait |= (del(.dependencies) | .kind="account" | .account=.binding.account | .host=.binding.host | .harness=.binding.harness | .model=.binding.model | .bucket="weekly" | .no_reset=true)' >/dev/null
+    account="$LANE_DIR"
+    [[ "$dep_account" == same ]] || account=/other
+    STUB_DEPENDENCY_PICK="$(jq -cn --arg a "$account" --arg through "$dep_through" --argjson weekly "$dep_weekly" '{config_dir:$a,status:"ok",measured_through:$through,binding_bucket:"session",session_5h_pct:40,weekly_pct:$weekly}')" dependency_resume
+    assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status') starts=$(grep -c '^start ' "$TMP_ROOT/host.log" || true)" \
+      "rc=$want_rc status=$want_status starts=$want_starts" "account room needs same-account host evidence for recorded weekly bucket: $row" "$TMP_ROOT/err"
+  done
+  fi
   dependency_resume_state
-  "$WS" --state-dir "$STATE" update oversee '.lanes[0].parked.wait |= (del(.dependencies) | .kind="account" | .account=.binding.account | .host=.binding.host | .harness=.binding.harness | .model=.binding.model | .bucket="weekly" | .no_reset=true)' >/dev/null
-  STUB_DEPENDENCY_PICK="$(jq -cn --arg a "$LANE_DIR" '{config_dir:$a,status:"ok",measured_through:"host",binding_bucket:"weekly"}')" dependency_resume
-  assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status')" 'rc=0 status=running' 'fresh same-account admission resumes the native account wait' "$TMP_ROOT/err"
-  dependency_resume_state
-  "$WS" --state-dir "$STATE" update oversee '.lanes[0].parked.wait |= (del(.dependencies) | .kind="account" | .account=.binding.account | .host=.binding.host | .harness=.binding.harness | .model=.binding.model | .bucket="weekly" | .no_reset=true)' >/dev/null
-  STUB_DEPENDENCY_PICK='{"config_dir":"/other","status":"ok","measured_through":"host","binding_bucket":"weekly"}' dependency_resume
-  assert_eq "rc=$RC starts=$(grep -c '^start ' "$TMP_ROOT/host.log" || true)" 'rc=1 starts=0' 'room on another account cannot authorize this wait' "$TMP_ROOT/err"
-  if [[ "${1:-}" == --dependency-only ]]; then
+  printf '%s\n' '{"type":"session_meta","payload":{"id":"other"}}' '{"type":"session_meta","payload":{"id":"native-70"}}' > "$HOSTED_DISK/sessions/native-70.jsonl"
+  dependency_resume
+  assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status') outcome=$($WS --state-dir "$STATE" get oversee '.lanes[0].dependency_wait.outcome')" \
+    'rc=1 status=stopped outcome=failed' 'transported evidence uses the native owner first-session identity' "$TMP_ROOT/err"
+  for row in \
+    'claude|--model claude-opus-4-6 --effort high|claude-opus-4-6|native-claude|/sessions/native-claude.jsonl|{"sessionId":"native-claude","cwd":"/srv/lane"}' \
+    'claude|--model claude-opus-4-6[1m] --effort high|claude-opus-4-6|native-claude|/sessions/native-claude.jsonl|{"sessionId":"native-claude","cwd":"/srv/lane"}'; do
+    IFS='|' read -r dep_harness dep_flags dep_model dep_id dep_file dep_meta <<<"$row"
+    dependency_resume_state
+    mkdir -p -- "$HOSTED_DISK${dep_file%/*}"
+    printf '%s\n' "$dep_meta" > "$HOSTED_DISK$dep_file"
+    "$WS" --state-dir "$STATE" update oversee --arg h "$dep_harness" --arg flags "$dep_flags" --arg model "$dep_model" --arg id "$dep_id" --arg file "$dep_file" '
+      .lanes[0] |= (.harness=$h | .model=$model | .session_id=$id
+        | .parked.wait.launch_flags=$flags | .parked.wait.session_file=$file
+        | .parked.wait.binding |= (.harness=$h | .model=$model | .session_id=$id))' >/dev/null
+    : > "$TMP_ROOT/native-buffers"
+    STUB_BUFFER_LOG="$TMP_ROOT/native-buffers" DEP_SCREEN=$'❯ \n? for shortcuts' ORCH_TMUX_VERIFY_SECS=1 DEP_HARNESS="$dep_harness" DEP_FLAGS="$dep_flags" dependency_resume
+    assert_eq "rc=$RC status=$($WS --state-dir "$STATE" get oversee '.lanes[0].status')" 'rc=0 status=running' "$dep_harness resumes its supported native evidence and original model flags" "$TMP_ROOT/err"
+    if [[ "$dep_harness" == claude ]]; then
+      assert_eq "$(grep -c '/orch start CC-70' "$TMP_ROOT/native-buffers" || true)" 0 'typed Claude resume never pastes a fresh start brief'
+    fi
+  done
+  # Hosted Copilot fleet admission has its own unsupported-context refusal.
+  # Exercise only the production native-proof route with provider file reads.
+  copilot_proof() (
+    SCRIPT_DIR="$SCRIPTS_DIR"
+    source "$SCRIPT_DIR/lib/lane-relaunch.sh"
+    eval "$(sed -n '/^relaunch_route()/,/^}/p' "$OT")"
+    HARNESS=copilot LANE_ENV="COPILOT_HOME=$LANE_DIR" DEPENDENCY_SESSION=native-copilot
+    DEPENDENCY_RECORD='{"parked":{"wait":{"session_file":"/sessions/native-copilot/workspace.yaml"}}}'
+    host_transport() { "$HOST_STUB" "$@"; }
+    ot_message() { :; }
+    export LANE_HOST_STUB_LOG="$TMP_ROOT/copilot-proof.log" LANE_HOST_STUB_DIR="$HOSTED_DISK"
+    relaunch_route CC-70 CC-70 /srv/lane
+  )
+  mkdir -p "$HOSTED_DISK/sessions/native-copilot"
+  printf '%s\n' 'id: native-copilot' 'cwd: /srv/lane' > "$HOSTED_DISK/sessions/native-copilot/workspace.yaml"
+  for evidence in resumable empty missing wrong; do
+    printf '%s\n' 'id: native-copilot' 'cwd: /srv/lane' > "$HOSTED_DISK/sessions/native-copilot/workspace.yaml"
+    printf '%s\n' '{"type":"session.start","data":{"sessionId":"native-copilot"}}' > "$HOSTED_DISK/sessions/native-copilot/events.jsonl"
+    case "$evidence" in empty) : > "$HOSTED_DISK/sessions/native-copilot/events.jsonl" ;; missing) rm -- "$HOSTED_DISK/sessions/native-copilot/events.jsonl" ;; wrong) printf '%s\n' 'id: other' > "$HOSTED_DISK/sessions/native-copilot/workspace.yaml" ;; esac
+    proof_rc=0
+    copilot_proof || proof_rc=$?
+    want_rc=1
+    [[ "$evidence" != resumable ]] || want_rc=0
+    assert_eq "$proof_rc" "$want_rc" "Copilot $evidence native evidence uses workspace identity and existing event admission"
+  done
+  if [[ "${1:-}" == --dependency-only || "${1:-}" == --native-only ]]; then
     printf '\npass: %s   fail: %s\n' "$PASS" "$FAIL"
     [[ "$FAIL" -eq 0 ]]
     exit

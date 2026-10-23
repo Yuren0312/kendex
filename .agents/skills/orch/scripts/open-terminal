@@ -3047,17 +3047,21 @@ relaunch_route() { # ITEM STATE_ID WORKTREE
     session_file="$(jq -er '(.parked.wait // .dependency_wait.wait).session_file | strings | select(length > 0)' <<<"$DEPENDENCY_RECORD")" || {
       ot_message dependency-held "item=$1" cause=native-session-proof-missing >&2; return 1;
     }
-    local transcript
-    transcript="$(host_transport cat --item "$2" "$session_file")" || {
-      ot_message dependency-held "item=$1" cause=native-session-unread >&2; return 1;
-    }
-    jq -Rne --arg id "$DEPENDENCY_SESSION" --arg harness "$HARNESS" '
-      [inputs | fromjson?] | any(.[];
-        if $harness == "codex" then .type == "session_meta" and .payload.id == $id
-        elif $harness == "pi" then .type == "session" and .id == $id
-        else .sessionId == $id end)' <<<"$transcript" >/dev/null || {
-      ot_message dependency-held "item=$1" cause=native-session-mismatch >&2; return 1;
-    }
+    local proof_rc=0 scratch
+    (
+      scratch="$(mktemp -d)" || exit 3
+      trap 'rm -rf -- "${scratch:?}"' EXIT
+      host_transport cat --item "$2" "$session_file" > "$scratch/${session_file##*/}" || exit 3
+      if [[ "$HARNESS" == copilot ]]; then
+        host_transport cat --item "$2" "${session_file%/*}/events.jsonl" > "$scratch/events.jsonl" || exit 3
+      fi
+      recorded_session_file "$HARNESS" "${LANE_ENV#*=}" "$DEPENDENCY_SESSION" "$scratch/${session_file##*/}" >/dev/null
+    ) || proof_rc=$?
+    if [[ "$proof_rc" != 0 ]]; then
+      if [[ "$proof_rc" == 3 ]]; then ot_message dependency-held "item=$1" cause=native-session-unread >&2
+      else ot_message dependency-held "item=$1" cause=native-session-mismatch >&2; fi
+      return 1
+    fi
     return 0
   fi
   # A saved selection belongs to the successor that already started.
@@ -3224,7 +3228,7 @@ launch_finish() {
   # relaunch has none either: which of its two commands runs is the host's
   # answer, and open_tmux checks for a harness screen instead.
   brief=""
-  if [[ -z "$CMD_TEMPLATE" && "$HARNESS" == "claude" && -z "$session_file" && "$RELAUNCH_ROUTE" != resume-or-fresh ]]; then
+  if [[ -z "$CMD_TEMPLATE" && "$HARNESS" == "claude" && -z "$session_file" && -z "${DEPENDENCY_SESSION:-}" && "$RELAUNCH_ROUTE" != resume-or-fresh ]]; then
     if [[ "$TRACKER" == "linear" ]]; then brief="/orch start $item"; else brief="/orch start github $repo#$item"; fi
   fi
   local model_env
@@ -4350,7 +4354,7 @@ for raw in "${ITEMS[@]}"; do
     fi
     if jq -e '(.parked.wait // .dependency_wait.wait) != null' <<<"$dependency_record" >/dev/null; then
       DEPENDENCY_RECORD="$dependency_record"
-      if jq -e '.status == "running" or .dependency_wait.outcome == "running"' <<<"$dependency_record" >/dev/null; then
+      if jq -e '.status == "running" or (.parked.wait == null and .dependency_wait.outcome == "running")' <<<"$dependency_record" >/dev/null; then
         ot_message dependency-held "item=$item" cause=resume-already-running >&2
         failed=$((failed + 1)); continue
       fi
@@ -4358,8 +4362,9 @@ for raw in "${ITEMS[@]}"; do
         ot_message dependency-held "item=$item" "cause=$LANE_WAIT_CAUSE" >&2
         failed=$((failed + 1)); continue
       fi
+      dependency_model="$(launch_choice_model_id "$LAUNCH_HARNESS" "$LAUNCH_MODEL" launch)" || { failed=$((failed + 1)); continue; }
       if ! jq -e --arg host "$LANE_HOST" --arg harness "$HARNESS" --arg account "${LANE_ENV#*=}" \
-          --arg model "$LAUNCH_MODEL" --arg effort "$LAUNCH_EFFORT" --arg flags "$LAUNCH_FLAGS" \
+          --arg model "$dependency_model" --arg effort "$LAUNCH_EFFORT" --arg flags "$LAUNCH_FLAGS" \
           '(.parked.wait // .dependency_wait.wait).binding as $b
           | $b.host == $host and $b.harness == $harness and $b.account == $account
           and $b.model == $model and $b.effort == $effort

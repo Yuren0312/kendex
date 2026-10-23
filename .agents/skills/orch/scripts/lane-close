@@ -924,8 +924,21 @@ park_clean_judge() {
     || { message park-refused "item=$ITEM" reason=clean-status-invalid "branch-source=$PARK_BRANCH_SOURCE" >&2; exit 1; }
 }
 
+park_native_session() (
+  local file scratch native
+  file="$(jq -er '.session_file | strings | select(length > 0)' <<<"$PARK_WAIT")" || return 1
+  scratch="$(mktemp -d)" || return 1
+  trap 'rm -rf -- "${scratch:?}"' EXIT
+  ORCH_LANE_HOST="$host" "$LANE_HOST" cat --item "$ITEM" "$file" > "$scratch/${file##*/}" || return 1
+  if [[ "$harness" == copilot ]]; then
+    ORCH_LANE_HOST="$host" "$LANE_HOST" cat --item "$ITEM" "${file%/*}/events.jsonl" > "$scratch/events.jsonl" || return 1
+  fi
+  native="$(session_id_of "$harness" "$scratch/${file##*/}" native)" || return 1
+  recorded_session_file "$harness" "$(record_field account)" "$native" "$scratch/${file##*/}" >/dev/null || return 1
+  printf '%s\n' "$native"
+)
 park_judge() {
-  local err view fields pr_state pr_head pr_branch armed merge_state queue queued out rc=0 kinds target clean target_repo connected binding_record pending_asks published_head
+  local err view fields pr_state pr_head pr_branch armed merge_state queue queued out rc=0 kinds target clean target_repo connected binding_record pending_asks published_head native
   [[ -n "$host" ]] || { message park-refused "item=$ITEM" "reason=local" >&2; exit 1; }
   [[ -x "$LANE_HOST" ]] || { message record-invalid "item=$ITEM" "field=lane-host" >&2; exit 1; }
   err="$(mktemp)" || { message park-refused "item=$ITEM" "reason=provider-unsupported" "cause=stderr-unsaved" >&2; exit 1; }
@@ -945,8 +958,19 @@ park_judge() {
     PARK_WAIT="$(jq -ce '.' -- "$PARK_WAIT_FILE")" || {
       message park-refused "item=$ITEM" reason=wait-unread >&2; exit 1;
     }
-    binding_record="$(jq -c --argjson wait "$PARK_WAIT" '
-      if .sandbox_instance_id == null then .sandbox_instance_id=$wait.binding.sandbox_instance_id else . end' <<<"$record")" || exit 1
+    native="$(park_native_session)" || {
+      message park-refused "item=$ITEM" reason=native-session-unverified >&2; exit 1;
+    }
+    # A fresh hosted launch has no session id until its native evidence exists.
+    # Fill only absent identities; exact attempt/session equality still admits
+    # the request, and the lifecycle owner persists both bindings together.
+    PARK_WAIT="$(jq -c --arg native "$native" 'if .binding.session_id == null then .binding.session_id=$native else . end' <<<"$PARK_WAIT")" || exit 1
+    [[ "$(jq -r .binding.session_id <<<"$PARK_WAIT")" == "$native" ]] || {
+      message park-refused "item=$ITEM" reason=native-session-mismatch >&2; exit 1;
+    }
+    binding_record="$(jq -c --argjson wait "$PARK_WAIT" --arg native "$native" '
+      (if .session_id == null then .session_id=$native else . end)
+      | if .sandbox_instance_id == null then .sandbox_instance_id=$wait.binding.sandbox_instance_id else . end' <<<"$record")" || exit 1
     lane_wait_validate "$PARK_WAIT" "$binding_record" || {
       message park-refused "item=$ITEM" "reason=$LANE_WAIT_CAUSE" >&2; exit 1;
     }
@@ -975,7 +999,7 @@ park_judge() {
     "$WORKFLOW_STATE" ${STATE_ARGS[@]+"${STATE_ARGS[@]}"} update oversee \
       --arg item "$ITEM" --argjson wait "$PARK_WAIT" --argjson asks "$pending_asks" \
       --arg head "$PARK_HEAD" --arg branch "$PARK_BRANCH" --arg repo "$PARK_REPO" --arg own_pr "$PARK_PR" \
-      '(.lanes[] | select(.item == $item)) |= (.sandbox_instance_id=$wait.binding.sandbox_instance_id | .parked = ({wait:$wait,pending_asks:$asks,head:$head,branch:$branch,repo:$repo,phase:"admitted"} + (if $own_pr == "" then {} else {pr:($own_pr|tonumber)} end)))' >/dev/null || exit 1
+      '(.lanes[] | select(.item == $item)) |= (.session_id=$wait.binding.session_id | .sandbox_instance_id=$wait.binding.sandbox_instance_id | .parked = ({wait:$wait,pending_asks:$asks,head:$head,branch:$branch,repo:$repo,phase:"admitted"} + (if $own_pr == "" then {} else {pr:($own_pr|tonumber)} end)))' >/dev/null || exit 1
     return 0
   fi
   target_repo="${PARK_UNTIL_REPO:-$PARK_REPO}"
