@@ -275,3 +275,50 @@ To target a state directory from a worktree, pass the global `--state-dir <path>
 .agents/skills/orch/scripts/workflow-state set PROJ-123 pr_review_baseline '{"last_threads":["PRRT_kwDOABC123","PRRT_kwDODEF456"]}'
 .agents/skills/orch/scripts/workflow-state --state-dir /path/to/tmp append PROJ-123 fixed_items '{"description":"Fix"}'
 ```
+
+## Finding occurrences
+
+`finding_occurrences` is optional item state, `{prior: "none"|"unknown", records: [...]}`. `init` starts it with `prior: "none"`. Legacy absence, unavailable provenance or an unusable failed-check list keeps `prior: "unknown"`, including after later successful reads. It follows this file's existing archive/remove lifetime. No total is stored. `lib/cause-keys.jq` derives counts; patched/frozen records and `repeated_class_rounds` keep their existing disposition meaning and patched-commit units.
+
+### Record verified findings
+
+This is the review-batch admission and completion contract for review producers feeding an item's fix or filing routes. Callers supply the item key and worktree, local or native identity, dry-run status, and their existing launch, acceptance and disposition routes. They keep their panels, deadlines, continuation proofs, advisory failures and round allowances.
+
+1. **Admission, before launch.** Ensure the caller's item state exists through its existing initialization route. Mint the batch token and stamp its freshness boundary:
+
+   ```bash
+   .agents/skills/orch/scripts/workflow-state new-round-id [ISSUE_ID] review_round_id
+   .agents/skills/orch/scripts/workflow-state set-now [ISSUE_ID] review_delegated_at
+   ```
+
+   Bind the printed token and the stored `review_delegated_at` boundary to this batch's assignments. A fresh wave or QA delegation is a batch. A confirming local pass takes fresh admission under its existing bound. A proved original-batch continuation keeps its original binding instead of stamping again. Under dry-run, make neither write and keep round provenance unavailable.
+
+2. **Acceptance.** Check each assigned report through the existing acceptance owner:
+
+   ```bash
+   .agents/skills/orch/scripts/review-artifact-check --file [ARTIFACT_PATH] [WORKTREE_PATH] [BOUND_REVIEW_DELEGATED_AT] --issue [ISSUE_ID]
+   ```
+
+   Under dry-run, omit the unavailable boundary and `--issue` to avoid recording a stage. The caller keeps its specialized acceptance checks and failure route. Only accepted evidence supplies findings. Retain its original path, batch token, boundary, array and index through disposition, even after another batch starts. A native report's `qa_metadata.review_round_id` must match its assigned token; dry-run reports use `null`. A missing original binding stays unknown, never today's mutable token. A failed or unavailable advisory review supplies no finding or clean pass.
+
+3. **Completion, before routing away.** Apply the caller's existing finding-disposition pass, Step 0 first. Write the batch file below with the harness file tool from every accepted source before display deduplication. Complete this step before any fix delegation, issue filing, empty-result exit or return, including reply-only and bounded confirming passes. Record verified true findings that survived Step 0, including findings tracked instead of fixed. False claims, questions and Step 0 exclusions add no record. An accepted clean batch has `records: []`. Under dry-run, report proposed observations and unavailable provenance without writing state. A failed or unbound observation follows the unknown-coverage rule below before a later query can claim completeness.
+
+```json
+{"records":[{"kind":"review","location":"src/x.rs (`f`)","owner":"src/shared.rs (`rule`)","source":{"round_id":"R","artifact":"tmp/review-reviewer-correctness-T.json","array":"blockers","index":0,"identity":["artifact","tmp/review-reviewer-correctness-T.json","blockers",0]}}]}
+```
+
+Omit absent `owner`. Set `source.round_id` from the retained original batch token. For original local reviews identity is `["artifact", original_path, array, index]`; for inline/PR-level copies it is `["native", source_type, original_id]`, preferring the original comment ID and using a thread-only ID conservatively once. A body entry uses `["native", "review-body", original_review_or_comment_id, entry_token]`; bare `file:line` supplies no native identity. Copied native findings never fall back to local artifact identity. An unavailable round, class or native binding sets `unknown: true` and omits that observation; keep any other bound records in the batch. With none bound, this is `{"unknown":true,"records":[]}`. Outside dry-run, record through the existing state writer:
+
+```bash
+.agents/skills/orch/scripts/workflow-state findings record [ISSUE_ID] [BATCH_FILE]
+```
+
+The recorder retains the first source provenance. Same-identity/class reads add nothing, even after a new round stamp or native retriage. A changed class under that identity refuses without rewriting it. A nonzero record result is unread coverage: preserve it through the existing design route and record an unknown batch before any later query can claim complete coverage. A failed unknown write remains unread; it supplies no zero/one count.
+
+`dev-artifact-check` records validation refusals in its existing schema-valid recording step, including a failed original and its recovery separately. It splits the receipt's `FAILING: check1,check2` list, trims outer whitespace, and deduplicates exact names within one receipt. Each row is `{kind:"validation", check, source:{round_id, receipt, identity:["receipt", round_id, receipt, check]}}`. Empty names retain unknown coverage. Pass, pending CI, no-verdict, missing/invalid receipts and run-live supply no refusal. Runner logs remain evidence; this interface claims no unpublished check identities. A stage-recording failure's existing advisory diagnostic leaves occurrence coverage unread too; it never proves complete recording.
+
+### Query and admission
+
+Write requests as an array of `{kind:"review", location, owner?}` copied from the proposed fix's source finding, or `{kind:"validation", check}` copied EXACTLY from the failed source receipt. Never derive a validation name from review-item prose. `findings query [ISSUE_ID] [REQUEST_FILE]` returns `{prior, classes:[{class, observed_count, prior, sources}]}`. Without the request file it reports all known classes. Review matching calls `shared_cause_key`, with no transitive aliases; validation matches exact check names. A request with no usable key reports `observed_count: null` and `prior: "unknown"`. Unknown prior coverage makes a numeric count a known lower bound; two attributable sources still establish recurrence. Query failure remains unread.
+
+Both direct fix owners read that result before stamping, pruning or changing delegation time, under [design-review.md](../references/design-review.md). Carry the unchanged query JSON in the existing ask/status and next delegation, and give its saved result file to `dev-round-write --finding-occurrences-file`. `lanes facts` and `oversee-report` consume the shared lane reader's same query over known classes. No observation interrupts active work, changes a disposition, or grants another round or validation start.
