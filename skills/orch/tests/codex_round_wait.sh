@@ -16,7 +16,7 @@ caller_pid=""
 cleanup() {
   local runner leader
   if [[ -n "$caller_pid" ]]; then kill -TERM "$caller_pid" 2>/dev/null || true; wait "$caller_pid" 2>/dev/null || true; fi
-  for runner in "$TMP_ROOT"/*/wait.runner; do
+  for runner in "$TMP_ROOT"/*/wait.runner "$TMP_ROOT/process-work/tmp"/*/review.runner "$TMP_ROOT"/native-*/tmp/job/review.runner; do
     [[ -f "$runner" ]] || continue
     leader="$(pgrep -f "${runner%.runner} " || true)"
     [[ -z "$leader" || "$leader" == *$'\n'* ]] || "$SKILL_DIR/scripts/lib/job-unit.sh" stop-job "$runner" "$leader" "*${runner%.runner}*" >/dev/null 2>&1 || true
@@ -31,6 +31,105 @@ command -v setsid >/dev/null || { echo 'rowless: codex_round_wait setsid=absent'
 
 awk '/^```sh$/ { active=1; blocks++; next } /^```$/ && active { active=0; next } active { print } END { if (blocks != 1 || active) exit 1 }' \
   "$SKILL_DIR/references/waiter-launch.md" > "$TMP_ROOT/launch.sh"
+
+runtime="${CODEX_RUNTIME_UNDER_TEST:-$SKILL_DIR/references/codex-runtime.md}"
+awk '/^## Process-owned reviewers$/ { section=1; next } /^## / && section { section=0 }
+  section && /^```bash$/ { active=1; next } /^```$/ && active { active=0; next }
+  active && /exec codex exec / { print; hits++ } END { if (hits != 1 || active) exit 1 }' \
+  "$runtime" > "$TMP_ROOT/process-launch"
+awk '/^## Process-owned reviewers$/ { section=1; next } /^## / && section { section=0 }
+  section && /^```bash$/ { active=1; next } /^```$/ && active { active=0; next }
+  active && /exec .*review-artifact-check --file/ { print; hits++ } END { if (hits != 1 || active) exit 1 }' \
+  "$runtime" > "$TMP_ROOT/process-collect"
+
+# Explicit integration route: the installed Codex uses its unchanged inherited
+# account/home. Hook trust and feature overrides are invocation-only. The ordinary suite
+# below uses a controlled executable and needs no model service.
+if [[ "${CODEX_ROUND_WAIT_ONLY:-}" == native-hooks ]]; then
+  native_codex="$(type -P codex)" || { echo 'codex_round_wait: codex=unavailable' >&2; exit 1; }
+  proof_dir="${CODEX_NATIVE_PROOF_DIR:?native proof needs a caller-owned evidence directory}"
+  [[ -d "$proof_dir" && ! -L "$proof_dir" ]] || exit 1
+  printf '%s\n' "$native_codex" > "$proof_dir/executable"
+  [[ "$(cat "$TMP_ROOT/process-launch")" == *' --disable hooks '* ]] || exit 1
+  for native_case in isolated control; do
+    fixture="$TMP_ROOT/native-$native_case"
+    job="$fixture/tmp/job"
+    mkdir -p "$job" "$fixture/.codex/hooks" "$fixture/.agents/skills/orch" "$fixture/.agents/skills/mailbox" "$fixture/offline-home"
+    git -C "$fixture" init -q
+    git -C "$fixture" config gc.auto 0
+    git -C "$fixture" config maintenance.auto false
+    git -C "$fixture" checkout -q -b fixture-4642
+    git -C "$fixture" -c user.name=Test -c user.email=test@example.com -c core.hooksPath=/dev/null commit -q --allow-empty -m fixture
+    mkdir "$fixture/.git/lane-mail"
+    printf '%s\n' "$fixture" > "$fixture/.git/lane-mail/fixture-4642"
+    ln -s "$SKILL_DIR/scripts" "$fixture/.agents/skills/orch/scripts"
+    ln -s "$SKILL_DIR/../mailbox/scripts" "$fixture/.agents/skills/mailbox/scripts"
+    cp "$SKILL_DIR/../../hooks/lane-mail-check.sh" "$fixture/.codex/hooks/lane-mail-check.sh"
+    cat > "$fixture/.codex/hooks/observe.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+payload="$(cat)"
+printf '%s\n' "$payload" >> "$HOOK_PROOF_FIXTURE/hook-events.jsonl"
+before="$(cat "$HOOK_PROOF_FIXTURE/tmp/lane-mail/FIXTURE-4642/to-lane.cursor")"
+rc=0
+LANES_HOME="$HOOK_PROOF_FIXTURE/offline-home" "$BASH" "$HOOK_PROOF_FIXTURE/.codex/hooks/lane-mail-check.sh" <<< "$payload" || rc=$?
+after="$(cat "$HOOK_PROOF_FIXTURE/tmp/lane-mail/FIXTURE-4642/to-lane.cursor")"
+jq -nc --arg before "$before" --arg after "$after" --argjson exit "$rc" \
+  '{before:$before,after:$after,exit:$exit}' >> "$HOOK_PROOF_FIXTURE/hook-cursors.jsonl"
+exit "$rc"
+SH
+    python3 - "$fixture" "$BASH" <<'PY'
+import json, pathlib, shlex, sys
+root = pathlib.Path(sys.argv[1])
+(root / '.codex/config.toml').write_text('[features]\nhooks = true\n')
+command = shlex.join([sys.argv[2], str(root / '.codex/hooks/observe.sh')])
+(root / '.codex/hooks.json').write_text(json.dumps({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': command, 'timeout': 30}]}]}}))
+PY
+    printf '%s\n' 'Synthetic parent directive for hook isolation. Respond only HOOK_PROOF; do not run any tools.' > "$fixture/directive.md"
+    (cd "$fixture" && "$SKILL_DIR/../mailbox/scripts/lane-mail" send --item FIXTURE-4642 --root "$fixture" --directive --file "$fixture/directive.md") > "$job/send.log" 2>&1
+    printf '0\n' > "$fixture/tmp/lane-mail/FIXTURE-4642/to-lane.cursor"
+    cp "$TMP_ROOT/launch.sh" "$job/launch.sh"
+    printf '%s\n' 'This is an isolated hook transport fixture. Run no tools. Respond only HOOK_PROOF. If a Stop hook continues the turn, respond HOOK_PROOF once more without running any tools.' > "$job/delegation.md"
+    launch="$(cat "$TMP_ROOT/process-launch")"
+    launch="${launch//\[JOB_DIR\]/$job}"
+    # Current lane selection is explicit; no auth/config file is inspected.
+    flags='--model gpt-6.1-sol -c model_reasoning_effort=high --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust -c features.hooks=true'
+    launch="${launch//\[CURRENT_REVIEW_MODEL_EFFORT_AND_PERMISSION_FLAGS\]/$flags}"
+    if [[ "$native_case" == control ]]; then
+      launch="${launch/ --disable hooks/}"
+    fi
+    # Remove parent project redirections; native HOME and CODEX_HOME, auth,
+    # model and effort stay inherited. Mail ownership is synthetic only.
+    (cd "$fixture" && env -u CLAUDE_PROJECT_DIR -u ORCH_STATE_DIR \
+      LANE_MAIL_ITEM=FIXTURE-4642 HOOK_PROOF_FIXTURE="$fixture" \
+      "$BASH" -c "$launch") > "$job/launch.log" 2>&1
+    rc=0
+    "$TIMEOUT" 300 sh -c 'while [ ! -s "$1/review.exit" ]; do sleep 1; done' sh "$job" || rc=$?
+    if [[ "$rc" != 0 ]]; then
+      cp -R "$fixture/." "$proof_dir/$native_case"
+      echo "codex_round_wait: native-completion=$rc case=$native_case" >&2
+      exit 1
+    fi
+    hook_count=0
+    [[ ! -f "$fixture/hook-events.jsonl" ]] || hook_count="$(jq -s 'length' "$fixture/hook-events.jsonl")"
+    cursor="$(cat "$fixture/tmp/lane-mail/FIXTURE-4642/to-lane.cursor")"
+    exit_code="$(cat "$job/review.exit")"
+    cp -R "$fixture/." "$proof_dir/$native_case"
+    assert_eq "$exit_code" 0 "native $native_case exits normally" "$job/review.log"
+    if [[ "$native_case" == isolated ]]; then
+      assert_eq "$hook_count:$cursor" '0:0' 'native hooks disabled leaves synthetic parent mail unread'
+    else
+      [[ "$hook_count" -gt 0 ]] && pass 'native control executes the trusted hook' || fail 'native control executes the trusted hook'
+      assert_eq "$cursor" 1 'native control hook acknowledges synthetic parent directive'
+      assert_eq "$(jq -s 'any(.[]; .before == "0" and .after == "1" and .exit == 2)' "$fixture/hook-cursors.jsonl")" true \
+        'native callback itself advances the synthetic cursor'
+    fi
+  done
+  printf 'pass: %d   fail: %d\n' "$PASS" "$FAIL"
+  [[ "$FAIL" == 0 ]]
+  exit
+fi
+
 awk '/^## Delegated round wait$/ { section=1; next } /^## / && section { section=0 } section && /^```bash$/ { active=1; blocks++; next } /^```$/ && active { active=0; next } active { print } END { if (blocks != 1 || active) exit 1 }' \
   "$SKILL_DIR/references/codex-runtime.md" > "$TMP_ROOT/command"
 awk '/^## Reviewer round wait$/ { section=1; next } /^## / && section { section=0 } section && /^```bash$/ { active=1; blocks++; next } /^```$/ && active { active=0; next } active { print } END { if (blocks != 1 || active) exit 1 }' \
@@ -108,13 +207,18 @@ PATH="$ROUND_POLL_PATH" "$BASH" -c "$poll"'
 await_file() {
   local i
   for ((i=0; i<2000; i++)); do
-    [[ ! -s "$1" && ! -f "$1" ]] || return 0
+    if [[ "${2:-}" == nonempty ]]; then
+      [[ ! -s "$1" ]] || return 0
+    else
+      [[ ! -s "$1" && ! -f "$1" ]] || return 0
+    fi
     "$REAL_SLEEP" 0.01
   done
   printf 'codex_round_wait: marker-timeout path=%s\n' "$1" >&2
   return 1
 }
 
+if [[ "${CODEX_ROUND_WAIT_ONLY:-}" != process ]]; then
 while IFS='|' read -r name kind caller dependency poll_source lands elapsed verdict continuation expected_rc; do
   case_dir="$TMP_ROOT/$name"
   mkdir -p "$case_dir/tmp" "$case_dir/.agents/skills"
@@ -175,5 +279,132 @@ delayed-reviewer-gtimeout-only|reviewer|caller|gtimeout|poll|yes|300|valid|valid
 reviewer-table-row-same-turn|reviewer|caller|timeout|poll|no|600|missing|missing|0
 control-reviewer-old-turn-end-stalls|reviewer|old-turn-end|timeout|poll|yes|300|valid|absent|0
 ROWS
+fi
+
+if [[ -z "${CODEX_ROUND_WAIT_ONLY:-}" || "$CODEX_ROUND_WAIT_ONLY" == process ]]; then
+  # Execute the source command boundary, not a second command model. The
+  # controlled executable receives the installed complete role and workflow
+  # plus the review-pr delegation. This proves transport, not model obedience
+  # to the workflow's panel selection, continuation or deadline instructions.
+  cat > "$TMP_ROOT/bin/codex" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+jq -nc --args '$ARGS.positional' -- "$@" >> "$PROCESS_JOB/invocations"
+printf '%s\n' "$CODEX_HOME" > "$PROCESS_JOB/account"
+pwd -P > "$PROCESS_JOB/cwd"
+cat > "$PROCESS_JOB/received"
+last=''
+while [[ "$#" -gt 0 ]]; do
+  if [[ "$1" == --output-last-message ]]; then last="$2"; shift; fi
+  shift
+done
+[[ -n "$last" ]] || exit 63
+printf 'Verdict: pass\nFile: %s\n' "$PROCESS_ARTIFACT" > "$last"
+case "$PROCESS_RESULT" in
+  valid | nonzero) cp "$PROCESS_JOB/receipt" "$PROCESS_ARTIFACT" ;;
+  invalid) printf '{"verdict":' > "$PROCESS_ARTIFACT" ;;
+  missing) ;;
+  *) exit 64 ;;
+esac
+[[ "$PROCESS_RESULT" != nonzero ]] || exit 7
+SH
+  chmod +x "$TMP_ROOT/bin/codex"
+  process_work="$TMP_ROOT/process-work"
+  mkdir -p "$process_work/.agents/skills" "$process_work/tmp" "$TMP_ROOT/process-account"
+  ln -s "$SKILL_DIR" "$process_work/.agents/skills/orch"
+  git -C "$process_work" init -q
+  git -C "$process_work" config gc.auto 0
+  git -C "$process_work" config maintenance.auto false
+  git -C "$process_work" -c user.name=Test -c user.email=test@example.com -c core.hooksPath=/dev/null commit -q --allow-empty -m fixture
+  process_head="$(git -C "$process_work" rev-parse HEAD)"
+  "$SKILL_DIR/scripts/workflow-state" --state-dir "$process_work/tmp" init process-4642 --worktree "$process_work" --branch fixture >/dev/null
+  source_repo="$(cd "$SKILL_DIR/../.." && pwd -P)"
+  while IFS='|' read -r domain result expected_exit expected_ok expected_reason; do
+    [[ -z "${CODEX_PROCESS_RESULT_ONLY:-}" || "$CODEX_PROCESS_RESULT_ONLY" == "$result" ]] || continue
+    job="$process_work/tmp/$domain-$result"
+    mkdir "$job"
+    cp "$TMP_ROOT/launch.sh" "$job/launch.sh"
+    artifact="$("$SKILL_DIR/scripts/review-artifact-check" --path "$process_work" "$domain")"
+    [[ ! -e "$artifact" ]] || rm -- "$artifact"
+    jq -nc --arg agent "$domain" --arg head "$process_head" \
+      '{agent:$agent,verdict:"pass",head:$head,dirty_paths:[],blockers:[],suggestions:[],questions:[]}' > "$job/receipt"
+    # The generated role contains consumer instructions absent from its catalog
+    # source. Universal newlines normalize checked-out TOML and Markdown.
+    python3 - "$source_repo" "$SKILL_DIR" "$domain" "$process_work" "$artifact" "$process_head" "$job/delegation.md" <<'PY'
+import pathlib, sys, tomllib
+repo, skill, domain, worktree, artifact, head, output = sys.argv[1:]
+role = tomllib.loads((pathlib.Path(repo) / '.codex/agents' / (domain + '.toml')).read_text())['developer_instructions']
+workflow = (pathlib.Path(skill).parent / 'reviewer/workflows/review.md').read_text()
+review = (pathlib.Path(skill) / 'workflows/review-pr.md').read_text()
+start = review.index('<delegation_format>')
+end = review.index('</delegation_format>', start) + len('</delegation_format>')
+delegation = review[start:end]
+for key, value in {
+    '[WORKTREE_PATH]': worktree, '[BRANCH]': 'fixture', '[ARTIFACT_PATH]': artifact,
+    '[DIFF_RANGE, or unavailable for a missing fix boundary]': head + '...' + head,
+    '[For each verified decision: "- [DECISION_ID]: [ONE_LINE_SUMMARY] — [DECISION_FILE_PATH]"]': '- Fixture decision: retain the exact assigned artifact.',
+    '[For each decision whose path failed verification: "- decision index lookup failed for [DECISION_ID]"]': '',
+    '[If none: "- No linked decisions found."]': '',
+    '[For each fixed_item: "[LOCATION] | [DESCRIPTION] — fixed in [COMMIT_SHA]"; an entry whose commit is a `dropped:<sha>` marker prints "recorded, then dropped in a rebase" in place of the sha]': 'file:1 | fixed fixture finding — fixed in ' + head,
+    '[For each escalated_item: "[LOCATION] | [DESCRIPTION] — [REASON]"]': 'file:2 | retained fixture finding — tracked',
+    '[For each declined_item: "[LOCATION] | [DESCRIPTION] — [REASON]"]': 'file:3 | suppressed fixture finding — no reachable defect',
+    '[PRIOR_REPORT_PATH]': worktree + '/tmp/prior.json', '[N]': '1',
+    '<if re-review cycle>': '', '<if this reviewer session was recreated fresh>': '', '</if>': '',
+}.items():
+    delegation = delegation.replace(key, value)
+assert not any(marker in delegation for marker in ('[For each', '[WORKTREE_PATH]', '[ARTIFACT_PATH]'))
+pathlib.Path(output).write_text('DELEGATION:\n' + role + '\n' + workflow + '\n' + delegation + '\n')
+PY
+    launch="$(cat "$TMP_ROOT/process-launch")"
+    launch="${launch//\[JOB_DIR\]/$job}"
+    process_flags='--model gpt-6.1-sol -c model_reasoning_effort=high --dangerously-bypass-approvals-and-sandbox'
+    launch="${launch//\[CURRENT_REVIEW_MODEL_EFFORT_AND_PERMISSION_FLAGS\]/$process_flags}"
+    (cd "$process_work" && env -i PATH="$TMP_ROOT/bin:$PATH" HOME="$TMP_ROOT" CODEX_HOME="$TMP_ROOT/process-account" \
+      PROCESS_JOB="$job" PROCESS_ARTIFACT="$artifact" PROCESS_RESULT="$result" \
+      "$TIMEOUT" 60 "$BASH" -c "$launch") > "$job/launch.log" 2>&1
+    await_file "$job/review.exit" nonempty
+    assert_eq "$(cat "$job/review.exit")" "$expected_exit" "process $domain $result: terminal exit"
+    assert_eq "$(wc -l < "$job/invocations" | tr -d ' ')" 1 "process $domain $result: one job"
+    assert_eq "$(jq -c '.' "$job/invocations")" \
+      "[\"exec\",\"--ephemeral\",\"--model\",\"gpt-6.1-sol\",\"-c\",\"model_reasoning_effort=high\",\"--dangerously-bypass-approvals-and-sandbox\",\"--disable\",\"hooks\",\"--output-last-message\",\"$job/last-message.md\",\"-\"]" \
+      "process $domain $result: native exec instead of attached launch"
+    assert_eq "$(cat "$job/account")|$(cat "$job/cwd")" "$TMP_ROOT/process-account|$process_work" \
+      "process $domain $result: account and owned worktree"
+    cmp -s "$job/delegation.md" "$job/received" && pass "process $domain $result: complete prompt and exact artifact delivered" \
+      || fail "process $domain $result: complete prompt and exact artifact delivered"
+    collect="$(cat "$TMP_ROOT/process-collect")"
+    collect="${collect//\[JOB_DIR\]/$job}"
+    collect="${collect//\[ASSIGNED_ARTIFACT_PATH\]/$artifact}"
+    collect="${collect//\[WORKTREE_PATH\]/$process_work}"
+    collect="${collect//\[CHECK_BOUNDARY\]/0}"
+    collect="${collect//\[ISSUE_ID\]/process-4642}"
+    rc=0
+    (cd "$process_work" && ORCH_STATE_DIR="$process_work/tmp" "$TIMEOUT" 60 "$BASH" -c "$collect") \
+      > "$job/collection.json" 2> "$job/collection.err" || rc=$?
+    if [[ "$result" == nonzero ]]; then
+      assert_eq "$rc:$(wc -c < "$job/collection.json" | tr -d ' ')" '1:0' \
+        "process $domain $result: failed execution supplies no acceptance"
+    else
+      assert_eq "$(jq -r '[.ok,.reason] | @tsv' "$job/collection.json")" \
+        "$expected_ok"$'\t'"$expected_reason" "process $domain $result: exact artifact acceptance"
+    fi
+  done <<'ROWS'
+reviewer-correctness|valid|0|true|valid
+reviewer-error|valid|0|true|valid
+reviewer-correctness|nonzero|7|false|unread
+reviewer-error|missing|0|false|missing
+reviewer-correctness|invalid|0|false|invalid
+ROWS
+  if [[ -z "${CODEX_RUNTIME_UNDER_TEST:-}" ]]; then
+    cp "$runtime" "$TMP_ROOT/process-exit-control.md"
+    mutate_file "$TMP_ROOT/process-exit-control.md" 'case "$code" in 0)' 'case "$code" in *)'
+    rc=0
+    CODEX_RUNTIME_UNDER_TEST="$TMP_ROOT/process-exit-control.md" CODEX_ROUND_WAIT_ONLY=process CODEX_PROCESS_RESULT_ONLY=nonzero \
+      "$TIMEOUT" 60 "$BASH" "$0" > "$TMP_ROOT/process-exit-control.log" 2>&1 || rc=$?
+    assert_eq "$rc" 1 'control: nonzero process execution cannot accept its valid artifact' "$TMP_ROOT/process-exit-control.log"
+    assert_eq "$(grep -c -F 'FAIL  process reviewer-correctness nonzero: failed execution supplies no acceptance' "$TMP_ROOT/process-exit-control.log" || true)" 1 \
+      'control: exit refusal assertion detects the planted defect'
+  fi
+fi
 printf 'pass: %d   fail: %d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
