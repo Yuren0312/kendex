@@ -23,11 +23,11 @@ SCRIPTS_DIR="$REPO_ROOT/skills/orch/scripts"
 TMP_ROOT="$(mktemp -d)" || { echo "dev_validate_run: scratch=mktemp-failed" >&2; exit 1; }
 [[ -d $TMP_ROOT && ! -L $TMP_ROOT ]] || { echo "dev_validate_run: scratch=not-a-directory value=[$TMP_ROOT]" >&2; exit 1; }
 TMP_ROOT="$(cd -- "$TMP_ROOT" && pwd -P)" || { echo "dev_validate_run: scratch=resolve-failed" >&2; exit 1; }
-trap 'status=$?; [[ $- != *e* ]] || printf "dev_validate_run: exit=%s command=%s\n" "$status" "$BASH_COMMAND" >&2' ERR
+trap 'status=$? failed_command=$BASH_COMMAND; [[ $- != *e* ]] || printf "dev_validate_run: exit=%s command=%s\n" "$status" "$failed_command" >&2' ERR
 trap '
-  status=$?
+  status=$? failed_command=$BASH_COMMAND
   if [[ $status != 0 ]]; then
-    printf "dev_validate_run: exit=%s command=%s\n" "$status" "$BASH_COMMAND" >&2
+    printf "dev_validate_run: exit=%s command=%s\n" "$status" "$failed_command" >&2
     for err in "$TMP_ROOT"/err.*; do
       [[ ! -f $err ]] || cat -- "$err" >&2
     done
@@ -224,7 +224,12 @@ SH
   assert_eq "$RC" 37 "selection abort: $abort_variant preserves raw status" "$ERR"
   assert_eq "$OUT" '' "selection abort: $abort_variant never reaches the tally" "$ERR"
   if [[ "$abort_variant" == retained ]]; then
-    assert_file_contains "$ERR" 'exit=37 command=( exit "$RC" )' 'selection abort: command and status survive'
+    if grep -Fxq -- 'dev_validate_run: exit=37 command=ABORT_GOT="$(abort_selection_row)"' "$ERR"; then
+      pass 'selection abort: command and status survive'
+    else
+      fail 'selection abort: command and status survive'
+      dump_stderr "$ERR"
+    fi
     assert_file_contains "$ERR" 'abort-stderr' 'selection abort: per-call stderr survives cleanup'
   else
     assert_eq "$(cat "$ERR")" '' 'must-fail control: removing diagnostics loses command, status and stderr'
